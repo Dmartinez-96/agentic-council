@@ -1,0 +1,61 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "{{COUNCIL_ROOT}}/laziness_gate.py"
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "Write|Edit|NotebookEdit",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "{{COUNCIL_ROOT}}/council_advisor.py"
+        },
+        {
+          "type": "command",
+          "command": "{{COUNCIL_ROOT}}/evidence_logger.py"
+        }
+      ]
+    },
+    {
+      "matcher": "Read|Bash|Grep|Glob|WebFetch|WebSearch|AskUserQuestion",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "{{COUNCIL_ROOT}}/evidence_logger.py"
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "{{COUNCIL_ROOT}}/stop_audit.py"
+        }
+      ]
+    }
+  ],
+  "SessionStart": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "{{COUNCIL_ROOT}}/session_start_probe.py"
+        },
+        {
+          "type": "command",
+          "command": "{{COUNCIL_ROOT}}/session_start_directive.py"
+        }
+      ]
+    }
+  ]
+}

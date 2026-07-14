@@ -1,0 +1,44 @@
+# Council runtime artifacts.
+#
+# COUNCIL_ROOT is derived from the script's own directory, so if the council is
+# run from a CHECKOUT of this repo rather than from an install, every one of
+# these lands INSIDE the repo. They are not incidental: a council log contains
+# the full pitch -- the actual file contents under review, the diffs, and the
+# user's directives. On the machine this was developed on, logs/ reached 1.1 GB
+# across 7,224 fires covering real client work. NONE OF THIS MAY BE COMMITTED.
+#
+# NOTE ON FORMAT: git has NO inline comments. A `#` only opens a comment when it
+# is the first character of the line; anywhere else it is a literal part of the
+# pattern. An earlier version of this file put the descriptions to the RIGHT of
+# each pattern, which silently disabled all three of them.
+#
+# consult_council.py -> logs/
+council/logs/
+# council_dialogue.py -> threads/ (full round-table threads)
+council/threads/
+# council_outcome.py -> labels + adjudications
+council/outcomes.jsonl
+# council_outcome.py -> drawn cohorts + their seeds
+council/sample_cohorts.jsonl
+# council_advisor.py -> auto-revert parks the REJECTED file content here.
+# That is verbatim file content, so it is exactly as sensitive as logs/.
+council/reverted/
+# council_advisor.py -> payload probe, only written when DEBUG_PAYLOAD exists
+council/payload_shape.jsonl
+council/DEBUG_PAYLOAD
+council/NO_AUTO_REVERT
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Runtime git-block stub dir (created by consult_council._ensure_nogit_stub)
+council/_nogit/
+council/DISABLED
