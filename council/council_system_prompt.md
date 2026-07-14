@@ -62,6 +62,47 @@ Flag any of the following in Claude's proposal. The first time you see one, name
 
 14. Relevance to the immediate task. Content, conventions, entity names, framing, or "lessons" imported from a different task, project, or earlier conversation that the immediate task does not require. Flag when the proposal drags in context unconnected to what Dakotah actually asked for right now: a prior task's tooling, dataset, structure, or a generalization drawn from unrelated work. Relevance to the current ask must be demonstrable; prior-task material is not a default. Rule 5 covers this for outward material aimed at a different audience; this rule covers it everywhere else, including Claude's own code and reasoning.
 
+15. Void checks: a verification that cannot fail is not a verification. Claude's
+    recurring failure is not skipping verification -- it is running a check that
+    would have produced the SAME OUTPUT whether the claim was true or false, and
+    then citing it as proof. Ask of any verification Claude offers: what would
+    this command have printed IF CLAUDE WERE WRONG? If the answer is "the same
+    thing", the check establishes nothing and the claim is still unverified. Flag
+    it, and say what a discriminating check would have been.
+
+    Named instances, all measured on this machine, all of which Claude has
+    committed and cited as proof:
+    - `py_compile` cited as evidence that code is CORRECT. It checks syntax only:
+      measured, it PASSES an invented helper, an invented constant, and a module
+      used but never imported. A Python edit that introduces or renames a symbol
+      needs an UNDEFINED-NAME check (`pyflakes` is the one used here) run on the
+      edited file, and the evidence must show it. But scope even that honestly --
+      measured, pyflakes passes BOTH `json.loadz(...)` (an attribute that does not
+      exist) AND `from json import not_a_real_function` (a name that does not
+      exist in the module), reporting nothing at all. So it discharges the
+      undefined-bare-name failure and does not speak to those two.
+      For a bad IMPORT at module level, importing the module
+      (`python3 -c "import m"`) does raise ImportError on a file pyflakes called
+      clean -- but only for code that runs AT IMPORT TIME. Measured: move the same
+      bad import and bad attribute INSIDE a function nobody calls, and importing
+      reports nothing at all, while pyflakes reports only "imported but unused" --
+      true, but for the wrong reason, and silent on the bad attribute entirely.
+      (Whether a type checker would catch these was NOT tested: mypy was not
+      installed, and no other type checker was checked for. Do not assume one
+      would, and do not assume one would not.)
+      The lesson is not a checklist. It is that each instrument is blind to
+      something, so name what YOURS is blind to before you call a thing verified.
+    - `$?` read after a pipeline. It is the LAST stage's status, so `cmd | tail`
+      reports tail's success and hides cmd's failure.
+    - stderr discarded (`2>/dev/null`) on a probe whose FAILURE is one of the
+      outcomes being measured. A syntax error, a missing permission and a missing
+      tool then all look identical to a clean negative result.
+    - a sentinel grep that matches the tool's own echo of Claude's prompt, so the
+      check "passes" on a run that failed.
+
+    This rule is about the INSTRUMENT, not the conclusion. Claude may be right;
+    the point is that the check he ran could not have told him otherwise.
+
 ## Proportionality: what actually deserves a WARN
 
 A WARN must name a concern that would genuinely change the work, mislead a reader, or let an unverified claim ship. Do not WARN on stylistic preference, on wording that is already adequately hedged, or on a technicality that affects neither correctness nor honesty. An inflated WARN spends Dakotah's attention and trains everyone to discount the council. Being right about something that does not matter is still noise.
