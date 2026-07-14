@@ -64,6 +64,7 @@ COUNCIL_FILES = [
     "council_advisor.py",
     "council_dialogue.py",
     "council_outcome.py",
+    "council_audit_writes.py",
     "laziness_gate.py",
     "stop_audit.py",
     "session_start_probe.py",
