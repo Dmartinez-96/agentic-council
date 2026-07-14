@@ -1052,10 +1052,98 @@ def format_evidence_block(evidence_path: Path, target_path: str = "") -> str:
     return head + index_text + "\n" if index_text else head
 
 
+STANDING_RULES_PATH = Path.home() / ".claude" / "CLAUDE.md"
+STANDING_RULES_MAX_BYTES = 20_000
+
+
+def format_standing_rules(path: Path = STANDING_RULES_PATH) -> str:
+    """Claude's standing rules file, for members to check compliance against.
+
+    Bar item 12 makes the user's standing instructions binding and names CLAUDE.md
+    as one of their homes -- but nothing ever put that file in front of a member,
+    so for the life of this council item 12 has pointed at a document its
+    enforcers could not read. They have been inferring it. This closes that.
+
+    ALL of it binds. The file has two authors -- the user writes the directives
+    above the first `---`, Claude writes the self-catalogue of failure modes below
+    it -- but Claude maintains that catalogue BECAUSE THE USER INSTRUCTED HIM TO,
+    so it is no less binding for having been typed by the party under review. The
+    header names the split only so a member knows whose words it is reading, and
+    says explicitly that authorship does not soften the rule. Beware the opposite
+    framing: a block that tells reviewers to DISCOUNT the reviewed party's own
+    rules is that party lowering the bar on himself, in the very artifact meant to
+    hold him to it.
+
+    The live hazard runs the other way, and the header says so: handing a reviewer
+    the reviewed party's own list of known failures invites him to hunt only for
+    what is on it. Whether this block improves the findings or merely narrows them
+    onto pre-declared failures is UNMEASURED, and nothing here measures it: the
+    test has to be run by hand, by drawing a council_outcome.py cohort from fires
+    before this change and another from fires after it, and comparing the mix.
+    Until someone does that, do not assume this block helps.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+
+    header = (
+        "## Claude's standing rules (CLAUDE.md)\n"
+        "\n"
+        "This is the standing-rules file Claude works under. It is placed AFTER "
+        "the evidence deliberately: it is context for judging the proposal, not a "
+        "frame to read the evidence through.\n"
+        "\n"
+        "ALL OF IT IS BINDING under bar item 12. Every rule here is a standing "
+        "instruction, and a proposal that breaks one is a bar item 12 violation "
+        "you should now cite BY NAME instead of inferring it. That is what this "
+        "block is for.\n"
+        "\n"
+        "The only thing the structure tells you is WHO TYPED IT, which changes "
+        "nothing about its force:\n"
+        "\n"
+        "- Above the first `---`: the user's directives, in their own words.\n"
+        "- The `# Failure modes YOU actually have` section and below: written by "
+        "CLAUDE, at the user's explicit instruction to maintain a catalogue of his "
+        "own repeated failures and amend it as new ones appear. Claude's authorship "
+        "does NOT make these advisory. The user directed them; they bind.\n"
+        "\n"
+        "One warning, and it is the reason this block sits after the evidence "
+        "rather than before it: THIS LIST DOES NOT BOUND YOUR REVIEW. It is the "
+        "accused's own catalogue of his known crimes, and the danger of handing it "
+        "to you is that you hunt only for what is on it. A failure that is not "
+        "listed here is still a failure, and the most valuable thing you can find "
+        "is one Claude did not know to predict. Do not let this list become your "
+        "search space.\n"
+        "\n"
+        "Citing a specific rule Claude broke is more useful to him than a generic "
+        "objection -- but only where he actually broke one.\n"
+        "\n"
+        "```\n"
+    )
+    footer = "\n```\n"
+
+    # Charge the header AND footer against the budget BEFORE slicing, and reserve
+    # slack for a multi-byte character severed at the cut (it re-encodes larger).
+    utf8_slack = 8
+    overhead = len(header.encode()) + len(footer.encode()) + utf8_slack
+    budget = STANDING_RULES_MAX_BYTES - overhead
+    raw = text.encode("utf-8")
+    if len(raw) > budget:
+        note = "\n\n[... truncated: standing rules exceed the block budget ...]"
+        raw = raw[: budget - len(note.encode())]
+        text = raw.decode("utf-8", errors="replace") + note
+
+    return header + text + footer
+
+
 def build_prompt(system_prompt: str, pitch: str, evidence_block: str = "",
                  user_directives_block: str = "",
                  round1_block: str = "",
-                 assistant_block: str = "") -> str:
+                 assistant_block: str = "",
+                 standing_rules_block: str = "") -> str:
     """Assemble a member's prompt. SECTION ORDER IS LOAD-BEARING.
 
     Claude's own prior messages used to be CONCATENATED onto the end of the
@@ -1070,8 +1158,13 @@ def build_prompt(system_prompt: str, pitch: str, evidence_block: str = "",
         Claude was partly grading his own exam.
 
     Order is now: the bar, then THE USER'S directives, then the EVIDENCE, then
-    Claude's claims (demoted, after the facts), then the proposal. Facts before
-    framing.
+    Claude's STANDING RULES, then Claude's claims about this proposal (both
+    demoted, after the facts), then the proposal itself. Facts before framing.
+
+    The standing-rules block sits on the same side of the evidence as Claude's
+    claims for the same reason: much of CLAUDE.md is Claude's own writing about
+    Claude, and a member that reads the accused's account of his own defects
+    before it reads a fact has been framed, however true that account is.
 
     Provenance for the design, since it came from the members rather than from
     me: the introspection round-table, resolved and recorded at
@@ -1084,6 +1177,11 @@ def build_prompt(system_prompt: str, pitch: str, evidence_block: str = "",
         sections.append(user_directives_block)
     if evidence_block:
         sections.append(evidence_block)
+    # AFTER the evidence, for the same reason Claude's claims are: a large part of
+    # this block is Claude's own writing, and a member that meets Claude's account
+    # of Claude's failures before it meets a single fact is being framed.
+    if standing_rules_block:
+        sections.append(standing_rules_block)
     if assistant_block:
         sections.append(assistant_block)
     sections.append(f"Proposal under review:\n\n{pitch}")
@@ -1396,10 +1494,11 @@ async def run_codex(pitch: str, system_prompt: str, cwd: Path,
                     evidence_block: str = "",
                     user_directives_block: str = "",
                     round1_block: str = "",
-                    assistant_block: str = "") -> dict:
+                    assistant_block: str = "",
+                    standing_rules_block: str = "") -> dict:
     prompt = build_prompt(system_prompt, pitch, evidence_block,
                           user_directives_block, round1_block,
-                          assistant_block)
+                          assistant_block, standing_rules_block)
 
     async def attempt() -> dict:
         out_path = Path(f"/tmp/council_codex_{uuid.uuid4().hex}.txt")
@@ -1537,10 +1636,11 @@ async def run_gemini(pitch: str, system_prompt: str, cwd: Path,
                      evidence_block: str = "",
                      user_directives_block: str = "",
                      round1_block: str = "",
-                     assistant_block: str = "") -> dict:
+                     assistant_block: str = "",
+                     standing_rules_block: str = "") -> dict:
     prompt = build_prompt(system_prompt, pitch, evidence_block,
                           user_directives_block, round1_block,
-                          assistant_block)
+                          assistant_block, standing_rules_block)
     # API only. main() drops gemini from the roster when GEMINI_API_KEY is
     # absent, so this is normally reached only with a key present; the
     # blocking call still fails closed (verdict ERROR) if the key is gone.
@@ -1616,10 +1716,11 @@ async def run_deepseek(pitch: str, system_prompt: str, cwd: Path,
                        evidence_block: str = "",
                        user_directives_block: str = "",
                        round1_block: str = "",
-                       assistant_block: str = "") -> dict:
+                       assistant_block: str = "",
+                       standing_rules_block: str = "") -> dict:
     prompt = build_prompt(system_prompt, pitch, evidence_block,
                           user_directives_block, round1_block,
-                          assistant_block)
+                          assistant_block, standing_rules_block)
     return await asyncio.to_thread(_deepseek_call_blocking, prompt)
 
 
@@ -1926,6 +2027,11 @@ async def main() -> int:
             args.transcript_path, args.evidence_file)
         assistant_block = format_assistant_messages(args.transcript_path)
 
+    # NOT gated on the transcript: the standing rules exist whether or not this
+    # fire came from a hook with a transcript path. Returns "" if the file is
+    # absent, which is the correct behaviour for anyone who has no CLAUDE.md.
+    standing_rules_block = format_standing_rules()
+
     # Members run in a fresh empty working directory, not the session's
     # project dir, so a member CLI that auto-explores its cwd (e.g.
     # gemini: verified this session) finds no project files to surface.
@@ -1938,7 +2044,7 @@ async def main() -> int:
     round1_results = await asyncio.gather(*[
         MEMBER_RUNNERS[m](pitch, system_prompt, member_cwd,
                           evidence_block, user_directives_block,
-                          "", assistant_block)
+                          "", assistant_block, standing_rules_block)
         for m in members
     ]) if members else []
 
@@ -1952,7 +2058,8 @@ async def main() -> int:
         builtin_results = await asyncio.gather(*[
             MEMBER_RUNNERS[m](pitch, system_prompt, member_cwd,
                               evidence_block, user_directives_block,
-                              round1_block, assistant_block)
+                              round1_block, assistant_block,
+                              standing_rules_block)
             for m in members
         ])
     else:
