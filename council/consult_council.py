@@ -721,7 +721,7 @@ def _is_tier1(ev: dict, target: str) -> bool:
         rather than hidden. If a future session is search-heavy, the cost
         argument may also become real; today it is not, and saying so is
         cheaper than being caught believing it.
-      - AskUserQuestion: authoritative for what Dakotah actually directed, so
+      - AskUserQuestion: authoritative for what the user actually directed, so
         it is never demoted. (Cheap in this session -- 2 events -- though that
         is one session, not a law about all sessions.)
     """
@@ -1062,14 +1062,14 @@ def build_prompt(system_prompt: str, pitch: str, evidence_block: str = "",
     Recent user directives block, and the whole thing was placed before the
     evidence. Two consequences, both bad:
 
-      - Positionally, Claude's prose sat inside the section carrying Dakotah's
+      - Positionally, Claude's prose sat inside the section carrying the user's
         authority. The block's own text said "NOT authoritative", but the layout
         said otherwise, and layout is what a reader actually follows.
       - It arrived BEFORE the evidence, so a member met Claude's framing of the
         problem before it met a single fact. That is anchoring, and it means
         Claude was partly grading his own exam.
 
-    Order is now: the bar, then DAKOTAH'S directives, then the EVIDENCE, then
+    Order is now: the bar, then THE USER'S directives, then the EVIDENCE, then
     Claude's claims (demoted, after the facts), then the proposal. Facts before
     framing.
 
@@ -1284,7 +1284,7 @@ CODEX_LOCK_PATH = Path(tempfile.gettempdir()) / "council_codex_auth.lock"
 # I first set this to PER_CRITIC_TIMEOUT_S (600s) on the theory that a holder
 # cannot outlive its own kill timer. gemini pointed out the consequence, and it
 # is disqualifying: this code runs inside a PostToolUse hook, so a 600s lock
-# wait would hang Dakotah's session for ten minutes -- far worse than the
+# wait would hang the user's session for ten minutes -- far worse than the
 # failure it is guarding against. A lock that stalls the tool is not a fix.
 #
 # So it is sized to how long a holder is OBSERVED to hold it. Measured over the

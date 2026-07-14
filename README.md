@@ -206,6 +206,10 @@ real client work. The runtime artifacts (`logs/`, `threads/`, `outcomes.jsonl`,
 `sample_cohorts.jsonl`) are gitignored, but if you fork this or relocate the
 install, **check before you push**.
 
+## License
+
+MIT. See `LICENSE`.
+
 ## Layout
 
 ```

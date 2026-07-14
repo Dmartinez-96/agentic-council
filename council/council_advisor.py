@@ -50,8 +50,8 @@ EVIDENCE_STATE_ROOT = Path.home() / ".claude" / "state"
 
 # --- Auto-revert on BLOCK ---------------------------------------------------
 #
-# Enabled at Dakotah's explicit instruction ("let's go ahead and do the auto
-# revert idea"), after the measurement he asked for first.
+# Enabled deliberately, and only after the measurement described below.
+# Read that before you turn this on.
 #
 # This hook is PostToolUse: by the time it runs the write is already on disk, so
 # a BLOCK could only ever REQUEST a revert. That request does halt the turn (exit

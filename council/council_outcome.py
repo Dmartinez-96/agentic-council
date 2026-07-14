@@ -240,7 +240,7 @@ def cmd_sample(args) -> int:
         for a nicer sample is therefore impossible without abandoning a cohort
         that stays on the record forever, which is a louder confession than any
         bad statistic.
-      - Every cohort keeps its seed, so Dakotah can replay the draw and confirm
+      - Every cohort keeps its seed, so the user can replay the draw and confirm
         the sample Claude laboured over is the sample he was dealt.
       - stats reports assigned-cohort outcomes SEPARATELY from volunteered ones,
         because only the assigned numbers are representative.
@@ -358,7 +358,7 @@ def cmd_verify(args) -> int:
     consistency check, and deepseek is right that it is NOT tamper-proof -- a
     determined Claude could edit the seed, the pool and the ids together and stay
     self-consistent. It raises the cost of faking a sample from "edit one line"
-    to "forge a coherent draw", and it lets Dakotah confirm the sample was not
+    to "forge a coherent draw", and it lets the user confirm the sample was not
     quietly rewritten afterwards. That is the honest claim.
 
     The POOL is stored in the cohort rather than rebuilt. An earlier version
@@ -727,7 +727,7 @@ def cmd_stats(args) -> int:
     #     ENTIRE cohort is labelled AND adjudicated to quorum. Labelling a few of
     #     them changes nothing.
     #   - This banner does not PREVENT abandonment and does not mechanically
-    #     penalise the numbers. It makes the manoeuvre visible to Dakotah, who
+    #     penalise the numbers. It makes the manoeuvre visible to the user, who
     #     can discount them. A reporting control, not an enforcement one.
     abandoned = [c for c in read_cohorts() if c.get("abandoned_cohort")]
     if abandoned:

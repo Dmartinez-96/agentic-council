@@ -14,7 +14,7 @@ that a PreToolUse hook can deny permission by returning a JSON payload
 with hookSpecificOutput.permissionDecision set to "deny").
 
 Why this is a hard gate rather than a council WARN: rule 11 violations
-waste Dakotah's API spend, time, and trust. The council exists to
+waste the user's API spend, time, and trust. The council exists to
 catch them at PostToolUse, but at that point the lazy write has
 already landed and reverting is on me. PreToolUse can refuse the
 write before it happens. This file enforces the rule synchronously

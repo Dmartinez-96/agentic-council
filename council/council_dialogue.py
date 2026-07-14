@@ -2,7 +2,7 @@
 """Workers' Council - dialogue mode (Claude-driven round-table).
 
 A multi-turn, round-table dialogue between Claude (the lead worker and
-spokesperson to Dakotah) and the council members (codex, gemini,
+spokesperson to the user) and the council members (codex, gemini,
 deepseek). Unlike the one-shot PostToolUse council, here Claude is a
 participant: members can interrogate Claude, Claude answers with
 evidence, and the thread iterates to convergence.
@@ -248,7 +248,7 @@ def build_directives_block(transcript_path: str | None,
 
     Mirrors what the one-shot advisor path builds (consult_council.py:
     1043-1051) so a dialogue member sees the same standing instructions a
-    PostToolUse member does. Bar item 12 tells members Dakotah's session
+    PostToolUse member does. Bar item 12 tells members the user's session
     directives are "visible to you in the Recent user directives block";
     without this the dialogue made that promise and did not keep it.
     Returns "" when no transcript is available.
@@ -691,7 +691,7 @@ def cmd_resolve(args) -> int:
             continue
         extra = f"  - {p['note']}" if p["note"] else ""
         print(f"#   {role:<9} {p['verdict']}{extra}")
-    print(f"\n# FINAL artifact (surface this to Dakotah): {artifact}")
+    print(f"\n# FINAL artifact (surface this to the user): {artifact}")
     print(f"# raw thread: council_dialogue.py show {tid}")
     return 0
 
