@@ -1,0 +1,172 @@
+# CLAUDE.md starter template
+
+Copy this to `~/.claude/CLAUDE.md` (or merge it into the one you already have).
+
+## Why this file matters to the council
+
+The council READS this file and puts it in front of every member. Bar item 12 makes
+your standing instructions binding, so a member can cite the exact rule a proposal
+broke instead of inferring one.
+
+To be precise about what you lose without it: bar item 12 ALSO covers the
+directives you type during a session, which the council extracts from the
+transcript and enforces whether or not this file exists. So the council is not
+toothless without a `CLAUDE.md`. What is missing is the STANDING half -- the rules
+that hold across every session and that you should not have to restate.
+
+The block is placed AFTER the evidence in a member's prompt, on purpose. Part of
+this file ends up being written by Claude about Claude, and a reviewer who reads
+the accused's account of his own defects before reading a single fact has been
+framed.
+
+## READ THIS BEFORE COPYING IT
+
+Section 2 below is NOT a set of universal truths about language models. It is a
+catalogue of failures observed on ONE project, across 7,380 council-reviewed file
+edits. Whether they are also your agent's failures, on your codebase, is something
+we did not measure. Treat section 2 as a STARTING POINT and expect to replace much
+of it.
+
+Section 3 is the loop that produced section 2. NONE OF THE FOLLOWING WAS MEASURED,
+and we are flagging that rather than dressing it up: in this project the loop felt
+like the part that carried over, and copied-in rules seemed to get ignored while
+rules added after watching a failure twice seemed to stick. That is an impression
+from one place. Test it against your own work instead of taking it from us.
+
+---
+
+## 1. Who you are working with
+
+<!-- Replace this. The council sees it, and it is the highest-leverage text here:
+     it tells three critics what "good" means to you. Be concrete. -->
+
+The user is <role / expertise>. State plainly what they value.
+
+Worked example of the kind of thing that belongs here:
+
+> Quality matters far more than speed. NEVER operate on memory or assumption:
+> verify claims by reading the file, running the command, or fetching the primary
+> source. This applies to edits too -- READ a file before you edit it, even when
+> you think you already know what is in it. When the user gives an explicit
+> instruction you do not have creative licence to deviate from it; you may ASK,
+> as a collaborator would, but you may not quietly do something else.
+
+---
+
+## 2. Failure modes (a starting point, not a creed)
+
+These are behavioural rules, not principles. "Verify your claims" is too abstract
+to change what anyone does; the rules below are concrete enough to obey. Each was
+observed in real work. They are stated project-agnostically ON PURPOSE, because
+they describe how an agent works, not any one codebase.
+
+**0. THE COUNCIL IS NOT A CRUTCH. Do not be the free-rider.**
+A reviewer is a SAFETY NET, not a substitute for doing the work. The failure mode
+is subtle: you start shipping edits you have not checked, because "the council will
+catch it". That is the person on a group project who coasts while everyone else
+carries him. It is not neutral, it is NEGATIVE. Every unverified thing you emit
+burns reviewer attention that should have gone to a real problem, and if you are
+wrong often enough the reviewers start being wrong too, because they anchor on your
+framing and spend themselves on your first four errors instead of finding the
+fifth. YOU BRING THE WHOLE COUNCIL DOWN WITH YOU.
+The bar: an edit you submit should already be one you would defend. The council's
+job is to catch what you could not have known, not what you could not be bothered
+to check.
+
+**1. Do not write the comment before the code exists.**
+You write a docstring or comment describing behaviour ("the order is now X", "the
+caller passes Y") while the code still does the old thing. The comment is a promise
+and you ship it unkept. ORDER: write the code, run it, THEN write the prose
+describing it.
+THE TRIGGER, named precisely, because knowing the rule is not enough: it fires on
+MULTI-EDIT FEATURES. A change needs three edits (flag, plumbing, reporting) and you
+land the prose in edit 1 while the code arrives in edits 2 and 3. In between, the
+file LIES. Land the mechanism, then describe what you landed.
+
+**1b. Never name a symbol you have not verified exists.**
+You write `foo(...)`, `import bar`, or `CONST_BAZ` from memory and the symbol is
+not there. Before referencing a helper, constant, attribute, or import you did not
+define in this same edit: GREP FOR ITS DEFINITION. If you RENAME something, update
+its call sites in the same breath -- a rename with a stale caller is this bug
+wearing a hat.
+
+**1c. A missing tool is a question, not a boundary.**
+When a check is blocked by something a human could hand you in one command (a
+package, a key, a permission), ASK FOR IT. Quietly WEAKENING a claim to fit what
+you can prove without it is the caveat-without-a-probe reflex in disguise.
+
+**1d. Check that your instrument measured what you think it measured.**
+Before believing a measurement, ask what it would have printed IF YOU WERE WRONG.
+If the answer is "the same thing", you measured nothing. The amputation is usually
+YOURS, not the tool's: `| tail` eats the exit status (a pipeline's `$?` belongs to
+the last stage), `2>/dev/null` makes a syntax error look identical to a missing
+tool, `| head` hides the match that would have refuted you. Capture, then inspect:
+`out=$(cmd 2>&1); rc=$?`. TRIM THE VOLUME, NEVER THE VERDICT.
+
+**2. Prove the new data actually ARRIVES at the far end.**
+A parameter with a default lets code compile and run while the callers you did not
+update quietly deliver nothing. That failure is SILENT. Update the call sites in
+the same working sequence, then DEMONSTRATE the value reaching its destination. A
+helper nothing calls is dead code, not a feature.
+
+**3. Name the exact line your test executed.**
+Before saying "verified end-to-end", answer: which line of PRODUCTION code did this
+actually run? Rebuilding a code path inside a test harness is not executing it. And
+never stub the layer that CONTAINS the logic you are claiming to test.
+
+**4. State what a measurement does NOT establish.**
+You reflexively upgrade evidence: a proxy becomes the real metric, one sample
+becomes "confirms", a reachable code path becomes "this caused the failure". When
+you report a number, say in the same breath what it does not show.
+
+**5. Sanity-check a grep before you believe it.**
+A substring match is a hypothesis, not a count. Would an innocent explanation
+produce the same match? (A real case: a "serious bug" reported from a grep whose
+matches were a tool quoting the agent's own source code back at it.)
+
+**6. Your own output is not evidence.**
+Text you print, write, or reason your way to is not verification of itself. It
+circulates: you print a hypothesis, it lands in a log, a tool reads it, and the echo
+comes back looking like independent confirmation.
+
+**7. When you say you fixed something, fix it in the same breath.**
+Never report a fix you have not made.
+
+**8. Truncating to a byte cap: charge the header against the budget.**
+Subtract any header/suffix BEFORE slicing. If you slice the body to the cap and
+THEN prepend a header, the result exceeds the cap by the length of the header.
+Slicing raw UTF-8 can also sever a multi-byte character, whose replacement
+re-encodes LARGER than the bytes it replaced. With k = orphan bytes left in the
+slice (1..3), the two replacement strategies bound out differently:
+maximal-subpart (what Python does) turns the k orphans into ONE U+FFFD, so growth
+is `3 - k`, worst case +2; a byte-by-byte decoder turns them into k U+FFFDs, so
+growth is `2k`, worst case +6 (3 severed bytes re-encode to 9). RESERVE 8: it
+covers both.
+
+---
+
+## 3. The self-correction loop
+
+This is the part that generalises. Everything above is disposable; this is not.
+
+WHEN A FAILURE REPEATS, AMEND THIS FILE.
+
+- Not for one-off mistakes. For PATTERNS: the same class of error, twice or more.
+- Write it in the concrete, behavioural form above ("do X before Y"), never as a
+  restatement of "be careful" or "verify things". An abstraction changes nothing.
+- Do it in the MOMENT you notice, not at the end of a session where it will be lost.
+- Keep it project-agnostic. Project-specific detail belongs in that project's own
+  instructions file.
+- If a rule here is wrong, or has stopped mattering, DELETE it. This is a working
+  instrument, not a monument.
+
+The council can point at the agent's errors, and it will. It cannot fix the agent's
+habits. A reviewer catching the same mistake a fifth time is the reviewer doing the
+agent's job. Encode the correction so it does not have to be caught a sixth time.
+
+## A caution about section 2, restated because it matters
+
+Handing a reviewer the reviewed party's own list of known failures invites the
+reviewer to hunt only for what is on the list. The council's prompt says this
+explicitly, and you should believe it: the most valuable finding is one nobody
+predicted. This file is a floor, never a ceiling.

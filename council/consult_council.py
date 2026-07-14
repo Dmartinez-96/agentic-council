@@ -164,6 +164,82 @@ GEMINI_API_URL = (
 # acts on the field. Quality was not measured.
 GEMINI_THINKING_LEVEL = "high"
 
+# --- FAST mode ---------------------------------------------------------------
+#
+# `touch <council dir>/FAST` drops every non-Claude member to effort "low" -- which
+# each provider was verified to ACCEPT, not proven to be its minimum; there may be
+# a lower setting nobody probed. `rm` restores whatever the constants above say,
+# which is not necessarily each provider's maximum either: read them, do not assume.
+#
+# Resolved once per fire. council_advisor.py runs this file as a fresh subprocess
+# for every review, so the snapshot is per-review and a toggle takes effect on the
+# next one without a restart.
+#
+# WHY EFFORT AND NOT LIGHTER MODELS. Measured on a real 43,749-char council prompt
+# (not a toy -- a toy prompt showed almost no effect, and that misled a first pass
+# at this):
+#     deepseek reasoning_effort="max"   97.4s
+#     deepseek reasoning_effort="high"  55.0s
+#     deepseek reasoning_effort="low"   42.4s     -> max->low is 2.3x
+# Members run in parallel, so the fire costs roughly what the SLOWEST member costs,
+# and deepseek at "max" is the slowest by a wide margin. Effort is therefore a lever
+# on the thing that actually sets wall-clock. n=1 per arm; latency only.
+#
+# Swapping in lighter MODELS was considered and rejected on the evidence available.
+# The one A/B we have (gemini-3.5-flash vs 3.1-pro, n=60) counted any WARN/BLOCK as
+# "caught the seeded defect" -- which an unrelated warning also produces. It is a
+# void check, so it licenses nothing about model tier in either direction. Do not
+# cite it to justify a downgrade.
+#
+# WHAT THIS COSTS, SAID PLAINLY: unknown. Lower effort was measured to be FASTER.
+# It was NOT measured to be as good. A fast PASS looks exactly like a real PASS,
+# and that is the danger -- so FAST is announced in the output rather than being a
+# silent config change (see emit_output).
+FAST_PATH = COUNCIL_ROOT / "FAST"
+
+# Lowest effort each provider accepts. Verified live before this shipped.
+FAST_EFFORT = {
+    "codex": "low",       # model_reasoning_effort
+    "gemini": "low",      # thinkingConfig.thinkingLevel
+    "deepseek": "low",    # reasoning_effort
+}
+_FULL_EFFORT = {
+    "codex": lambda: CODEX_REASONING,
+    "gemini": lambda: GEMINI_THINKING_LEVEL,
+    "deepseek": lambda: DEEPSEEK_REASONING,
+}
+
+
+_FAST_SNAPSHOT: bool | None = None
+
+
+def fast_mode() -> bool:
+    """True when FAST is armed. Resolved ONCE per fire, then frozen.
+
+    Deliberately NOT re-read on every call. Each fire is its own process, so a
+    per-process snapshot still lets `touch FAST` / `rm FAST` take effect between
+    fires without a restart -- which is the whole point. What it prevents is the
+    file changing MID-fire: members would then run at one effort while the banner
+    reported another, and the banner is the only thing telling the reader that a
+    PASS was reached at reduced depth. A report that can disagree with what
+    actually ran is worse than no report.
+    """
+    global _FAST_SNAPSHOT
+    if _FAST_SNAPSHOT is None:
+        _FAST_SNAPSHOT = FAST_PATH.exists()
+    return _FAST_SNAPSHOT
+
+
+def effort_for(member: str) -> str:
+    """The reasoning effort this member should use for THIS fire.
+
+    The models are deliberately unchanged in FAST mode. Only the effort moves.
+    """
+    if fast_mode():
+        return FAST_EFFORT[member]
+    return _FULL_EFFORT[member]()
+
+
 VERDICT_RE = re.compile(r"^VERDICT:\s*(PASS|WARN|BLOCK)\s*$", re.MULTILINE)
 
 PER_CRITIC_TIMEOUT_S = 600
@@ -1331,7 +1407,7 @@ def codex_cmd(out_path: Path) -> list[str]:
         "--color", "never",
         "--output-last-message", str(out_path),
         "-c", f'model="{CODEX_MODEL}"',
-        "-c", f'model_reasoning_effort="{CODEX_REASONING}"',
+        "-c", f'model_reasoning_effort="{effort_for("codex")}"',
         "-",
     ]
 
@@ -1580,7 +1656,7 @@ def _gemini_api_call_blocking(prompt: str) -> dict:
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "thinkingConfig": {"thinkingLevel": GEMINI_THINKING_LEVEL},
+            "thinkingConfig": {"thinkingLevel": effort_for("gemini")},
         },
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -1670,7 +1746,7 @@ def _deepseek_call_blocking(prompt: str) -> dict:
         "model": DEEPSEEK_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "reasoning_effort": DEEPSEEK_REASONING,
+        "reasoning_effort": effort_for("deepseek"),
     }).encode("utf-8")
     req = urllib.request.Request(
         DEEPSEEK_URL, data=body, method="POST",
@@ -1850,6 +1926,19 @@ def emit_output(results: list[dict], final_verdict: str, log_path: Path) -> None
         return lines[-1] if lines else ""
 
     print(f"VERDICT: {final_verdict}")
+    if fast_mode():
+        # ANNOUNCE IT. A fast PASS is indistinguishable from a real one on the
+        # page, and that is precisely the danger of a speed switch: it converts
+        # "we looked less hard" into "we found nothing", silently. The verdict is
+        # still the verdict -- this does not downgrade it -- but nobody should be
+        # able to read a FAST PASS as full-strength assurance without being told.
+        effs = ", ".join(f"{m}={effort_for(m)}" for m in ALL_MEMBERS)
+        print(f"# FAST MODE (touch/rm {FAST_PATH} to toggle). Members ran at "
+              f"REDUCED effort: {effs}.")
+        print(f"# Measured on deepseek only (max 97.4s -> low 42.4s on a real "
+              f"prompt): lower effort is FASTER. Nothing measured it to be as "
+              f"GOOD, for any member. Treat a FAST PASS as 'no objection at "
+              f"reduced depth', not as a clean bill of health.")
     print(f"# log: {log_path}")
     for r in results:
         line = f"# member: {r['role']} verdict={r['verdict']}"

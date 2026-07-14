@@ -187,6 +187,25 @@ is checked per call, so it works mid-session.
   over-flagging is exactly the question `council_outcome.py` exists to answer.
   Measure it on your own work rather than trusting this README.
 
+## Your own standing rules (CLAUDE.md)
+
+The council READS `~/.claude/CLAUDE.md` and shows it to every member, so bar item
+12 lets a member cite the exact rule of YOURS that a proposal broke, rather than
+inferring one. Without that file the council still enforces the directives you type
+during a session; what it lacks is the STANDING half.
+
+`starter-prompts/CLAUDE.md.template` is a starting point. **Read it before you copy
+it.** Its failure-mode list was observed across 7,380 council-reviewed edits spanning
+27 project roots on a single machine's logs. Whether the same failures show up for
+your agent, on your codebase, is not something we measured. The list is a floor, not
+a ceiling. UNMEASURED, offered only as a suggestion: the piece we would expect to
+outlast the specific rules is the loop at the end -- when a failure repeats, amend
+the file.
+
+The installer will tell you if the file is missing. It deliberately will NOT write
+it for you -- those are your instructions to your agent, and an installer that
+silently authors them has overstepped.
+
 ## Tuning
 
 - **The quality bar**, at `<council_root>/council_system_prompt.md`. Read it

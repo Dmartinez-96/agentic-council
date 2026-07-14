@@ -181,6 +181,29 @@ def check_deepseek(rep: Reporter) -> None:
                  "runs under to enable it.")
 
 
+def check_standing_rules(rep: Reporter) -> None:
+    """Informational. The council READS ~/.claude/CLAUDE.md and shows it to every
+    member, so bar item 12 can cite the user's own rules by name. Without the file
+    that block is simply empty -- the council still enforces the directives typed
+    during a session, so this is a missing capability, not a broken install.
+
+    Deliberately does NOT write the file. CLAUDE.md is the user's own standing
+    instructions to their agent; an installer that silently authors those has
+    overstepped. Point at the template and let them decide.
+    """
+    path = CLAUDE_HOME / "CLAUDE.md"
+    if path.exists():
+        rep.ok(f"{path} present: the council will show it to every member, and "
+               f"members can cite your rules by name (bar item 12).")
+        return
+    rep.info(f"No {path}. The council will still enforce the directives you type "
+             f"during a session, but it has no STANDING rules of yours to cite.")
+    rep.info(f"  A starter you can copy and edit: "
+             f"{REPO_ROOT / 'starter-prompts' / 'CLAUDE.md.template'}")
+    rep.info("  Read it before copying: its failure-mode list was observed on one "
+             "project and may not be your agent's failures.")
+
+
 def check_bubblewrap(rep: Reporter) -> None:
     if sys.platform.startswith("linux"):
         if not which("bwrap"):
@@ -486,6 +509,7 @@ def main() -> int:
     if not check_gemini_key(rep):
         ok = False
     check_deepseek(rep)
+    check_standing_rules(rep)
     check_bubblewrap(rep)
 
     if not ok:
