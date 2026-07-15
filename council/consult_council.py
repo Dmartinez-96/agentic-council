@@ -1830,6 +1830,9 @@ MEMBER_RUNNERS = {
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
 
+# Opt-in marker for the layer-2 shadow critics (toggled with `touch`/`rm SHADOW`).
+SHADOW_PATH = COUNCIL_ROOT / "SHADOW"
+
 # role -> (primary slug, fallback slug). Passed to OpenRouter as a `models` array:
 # if the primary is down, rate-limited, or moderation-blocked, OpenRouter falls
 # through to the fallback and reports which one answered. Slugs selected from the
@@ -2410,8 +2413,12 @@ async def main() -> int:
     # de-anchored. The task is created here -- so it starts and overlaps the voting
     # rounds -- and awaited below; its results go into their own `shadow_results`,
     # never into `all_results`, so a shadow can neither vote nor trigger auto-revert.
-    # Gated on OPENROUTER_API_KEY: no key -> no shadow roster.
-    shadow_roles = list(SHADOW_MEMBERS) if os.environ.get(OPENROUTER_KEY_ENV) else []
+    # Gated on BOTH the explicit SHADOW opt-in marker AND the key: absent either,
+    # the roster is empty. Requiring the marker (not the key alone) is what keeps a
+    # user who merely has OPENROUTER_API_KEY exported for other tooling from paying
+    # for silent shadow calls on every edit.
+    shadow_enabled = SHADOW_PATH.exists() and bool(os.environ.get(OPENROUTER_KEY_ENV))
+    shadow_roles = list(SHADOW_MEMBERS) if shadow_enabled else []
     shadow_task = asyncio.gather(*[
         run_openrouter(r, list(SHADOW_MEMBERS[r]), pitch, system_prompt,
                        evidence_block, user_directives_block, "",

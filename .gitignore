@@ -42,3 +42,5 @@ __pycache__/
 # Runtime git-block stub dir (created by consult_council._ensure_nogit_stub)
 council/_nogit/
 council/DISABLED
+# consult_council.py -> layer-2 shadow-critic opt-in marker (needs this AND OPENROUTER_API_KEY)
+council/SHADOW
