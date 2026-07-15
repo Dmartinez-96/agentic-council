@@ -1819,6 +1819,118 @@ MEMBER_RUNNERS = {
 }
 
 
+# --- OpenRouter transport -----------------------------------------------------
+#
+# ONE OpenAI-compatible runner for any OpenRouter-hosted model: a single key
+# (OPENROUTER_API_KEY), a tool-less HTTPS POST (so it can no more mutate state than
+# deepseek can -- the agy-incident safeguard holds), and a `models` array giving
+# automatic primary->fallback failover. Adding a model is one config line, not a new
+# bespoke transport. The request schema below (top-level `models` array; nested
+# `reasoning.effort`) is verified against OpenRouter's API docs, not guessed.
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
+
+# role -> (primary slug, fallback slug). Passed to OpenRouter as a `models` array:
+# if the primary is down, rate-limited, or moderation-blocked, OpenRouter falls
+# through to the fallback and reports which one answered. Slugs selected from the
+# openrouter.ai model listings (2026-07); PINNED, not the *-latest auto-routes -- a
+# silently changing model would contaminate the logs the way an unrecorded FAST run
+# did. (Kimi primary is the reasoning variant, not the code one, for critique.)
+SHADOW_MEMBERS = {
+    "kimi": ("moonshotai/kimi-k2-thinking", "moonshotai/kimi-k2.6"),
+    "glm":  ("z-ai/glm-5.2",                "z-ai/glm-5"),
+    "grok": ("x-ai/grok-4.5",               "x-ai/grok-4.3"),
+}
+
+
+def openrouter_effort() -> str:
+    """OpenRouter's unified reasoning effort for this fire: FAST -> low, else high.
+
+    Kept separate from FAST_EFFORT/_FULL_EFFORT, which hold the CORE members'
+    PROVIDER-SPECIFIC effort strings; OpenRouter's reasoning.effort vocabulary is its
+    own ("low"/"medium"/"high"), and merging the two would be a category error.
+    """
+    return "low" if fast_mode() else "high"
+
+
+def _openrouter_call_blocking(role: str, models: list[str], prompt: str) -> dict:
+    """Blocking OpenAI-compatible POST to OpenRouter. Same result shape as
+    _deepseek_call_blocking; any failure -> ERROR so the member degrades gracefully.
+    `models` is [primary, fallback]; the response's `model` field records which one
+    actually answered, kept as `model_used` for fallback provenance."""
+    t0 = time.monotonic()
+
+    def fail(msg: str) -> dict:
+        return {
+            "role": role, "text": "", "stderr": msg,
+            "returncode": -1, "verdict": "ERROR",
+            "duration_s": round(time.monotonic() - t0, 2),
+        }
+
+    api_key = os.environ.get(OPENROUTER_KEY_ENV, "")
+    if not api_key:
+        return fail(f"{OPENROUTER_KEY_ENV} not set in environment")
+
+    body = json.dumps({
+        "models": models,          # [primary, fallback] -> automatic model failover
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "reasoning": {"effort": openrouter_effort()},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        OPENROUTER_URL, data=body, method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=PER_CRITIC_TIMEOUT_S) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        return fail(f"HTTPError {e.code}: {detail}")
+    except Exception as e:  # noqa: BLE001
+        return fail(f"request failed: {e}")
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return fail(f"non-JSON response: {raw[:300]}")
+    if isinstance(data, dict) and data.get("error"):
+        return fail(f"api error: {json.dumps(data['error'])[:400]}")
+    try:
+        content = data["choices"][0]["message"].get("content") or ""
+    except (KeyError, IndexError, TypeError):
+        content = ""
+    if not content:
+        return fail(f"empty content in response: {raw[:300]}")
+
+    return {
+        "role": role, "text": content, "stderr": "",
+        "returncode": 0, "verdict": parse_verdict(content),
+        "duration_s": round(time.monotonic() - t0, 2),
+        "model_used": data.get("model", ""),
+    }
+
+
+async def run_openrouter(role: str, models: list[str], pitch: str,
+                         system_prompt: str,
+                         evidence_block: str = "",
+                         user_directives_block: str = "",
+                         round1_block: str = "",
+                         assistant_block: str = "",
+                         standing_rules_block: str = "") -> dict:
+    prompt = build_prompt(system_prompt, pitch, evidence_block,
+                          user_directives_block, round1_block,
+                          assistant_block, standing_rules_block)
+    return await asyncio.to_thread(_openrouter_call_blocking, role, models, prompt)
+
+
 def load_external_verdicts(specs: list[str]) -> list[dict]:
     out: list[dict] = []
     for spec in specs:
@@ -1943,7 +2055,8 @@ def determine_final_verdict(active_results: list[dict]) -> str:
 def write_log(layer: str, tool_name: str | None, target_path: str | None,
               pitch: str, all_results: list[dict], final_verdict: str,
               session_id: str = "",
-              round1_results: list[dict] | None = None) -> Path:
+              round1_results: list[dict] | None = None,
+              shadow_results: list[dict] | None = None) -> Path:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     log_dir = LOGS_ROOT / today
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -2036,12 +2149,23 @@ def write_log(layer: str, tool_name: str | None, target_path: str | None,
             {k: v for k, v in r.items() if k != "stderr"}
             for r in (round1_results or [])
         ],
+
+        # LAYER-2 SHADOW members' results (kimi/glm/grok via OpenRouter), kept in
+        # their OWN field and NEVER merged into `members`. That separation is the
+        # point: anything that reads `members` to compute the council's verdict or
+        # outcome stats cannot count a non-voting shadow as a real vote. stderr
+        # dropped for size, as with round1.
+        "shadow": [
+            {k: v for k, v in r.items() if k != "stderr"}
+            for r in (shadow_results or [])
+        ],
     }
     log_path.write_text(json.dumps(entry, indent=2, default=str))
     return log_path
 
 
-def emit_output(results: list[dict], final_verdict: str, log_path: Path) -> None:
+def emit_output(results: list[dict], final_verdict: str, log_path: Path,
+                shadow_results: list[dict] | None = None) -> None:
     def extract_error_reason(stderr: str) -> str:
         if not stderr:
             return ""
@@ -2088,6 +2212,19 @@ def emit_output(results: list[dict], final_verdict: str, log_path: Path) -> None
             line += f" stderr_hint={hint[:200]!r}"
         print(line)
     print()
+
+    # Layer-2 shadow members, shown so they are VISIBLE when they fire but clearly
+    # marked NON-VOTING -- they are already excluded from `results`/the verdict, and
+    # this display must not blur that. `model_used` names which of the [primary,
+    # fallback] pair OpenRouter actually served.
+    for r in (shadow_results or []):
+        used = f" via {r['model_used']}" if r.get("model_used") else ""
+        extra = ""
+        if r["verdict"] == "ERROR":
+            extra = f" stderr_hint={extract_error_reason(r['stderr'])[:160]!r}"
+        print(f"# shadow (NON-VOTING): {r['role']} verdict={r['verdict']}{used}{extra}")
+    if shadow_results:
+        print()
 
     # Fail LOUD. A lost vote used to disappear into the WARN branch of
     # determine_final_verdict with nothing said, so a fire could come back WARN
@@ -2267,6 +2404,21 @@ async def main() -> int:
     # it is not a full filesystem sandbox.
     member_cwd = Path(tempfile.mkdtemp(prefix="council_member_"))
 
+    # Layer-2 SHADOW members (OpenRouter) run CONCURRENTLY with the voting rounds and
+    # INDEPENDENTLY of them: they get the same proposal/evidence/standing-rules but
+    # NOT the members' round-1 verdicts (round1_block=""), so their catches are
+    # de-anchored. The task is created here -- so it starts and overlaps the voting
+    # rounds -- and awaited below; its results go into their own `shadow_results`,
+    # never into `all_results`, so a shadow can neither vote nor trigger auto-revert.
+    # Gated on OPENROUTER_API_KEY: no key -> no shadow roster.
+    shadow_roles = list(SHADOW_MEMBERS) if os.environ.get(OPENROUTER_KEY_ENV) else []
+    shadow_task = asyncio.gather(*[
+        run_openrouter(r, list(SHADOW_MEMBERS[r]), pitch, system_prompt,
+                       evidence_block, user_directives_block, "",
+                       assistant_block, standing_rules_block)
+        for r in shadow_roles
+    ]) if shadow_roles else None
+
     # Round 1: each member sees the proposal independently and emits
     # an initial verdict.
     round1_results = await asyncio.gather(*[
@@ -2303,13 +2455,19 @@ async def main() -> int:
                                                  member_cwd)
 
     shutil.rmtree(member_cwd, ignore_errors=True)
+    # Retrieve the shadow task created before the voting rounds (it ran concurrently
+    # with them -- verified: asyncio.gather schedules its coroutines as Tasks on
+    # creation). shadow_results stays OUT of all_results, so determine_final_verdict
+    # never sees it and a shadow can neither vote nor trigger auto-revert.
+    shadow_results = list(await shadow_task) if shadow_task is not None else []
     all_results = list(builtin_results) + external
     final_verdict = determine_final_verdict(all_results)
     log_path = write_log(args.layer, args.tool_name, args.target_path,
                          pitch, all_results, final_verdict,
                          session_id=args.session_id,
-                         round1_results=list(round1_results))
-    emit_output(all_results, final_verdict, log_path)
+                         round1_results=list(round1_results),
+                         shadow_results=shadow_results)
+    emit_output(all_results, final_verdict, log_path, shadow_results)
 
     return {"PASS": 0, "WARN": 1, "BLOCK": 2}.get(final_verdict, 3)
 
