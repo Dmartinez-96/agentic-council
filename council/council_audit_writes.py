@@ -102,6 +102,32 @@ def newest_session() -> str:
     return max(dirs, key=lambda d: d.stat().st_mtime).name if dirs else ""
 
 
+def sessions_with_activity(within_hours: float) -> list[str]:
+    """Session ids whose evidence file was MODIFIED inside the window, newest first.
+
+    Say what this is, because the name it nearly had ("active_sessions") would have
+    lied: it is an mtime test on evidence.jsonl, so it reports sessions that were
+    WRITTEN TO in the window. That is a SUPERSET of concurrency -- two sessions run
+    back-to-back inside the window both appear here, though they never overlapped.
+    The caller only uses it to decide whether auto-picking a session is safe, and for
+    that a superset is the correct side to err on: a needless demand for
+    --session-id costs one flag, while auditing the wrong session costs a false
+    accusation that a reviewed file bypassed the council.
+    """
+    if not STATE_ROOT.is_dir():
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=within_hours)
+    live = []
+    for d in STATE_ROOT.iterdir():
+        ev = d / "evidence.jsonl"
+        if not ev.is_file():
+            continue
+        mt = datetime.fromtimestamp(ev.stat().st_mtime, tz=timezone.utc)
+        if mt >= cutoff:
+            live.append((mt, d.name))
+    return [name for _, name in sorted(live, reverse=True)]
+
+
 def _parse(ts: str) -> datetime | None:
     try:
         d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
@@ -247,7 +273,34 @@ def main() -> int:
                          "finding under thousands of unrelated mtimes.")
     args = ap.parse_args()
 
-    sid = args.session_id or newest_session()
+    # REFUSE TO GUESS WHEN SESSIONS ARE CONCURRENT.
+    #
+    # Auto-picking the newest session is safe only when there IS one session. With
+    # several live at once it silently audits the WRONG one: reviewed_at() then holds
+    # some other session's reviews, none of them match the files that changed here,
+    # and the tool reports NEVER REVIEWED for files the council reviewed a dozen
+    # times. That is not a degraded answer, it is a confident false accusation from
+    # the one tool whose entire job is integrity -- and it is indistinguishable from
+    # a real finding.
+    #
+    # Observed exactly that on 2026-07-14: three sessions live, auto-pick landed on
+    # the wrong one, and three thoroughly-reviewed files were reported as bypassed.
+    # So when it is ambiguous, do not choose. Say so and exit 2 (cannot run), which
+    # is a REFUSAL, not a pass.
+    sid = args.session_id
+    if not sid:
+        window_h = args.hours if args.hours > 0 else 24.0
+        live = sessions_with_activity(window_h)
+        if len(live) > 1:
+            print(f"AMBIGUOUS: {len(live)} sessions wrote evidence in the last "
+                  f"{window_h:g}h (they need not have overlapped). Auto-picking one "
+                  f"COULD land on the wrong session's reviews, which could cause "
+                  f"reviewed files to be reported as bypassed.", file=sys.stderr)
+            for s in live:
+                print(f"  --session-id {s}", file=sys.stderr)
+            print("Re-run with --session-id. Refusing to guess.", file=sys.stderr)
+            return 2
+        sid = live[0] if live else newest_session()
     if not sid:
         print("no session found under ~/.claude/state/", file=sys.stderr)
         return 2

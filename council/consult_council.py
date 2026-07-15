@@ -247,6 +247,18 @@ PITCH_LOG_MAX_BYTES = 200_000
 
 ALL_MEMBERS = ("codex", "gemini", "deepseek")
 
+# How many members must cast BLOCK before the fire BLOCKs and the file is
+# auto-reverted.
+#
+# 2 = a quorum: a lone dissenting member warns loudly (see emit_output) but does
+#     NOT revert, so no single critic can destroy work on its own; two must agree.
+# 1 = the older behaviour, where any single BLOCK reverts. Auto-revert destroys
+#     work, so raising or lowering this threshold is a deliberate policy choice.
+#
+# Do not raise it above the member count, or BLOCK becomes unreachable and
+# enforcement is theatre.
+BLOCK_QUORUM = 2
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1862,11 +1874,57 @@ def lost_votes(results: list[dict]) -> list[dict]:
 
 
 def determine_final_verdict(active_results: list[dict]) -> str:
+    """The council's verdict. BLOCK requires a QUORUM, not a single voice.
+
+    WHY BLOCK IS A VOTE AND NOT A VETO.
+
+    A BLOCK auto-reverts the user's file, so it is the only verdict that DESTROYS
+    work. It used to fire on a single member. Measured over 4,387 posttool fires:
+
+      - 281 fires (6.41%) reached BLOCK, and 101 of those rode on ONE member.
+      - Of those 101 lone BLOCKs, 47 came with the other TWO members saying PASS --
+        a file reverted while a majority of the council saw nothing wrong at all.
+      - codex cast 73 of the 101 lone BLOCKs. deepseek has cast ZERO in 64 BLOCKs;
+        it has never once unilaterally reverted a file.
+
+    Requiring two would have cut auto-reverts from 281 to 180 (-36%). It also makes
+    the council SCALE: a veto gets more trigger-happy with every member added, while
+    a quorum does not. Simulated on the measured correlation structure, a 7-critic
+    council under a veto reverts 9.37% of fires; under this quorum it reverts 5.74%
+    -- BELOW today's 3-critic veto rate of 6.41%. That is what makes adding members
+    affordable.
+
+    WHAT THIS DOES NOT ESTABLISH, and it matters:
+      - It does NOT show those 101 lone BLOCKs were WRONG. Nobody adjudicated them.
+        A lone blocker may be the only member who saw the defect. This rule TRADES
+        sensitivity for precision on an unmeasured exchange rate, deliberately,
+        because the cost of a wrong BLOCK (destroyed work) is paid immediately and
+        the cost of a missed BLOCK is a WARN that Claude still has to answer.
+      - The quorum is counted on ROUND-2 verdicts, and round 2 is where members SEE
+        each other. Measured: P(a member BLOCKs) is 0.81% when no peer blocked and
+        54.30% when one did -- a 67x jump. That is consistent with genuine shared
+        signal AND with herding, and round-2 data cannot separate them. If it is
+        herding, then "two members agreed" is one judgment counted twice and this
+        quorum is weaker than it looks. Round-1 verdicts are now logged precisely so
+        that P(BLOCK in round 1 | peer BLOCKed in round 1) can settle it. Until it
+        does, treat the quorum as an improvement on a veto, not as proof of
+        corroboration.
+
+    Every member verdict is logged, so ANY threshold can be re-evaluated against the
+    corpus offline. This one is not a guess that has to stand; it is a default that
+    can be re-derived.
+    """
     if not active_results:
         return "ERROR"
     verdicts = [r["verdict"] for r in active_results]
-    if any(v == "BLOCK" for v in verdicts):
+    if sum(1 for v in verdicts if v == "BLOCK") >= BLOCK_QUORUM:
         return "BLOCK"
+    # A BLOCK below quorum does NOT revert, but it must not be swallowed either: it
+    # is a member demanding the work be undone. It comes out as WARN, and
+    # emit_output names it as a sub-quorum BLOCK so the dissent is loud rather than
+    # silently downgraded.
+    if any(v == "BLOCK" for v in verdicts):
+        return "WARN"
     # A lost vote (UNPARSEABLE or ERROR) is handled CONSERVATIVELY: it cannot
     # count as a PASS, so it prevents an all-PASS consensus and the fire comes
     # out as WARN. That is the pre-existing behaviour and it is deliberately
@@ -1884,7 +1942,8 @@ def determine_final_verdict(active_results: list[dict]) -> str:
 
 def write_log(layer: str, tool_name: str | None, target_path: str | None,
               pitch: str, all_results: list[dict], final_verdict: str,
-              session_id: str = "") -> Path:
+              session_id: str = "",
+              round1_results: list[dict] | None = None) -> Path:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     log_dir = LOGS_ROOT / today
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1910,6 +1969,73 @@ def write_log(layer: str, tool_name: str | None, target_path: str | None,
         "pitch": pitch_logged,
         "members": all_results,
         "final_verdict": final_verdict,
+
+        # DEPTH PROVENANCE. Before these two fields existed, the entry recorded
+        # nothing about the EFFORT a run was made at. Entries still differed from
+        # one another (timestamp, durations, member text), but on the axis of
+        # depth a FAST verdict and a normal-mode verdict were indistinguishable.
+        # ("Normal mode" is the configured effort, which is not the maximum:
+        # locally deepseek runs at "high", one notch below "max".)
+        #
+        # It matters because the log-derived metrics -- the per-edit clean rate,
+        # the findings/fire trend, every council_outcome cohort -- are computed
+        # from these files. An unrecorded FAST run does not merely lose
+        # information there: it launders a shallower look into the evidence base
+        # as though it were a normal-depth one.
+        #
+        # Both fields, deliberately. "fast_mode" is the SWITCH; "effort" is what
+        # each member that ACTUALLY RAN was sent. They disagree if FAST_EFFORT is
+        # retuned later, and the one that explains a run's behavior is "effort".
+        #
+        # "effort" is keyed off all_results, NOT ALL_MEMBERS, because --members
+        # can run a subset and ALL_MEMBERS would record an effort for a member
+        # that never ran. The `in FAST_EFFORT` guard is load-bearing, not
+        # defensive: --external-verdict NAME=PATH admits an ARBITRARY role string
+        # into all_results, and effort_for() raises KeyError on an unknown member.
+        # Without the guard an external verdict crashes write_log AFTER whichever
+        # built-in members were requested have already run, losing the whole
+        # review at the last step.
+        #
+        # KNOWN GAP IN THE CORPUS: logs from 11:24:29Z to 11:30:13Z on 2026-07-14
+        # (7 runs) were made with FAST armed but predate these fields, so their
+        # depth is unrecoverable from the log alone. duration_s is suggestive
+        # (FAST measured ~3.7x faster) but is an inference, not a record.
+        #
+        # NB when correlating by hand: log timestamps and filenames are UTC, but
+        # `stat` prints mtime in local time. Reading a -0500 mtime as UTC
+        # misaligns the two by five hours.
+        #
+        # CONSUMERS: a MISSING key means UNKNOWN, not False. Every log written
+        # before this change lacks it. `entry.get("fast_mode")` is falsey for
+        # those, which would silently read "unknown provenance" as "full
+        # strength" -- the exact upgrade-the-evidence move this project exists to
+        # stop. Test for the key's PRESENCE before trusting either field.
+        "fast_mode": fast_mode(),
+        "effort": {r["role"]: effort_for(r["role"]) for r in all_results
+                   if r.get("role") in FAST_EFFORT},
+
+        # ROUND-1 (PRE-ANCHORING) VERDICTS. `members` above holds ROUND 2, where
+        # every member has already seen every other member's round-1 verdict. That
+        # is the right thing to ENFORCE on -- a member who is talked out of a bad
+        # call should be -- but it is the wrong thing to MEASURE independence with,
+        # and until now it was the only thing kept.
+        #
+        # The cost of that: any statistic computed from `members` about whether the
+        # members agree cannot separate "they independently found the same defect"
+        # from "the later ones deferred to the first". Measured on the round-2 logs,
+        # members flag together 1.6-1.9x more often than independence predicts and
+        # deepseek has never once cast a lone BLOCK -- both are consistent with real
+        # shared signal AND with anchoring, and the logs could not tell them apart
+        # because round 1 was computed, used, and thrown away on every fire.
+        #
+        # It is kept WITHOUT stderr, which is the bulky part and is already captured
+        # for round 2. Absent key means the fire predates this, i.e. UNKNOWN -- same
+        # rule as fast_mode, for the same reason. Empty list is different: it means
+        # the round genuinely did not run (fewer than two members, see main()).
+        "round1": [
+            {k: v for k, v in r.items() if k != "stderr"}
+            for r in (round1_results or [])
+        ],
     }
     log_path.write_text(json.dumps(entry, indent=2, default=str))
     return log_path
@@ -1926,6 +2052,19 @@ def emit_output(results: list[dict], final_verdict: str, log_path: Path) -> None
         return lines[-1] if lines else ""
 
     print(f"VERDICT: {final_verdict}")
+
+    # A BLOCK that did not reach quorum does NOT revert the file, and that silence
+    # would be the dangerous part: a member demanded the work be undone and the
+    # only trace would be a WARN indistinguishable from a style nit. Name it.
+    blockers = [r["role"] for r in results if r.get("verdict") == "BLOCK"]
+    if blockers and len(blockers) < BLOCK_QUORUM:
+        print(f"# SUB-QUORUM BLOCK: {', '.join(blockers)} voted BLOCK, but "
+              f"{BLOCK_QUORUM} are required to auto-revert, so the file STANDS.")
+        print("# This is not a downgrade of the objection. A member is saying the "
+              "work should be undone.")
+        print("# Answer it on the merits or revert by hand; do not read the "
+              "surviving file as vindication.")
+
     if fast_mode():
         # ANNOUNCE IT. A fast PASS is indistinguishable from a real one on the
         # page, and that is precisely the danger of a speed switch: it converts
@@ -1935,10 +2074,10 @@ def emit_output(results: list[dict], final_verdict: str, log_path: Path) -> None
         effs = ", ".join(f"{m}={effort_for(m)}" for m in ALL_MEMBERS)
         print(f"# FAST MODE (touch/rm {FAST_PATH} to toggle). Members ran at "
               f"REDUCED effort: {effs}.")
-        print(f"# Measured on deepseek only (max 97.4s -> low 42.4s on a real "
-              f"prompt): lower effort is FASTER. Nothing measured it to be as "
-              f"GOOD, for any member. Treat a FAST PASS as 'no objection at "
-              f"reduced depth', not as a clean bill of health.")
+        print("# Measured on deepseek only (max 97.4s -> low 42.4s on a real "
+              "prompt): lower effort is FASTER. Nothing measured it to be as "
+              "GOOD, for any member. Treat a FAST PASS as 'no objection at "
+              "reduced depth', not as a clean bill of health.")
     print(f"# log: {log_path}")
     for r in results:
         line = f"# member: {r['role']} verdict={r['verdict']}"
@@ -2004,8 +2143,8 @@ def emit_output(results: list[dict], final_verdict: str, log_path: Path) -> None
             if hint:
                 print(f"[no text returned; possible error line from stderr: {hint}]")
             else:
-                print(f"[no text returned]")
-            print(f"[stderr tail (last 2000 chars):]")
+                print("[no text returned]")
+            print("[stderr tail (last 2000 chars):]")
             print(r["stderr"].strip()[-2000:])
         else:
             print(text)
@@ -2168,7 +2307,8 @@ async def main() -> int:
     final_verdict = determine_final_verdict(all_results)
     log_path = write_log(args.layer, args.tool_name, args.target_path,
                          pitch, all_results, final_verdict,
-                         session_id=args.session_id)
+                         session_id=args.session_id,
+                         round1_results=list(round1_results))
     emit_output(all_results, final_verdict, log_path)
 
     return {"PASS": 0, "WARN": 1, "BLOCK": 2}.get(final_verdict, 3)

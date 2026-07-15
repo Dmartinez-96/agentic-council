@@ -478,12 +478,12 @@ def print_status(thread: dict, a: dict) -> None:
         print(f"#   {role:<9} {p['verdict']:<13} ({durs}){qstr}{mark}{note}")
     if a["converged"]:
         verds = ", ".join(f"{r}={a['per'][r]['verdict']}" for r in a["live"])
-        print(f"CONVERGENCE: YES")
+        print("CONVERGENCE: YES")
         print(f"CONSENSUS: {a['consensus']}  ({verds})")
     else:
         pend = [r for r in a["live"] if a["per"][r]["terminality"] != "terminal"]
         print(f"CONVERGENCE: NO  (still pending: {', '.join(pend) or 'none'})")
-        print(f"CONSENSUS: PENDING")
+        print("CONSENSUS: PENDING")
 
 
 def write_final_artifact(thread: dict, a: dict, premature: bool) -> Path:

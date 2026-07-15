@@ -165,6 +165,38 @@ def latest_labels(since: str = "") -> dict[str, dict]:
     return latest
 
 
+DEPTHS = ("normal", "fast", "unknown")
+
+
+def depth_of(log_entry: dict) -> str:
+    """Which SWITCH POSITION a council run was made under: normal/fast/unknown.
+
+    This reads `fast_mode` -- the state of the FAST switch -- and NOT the
+    `effort` map, and the difference matters. `fast_mode` says which regime was
+    in force; `effort` records the literal reasoning effort each member that ran
+    was sent, and it is the ground truth for what a member actually did.
+
+    So a shared `fast_mode` is NECESSARY but NOT SUFFICIENT for two runs to be
+    comparable: FAST_EFFORT (or the normal-mode constants) can be retuned between
+    runs, and two logs can then both say `fast_mode: true` while having been sent
+    different efforts. This function is a coarse SCREEN, not a proof of
+    comparability -- it is enough to keep fast and normal runs from being pooled
+    blindly, which is the failure it exists to stop. Anything that needs to
+    establish real comparability must read `effort` from the logs.
+
+    'unknown' is NOT a synonym for 'normal', and that distinction is the whole
+    point. Both fields were added on 2026-07-14; every log written before that
+    lacks them. A plain `log.get("fast_mode")` is falsey for those, so treating
+    the absent key as False would silently relabel every historical run --
+    including runs genuinely made with FAST armed -- as normal-depth. That is
+    fabricating provenance for 7,700+ logs, which is worse than admitting the
+    gap. Missing key -> 'unknown', and it stays visible as such.
+    """
+    if "fast_mode" not in log_entry:
+        return "unknown"
+    return "fast" if log_entry["fast_mode"] else "normal"
+
+
 def all_concerns(since: str = "") -> dict[str, dict]:
     """Every REASON from every WARN/BLOCK ever cast, keyed by concern_id."""
     concerns: dict[str, dict] = {}
@@ -175,14 +207,35 @@ def all_concerns(since: str = "") -> dict[str, dict]:
             d = json.loads(f.read_text())
         except Exception:  # noqa: BLE001
             continue
+        depth = depth_of(d)
         for m in d.get("members", []):
             if m.get("verdict") not in ("WARN", "BLOCK"):
                 continue
             for i, reason in enumerate(reasons_of(m)):
                 cid = concern_id(str(f), m.get("role", "?"), i)
                 concerns[cid] = {"log": str(f), "member": m.get("role"),
-                                 "verdict": m.get("verdict"), "reason": reason}
+                                 "verdict": m.get("verdict"), "reason": reason,
+                                 "depth": depth}
     return concerns
+
+
+def restriction_of(cohort: dict) -> str:
+    """What a cohort was RESTRICTED to when drawn; "" means a cross-section.
+
+    A cohort drawn with --verdict and/or --depth is a STRATUM: skewed by
+    construction, so its outcome mix is a fact about that stratum and nothing
+    else. One helper, so the several places that must agree on "is this a
+    stratum?" cannot drift apart.
+
+    Note the asymmetry with depth_of(), which is deliberate and is NOT a
+    copy-paste slip. There, a missing `fast_mode` means UNKNOWN, because the run
+    happened and we simply failed to record how deep it was. HERE, a missing
+    `depth_filter` means UNRESTRICTED, and that is not an assumption: cohorts
+    drawn before the flag existed were drawn from a pool that was never filtered
+    by depth, so "no filter recorded" and "no filter applied" are the same fact.
+    """
+    parts = [cohort.get("verdict_filter") or "", cohort.get("depth_filter") or ""]
+    return "+".join(p for p in parts if p)
 
 
 def read_cohorts() -> list[dict]:
@@ -257,7 +310,7 @@ def cmd_sample(args) -> int:
               f"({done}/{len(existing['concern_ids'])} labelled).", file=sys.stderr)
         print("Finish it before drawing another. Re-drawing to get a kinder "
               "sample is exactly what this rule exists to prevent.", file=sys.stderr)
-        print(f"  see it:  council_outcome.py cohort", file=sys.stderr)
+        print("  see it:  council_outcome.py cohort", file=sys.stderr)
         return 2
 
     concerns = all_concerns(args.since)
@@ -266,9 +319,14 @@ def cmd_sample(args) -> int:
     if args.verdict:
         todo = {cid: c for cid, c in todo.items()
                 if c["verdict"] == args.verdict}
+    if args.depth:
+        todo = {cid: c for cid, c in todo.items()
+                if c["depth"] == args.depth}
     if not todo:
-        if args.verdict:
-            print(f"no unlabelled {args.verdict} concerns in range.")
+        restrictions = [x for x in (args.verdict, args.depth) if x]
+        if restrictions:
+            print(f"no unlabelled concerns in range matching "
+                  f"{' + '.join(restrictions)}.")
         else:
             print("every concern in range is already labelled.")
         return 0
@@ -316,6 +374,7 @@ def cmd_sample(args) -> int:
         # the headline mix would bias that mix toward the restricted stratum
         # without saying so. Absent/empty means an unrestricted draw.
         "verdict_filter": args.verdict or "",
+        "depth_filter": args.depth or "",
         "abandoned_cohort": existing["cohort_id"] if (existing and args.force) else None,
     }
     with COHORTS.open("a") as fh:
@@ -705,8 +764,8 @@ def cmd_stats(args) -> int:
     # cross-section. Pooling the two would drag the headline mix toward whichever
     # stratum happened to have been sampled, and the number would never announce
     # that it had moved -- a bias with no symptom, which is the worst kind.
-    cross_cohorts = [c for c in windowed_cohorts if not c.get("verdict_filter")]
-    stratum_cohorts = [c for c in windowed_cohorts if c.get("verdict_filter")]
+    cross_cohorts = [c for c in windowed_cohorts if not restriction_of(c)]
+    stratum_cohorts = [c for c in windowed_cohorts if restriction_of(c)]
 
     in_window = [cid for c in cross_cohorts for cid in c["concern_ids"]]
     upheld_mix = collections.Counter(all_labels[cid]["outcome"] for cid in in_window
@@ -827,16 +886,16 @@ def cmd_stats(args) -> int:
         # whether a BLOCK is right. Restricting the draw is not the ONLY way to
         # get there (a large enough unrestricted sample would also work: reaching
         # ~30 BLOCK reasons that way costs ~310 labels). It is the affordable way.
-        for filt in sorted({c["verdict_filter"] for c in stratum_cohorts}):
+        for filt in sorted({restriction_of(c) for c in stratum_cohorts}):
             cids = [cid for c in stratum_cohorts
-                    if c["verdict_filter"] == filt for cid in c["concern_ids"]]
+                    if restriction_of(c) == filt for cid in c["concern_ids"]]
             mix = collections.Counter(all_labels[cid]["outcome"] for cid in cids
                                       if cid not in all_disputed)
             nd = sum(1 for cid in cids if cid in all_disputed)
             upheld_n = sum(mix.values())
             print()
             print(f"  STRATUM {filt}: {len(cids)} concern(s) drawn ONLY from "
-                  f"{filt} votes; {nd} DISPUTED.")
+                  f"the {filt} stratum; {nd} DISPUTED.")
             print(f"    Outcome mix, upheld only: "
                   f"{dict(mix) or '{} -- the council disputed EVERY label'}")
             if upheld_n:
@@ -856,21 +915,21 @@ def cmd_stats(args) -> int:
                 fp = mix.get("refuted", 0)
                 print(f"    REASON-level refutation rate = refuted-and-upheld / "
                       f"upheld = {fp}/{upheld_n} = {fp/upheld_n:.0%}")
-                print(f"    WHAT THIS IS NOT. It is not the rate at which a {filt}")
-                print(f"    FIRE is wrong, and enforcement (auto-revert) acts on")
-                print(f"    fires. Three gaps, none of them closed here:")
-                print(f"      - unit: a fire carries several reasons from several")
-                print(f"        members, and one surviving reason can still justify")
-                print(f"        it, so a refuted REASON is not a wrong FIRE;")
-                print(f"      - weighting: the draw is equal-per-member, so a member")
-                print(f"        who rarely flags counts as much as one who always")
+                print("    WHAT THIS IS NOT. It is not the rate at which a fire")
+                print(f"    in the {filt} stratum is wrong, and enforcement")
+                print("    (auto-revert) acts on fires. Three gaps, none closed here:")
+                print("      - unit: a fire carries several reasons from several")
+                print("        members, and one surviving reason can still justify")
+                print("        it, so a refuted REASON is not a wrong FIRE;")
+                print("      - weighting: the draw is equal-per-member, so a member")
+                print("        who rarely flags counts as much as one who always")
                 print(f"        does -- this is not weighted by real {filt} volume;")
                 print(f"      - n={upheld_n} is small. An order of magnitude, not a")
-                print(f"        point estimate.")
-                print(f"    Getting the fire-level rate needs a draw whose unit is")
-                print(f"    the FIRE. This sampler's unit is the reason.")
-            print(f"    This describes {filt} votes ONLY. It is not pooled into "
-                  f"the mix above and is not the council's overall rate.")
+                print("        point estimate.")
+                print("    Getting the fire-level rate needs a draw whose unit is")
+                print("    the FIRE. This sampler's unit is the reason.")
+            print(f"    This describes the {filt} stratum ONLY. It is not pooled "
+                  f"into the mix above and is not the council's overall rate.")
         if pending:
             print(f"  ({len(pending)} further assigned concern(s) still open and "
                   f"NOT included above.)")
@@ -892,11 +951,11 @@ def cmd_stats(args) -> int:
     # the entire control. They now sit in their own column and count toward
     # NOTHING.
     print("UPHELD labels only. 'provis' = labelled but not adjudicated: Claude's")
-    print("unexamined word, counted toward nothing. 'strat' = drawn in a --verdict")
-    print("STRATUM: held OUT of the outcome columns (a stratum is skewed by")
-    print("construction, so pooling it here would bias every column without the")
-    print("number ever announcing it moved), but still counted toward coverage,")
-    print("because labelling it was real work done on a real concern.")
+    print("unexamined word, counted toward nothing. 'strat' = drawn in a STRATUM")
+    print("(--verdict and/or --depth): held OUT of the outcome columns (a stratum")
+    print("is skewed by construction, so pooling it here would bias every column")
+    print("without the number ever announcing it moved), but still counted toward")
+    print("coverage, because labelling it was real work on a real concern.")
     print()
     print(f"{'member':10s} {'upheld':>7s} {'accept':>7s} {'refute':>7s} "
           f"{'immat':>6s} {'ignored':>8s} {'disputed':>9s} {'provis':>7s} "
@@ -906,7 +965,7 @@ def cmd_stats(args) -> int:
     per_total = collections.Counter(c["member"] for c in concerns.values())
     # Every stratum concern EVER drawn, not just the windowed ones: a stratum
     # label is skewed regardless of which reporting window it lands in.
-    stratum_cids = {cid for c in cohorts if c.get("verdict_filter")
+    stratum_cids = {cid for c in cohorts if restriction_of(c)
                     for cid in c["concern_ids"]}
     for cid, l in labels.items():
         adj = l.get("adjudication") or {}
@@ -1019,6 +1078,18 @@ def main() -> int:
                            "of this verdict. The cohort is then a STRATUM and is "
                            "reported separately, never pooled into the "
                            "cross-section mix.")
+    # A --depth draw is likewise a STRATUM. `normal` and `fast` are concerns
+    # raised by runs made at configured and at reduced effort respectively;
+    # `unknown` is every run logged before consult_council.py started recording
+    # the field on 2026-07-14, whose depth cannot be recovered. Restricting to
+    # one of them answers "does a reduced-effort council still raise concerns
+    # that hold up?", which the mixed pool cannot. It is recorded, and stats
+    # keeps it out of the cross-section mix.
+    p_sa.add_argument("--depth", choices=list(DEPTHS), default="",
+                      help="restrict the draw to concerns raised by runs at this "
+                           "depth (normal | fast | unknown). The cohort is then a "
+                           "STRATUM and is reported separately, never pooled into "
+                           "the cross-section mix.")
     p_sa.add_argument("--force", action="store_true",
                       help="abandon the open cohort and draw a new one. The "
                            "abandonment is written to the cohort log.")
