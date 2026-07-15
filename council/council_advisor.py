@@ -626,6 +626,41 @@ def escalation_hint(wrapper_stdout: str, session_id: str,
     )
 
 
+def batch_probe(payload: dict, tool_input: dict) -> None:
+    """NON-BLOCKING instrument, GATED on COUNCIL_ROOT/BATCH_PROBE. Records the turn and
+    tool identifiers on each edit fire so offline analysis can TEST whether edits group
+    into same-turn, same-file batches.
+
+    VERIFIED PRESENT 2026-07-15 (batch_probe.jsonl, real hook payload): the PostToolUse
+    payload carries `prompt_id` and `tool_use_id`. Only their PRESENCE is confirmed,
+    not their semantics. Working hypothesis, to check once a real multi-edit turn is
+    logged: `tool_use_id` is unique per edit call, and `prompt_id` is shared across the
+    tool calls of one turn (the batch grouping key). IF that holds, a batch shows as
+    >=2 records sharing one prompt_id and file -- detectable with no transcript
+    reconstruction and no content-hash guessing (an earlier draft of this probe did
+    both; the identifiers were in the payload all along, just unread by the advisor),
+    their timestamps spaced ~one review apart because this hook blocks.
+
+    Changes no review decision and does not touch the verdict or the file -- when
+    enabled it only appends to batch_probe.jsonl. Every failure is swallowed: a probe
+    must never break the review. Motivated by the 2026-07-15 coalescing discussion.
+    """
+    try:
+        if not (COUNCIL_ROOT / "BATCH_PROBE").exists():
+            return
+        rec = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "session_id": payload.get("session_id") or "",
+            "file": tool_input.get("file_path") or tool_input.get("notebook_path") or "",
+            "prompt_id": payload.get("prompt_id"),      # presumed turn id (grouping unverified)
+            "tool_use_id": payload.get("tool_use_id"),  # this edit call's id
+        }
+        with (COUNCIL_ROOT / "batch_probe.jsonl").open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:  # noqa: BLE001  a probe must never break the hook
+        pass
+
+
 def main() -> int:
     # Kill switch: `touch <council dir>/DISABLED` silences this hook;
     # `rm` re-enables it. Checked per call, so it works mid-session.
@@ -681,6 +716,11 @@ def main() -> int:
 
     if tool_name not in SUPPORTED_TOOLS:
         return 0  # matcher should prevent; be defensive
+
+    # Measurement only: no-op unless COUNCIL_ROOT/BATCH_PROBE exists. When enabled it
+    # reads the transcript tail and appends to batch_probe.jsonl, but it makes no
+    # review decision and does not touch the verdict or the file -- behaviour-neutral.
+    batch_probe(payload, tool_input)
 
     if not WRAPPER.exists():
         print(f"council-advisor: wrapper missing at {WRAPPER}", file=sys.stderr)
