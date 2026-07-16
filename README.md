@@ -32,6 +32,41 @@ filesystem access, and gemini is *dropped* rather than falling back to any CLI.
 codex is the only subprocess member and runs under `--sandbox read-only`. Do not
 "improve" this by giving a member tools.
 
+## The shadow tier (layer 2: optional, non-voting)
+
+Behind the three voting members there is an optional second tier of critics from
+other model families -- kimi, glm, and grok -- queried through OpenRouter. They
+are **non-voting**. A shadow critic's verdict is logged and shown to you (marked
+`NON-VOTING`), but it is held out of consensus entirely: it cannot change a
+verdict and it can never trigger auto-revert. The purpose is a low-risk vetting
+ground. A different-family model runs alongside the real council so you can see
+what it uniquely catches, without letting it touch your files.
+
+| shadow member | primary model | fallback |
+|---|---|---|
+| kimi | `moonshotai/kimi-k2-thinking` | `moonshotai/kimi-k2.6` |
+| glm  | `z-ai/glm-5.2` | `z-ai/glm-5` |
+| grok | `x-ai/grok-4.5` | `x-ai/grok-4.3` |
+
+All three run through a single OpenRouter key. Each pair is passed as OpenRouter's
+`models` array, so a primary that is down or rate-limited falls through to the
+fallback automatically, and the reply reports which one answered.
+
+**It is off by default, and turning it on takes two deliberate steps:**
+
+1. Export `OPENROUTER_API_KEY` in the environment Claude Code launches under.
+2. `touch <council_root>/SHADOW`.
+
+The marker is required ON TOP OF the key, on purpose: having `OPENROUTER_API_KEY`
+exported for some other tool must never silently start spending money here. With
+the key set but no `SHADOW` file, the tier stays dark. `rm <council_root>/SHADOW`
+turns it off again; like the other switches it is checked per fire, so it takes
+effect mid-session. When enabled, each fire adds one call per shadow member --
+three more calls on top of the voting members' two to six.
+
+Each shadow verdict is written to a `shadow` field in the log entry. That is the
+data you would use to decide whether a new family has earned a voting seat.
+
 ## What fires, and when
 
 - **PreToolUse** (`laziness_gate.py`). Regex-scans the proposed content for
@@ -179,8 +214,9 @@ is checked per call, so it works mid-session.
 
 ## What this costs you
 
-- **Two to six model calls per Write/Edit/NotebookEdit**, depending on how many
-  members your keys enable. Check your vendors' pricing.
+- **Two to six model calls per Write/Edit/NotebookEdit** from the voting members,
+  depending on how many your keys enable -- plus **three more** when the optional
+  shadow tier is enabled (see "The shadow tier" above). Check your vendors' pricing.
 - **Latency**: members run in parallel, so wall time per fire is roughly twice the
   slowest member's round trip, not the sum of all of them.
 - **Noise**: `WARN` is common and `BLOCK` is not. Whether that is signal or

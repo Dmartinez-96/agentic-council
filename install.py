@@ -182,6 +182,22 @@ def check_deepseek(rep: Reporter) -> None:
                  "runs under to enable it.")
 
 
+def check_openrouter(rep: Reporter) -> None:
+    """Informational. OpenRouter powers the OPTIONAL, non-voting layer-2 shadow
+    critics (kimi/glm/grok). They are OFF by default and require TWO things: the
+    OPENROUTER_API_KEY here AND a `SHADOW` marker file in the council root. The key
+    alone does nothing, by design, so nobody pays for shadow calls merely for
+    having the key exported for another tool."""
+    if os.environ.get("OPENROUTER_API_KEY"):
+        rep.info("OPENROUTER_API_KEY present (value not printed): the optional "
+                 "non-voting shadow tier (kimi/glm/grok) is AVAILABLE but stays "
+                 "OFF until you `touch <council_root>/SHADOW`.")
+    else:
+        rep.info("OPENROUTER_API_KEY not set: the optional layer-2 shadow critics "
+                 "(kimi/glm/grok via OpenRouter) are unavailable. Set the key AND "
+                 "`touch <council_root>/SHADOW` to enable them; both are required.")
+
+
 def check_standing_rules(rep: Reporter) -> None:
     """Informational. The council READS ~/.claude/CLAUDE.md and shows it to every
     member, so bar item 12 can cite the user's own rules by name. Without the file
@@ -495,7 +511,7 @@ def main() -> int:
     args = parse_args()
     rep = Reporter(dry_run=args.dry_run, quiet=args.quiet)
     council_root = (args.council_root or DEFAULT_COUNCIL_ROOT).expanduser()
-    rep.info(f"agentic-council installer")
+    rep.info("agentic-council installer")
     rep.info(f"  repo root:    {REPO_ROOT}")
     rep.info(f"  council root: {council_root}")
     rep.info(f"  dry-run:      {args.dry_run}")
@@ -510,6 +526,7 @@ def main() -> int:
     if not check_gemini_key(rep):
         ok = False
     check_deepseek(rep)
+    check_openrouter(rep)
     check_standing_rules(rep)
     check_bubblewrap(rep)
 
