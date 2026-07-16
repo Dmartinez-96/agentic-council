@@ -18,6 +18,8 @@ council/logs/
 council/threads/
 # council_outcome.py -> labels + adjudications
 council/outcomes.jsonl
+# council_shadow_audit.py -> shadow-catch user rulings
+council/shadow_outcomes.jsonl
 # council_outcome.py -> drawn cohorts + their seeds
 council/sample_cohorts.jsonl
 # council_advisor.py -> auto-revert parks the REJECTED file content here.

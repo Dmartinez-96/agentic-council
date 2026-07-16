@@ -65,6 +65,7 @@ COUNCIL_FILES = [
     "council_dialogue.py",
     "council_outcome.py",
     "council_audit_writes.py",
+    "council_shadow_audit.py",
     "laziness_gate.py",
     "stop_audit.py",
     "session_start_probe.py",
@@ -72,6 +73,7 @@ COUNCIL_FILES = [
     "evidence_logger.py",
     "council_system_prompt.md",
     "council_dialogue_prompt.md",
+    "council_layer2_prompt.md",
 ]
 EXECUTABLE_FILES = [f for f in COUNCIL_FILES if f.endswith(".py")]
 

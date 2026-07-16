@@ -41,6 +41,7 @@ from pathlib import Path
 # anywhere; see install.py, which copies every script into one dir.
 COUNCIL_ROOT = Path(__file__).resolve().parent
 SYSTEM_PROMPT_PATH = COUNCIL_ROOT / "council_system_prompt.md"
+LAYER2_PROMPT_PATH = COUNCIL_ROOT / "council_layer2_prompt.md"
 LOGS_ROOT = COUNCIL_ROOT / "logs"
 # codex is the ONLY subprocess council member. It is launched in
 # _run_subprocess with this dir prepended to PATH; the dir holds a `git`
@@ -1231,7 +1232,8 @@ def build_prompt(system_prompt: str, pitch: str, evidence_block: str = "",
                  user_directives_block: str = "",
                  round1_block: str = "",
                  assistant_block: str = "",
-                 standing_rules_block: str = "") -> str:
+                 standing_rules_block: str = "",
+                 council_conclusion_block: str = "") -> str:
     """Assemble a member's prompt. SECTION ORDER IS LOAD-BEARING.
 
     Claude's own prior messages used to be CONCATENATED onto the end of the
@@ -1275,6 +1277,11 @@ def build_prompt(system_prompt: str, pitch: str, evidence_block: str = "",
     sections.append(f"Proposal under review:\n\n{pitch}")
     if round1_block:
         sections.append(round1_block)
+    # LAYER 2 ONLY: the council's conclusion, placed LAST so the inspector reads the
+    # transcript and proposal before it meets the verdict. Empty for the voting
+    # members, which is what keeps layer 1 blind to layer 2.
+    if council_conclusion_block:
+        sections.append(council_conclusion_block)
     return "\n\n---\n\n".join(sections) + "\n"
 
 
@@ -1316,6 +1323,38 @@ def format_round1_block(round1_results: list[dict]) -> str:
             body_lines.append("(no text returned)")
         body_lines.append("")
     return "\n".join(body_lines).rstrip() + "\n"
+
+
+def format_council_conclusion(all_results: list[dict], final_verdict: str) -> str:
+    """Format the council's final results into one block for the layer-2 inspector.
+
+    Takes `all_results` -- the voting members' final verdicts and reasoning, plus
+    any external verdicts (and, with fewer than two built-in members, the round-1
+    result) -- and the aggregate final verdict. main() passes this ONLY to the
+    layer-2 run, as its trailing section after the transcript and proposal, and
+    never to the voting members: that is what keeps layer 1 blind to layer 2.
+    """
+    if not all_results:
+        return ""
+    lines: list[str] = [
+        "## The council's conclusion (layer 1) -- for your inspection",
+        "",
+        ("The first-layer council has already reviewed the proposal above. Form "
+         "your OWN assessment from the transcript and proposal FIRST, then inspect "
+         "this conclusion: did they miss something, over-flag something, or get it "
+         "right?"),
+        "",
+        f"Final council verdict: {final_verdict}",
+        "",
+    ]
+    for r in all_results:
+        role = r.get("role", "?")
+        verdict = r.get("verdict", "?")
+        text = (r.get("text") or "").strip()
+        lines.append(f"### {role}: {verdict}")
+        lines.append(text if text else "(no text returned)")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _ensure_nogit_stub() -> Path:
@@ -1927,10 +1966,12 @@ async def run_openrouter(role: str, models: list[str], pitch: str,
                          user_directives_block: str = "",
                          round1_block: str = "",
                          assistant_block: str = "",
-                         standing_rules_block: str = "") -> dict:
+                         standing_rules_block: str = "",
+                         council_conclusion_block: str = "") -> dict:
     prompt = build_prompt(system_prompt, pitch, evidence_block,
                           user_directives_block, round1_block,
-                          assistant_block, standing_rules_block)
+                          assistant_block, standing_rules_block,
+                          council_conclusion_block)
     return await asyncio.to_thread(_openrouter_call_blocking, role, models, prompt)
 
 
@@ -2216,17 +2257,36 @@ def emit_output(results: list[dict], final_verdict: str, log_path: Path,
         print(line)
     print()
 
-    # Layer-2 shadow members, shown so they are VISIBLE when they fire but clearly
-    # marked NON-VOTING -- they are already excluded from `results`/the verdict, and
-    # this display must not blur that. `model_used` names which of the [primary,
-    # fallback] pair OpenRouter actually served.
+    # Layer-2 members, shown so they are VISIBLE when they fire but clearly marked
+    # NON-VOTING -- they are already excluded from `results`/the verdict, and this
+    # display must not blur that. `model_used` names which of the [primary, fallback]
+    # pair OpenRouter actually served.
     for r in (shadow_results or []):
         used = f" via {r['model_used']}" if r.get("model_used") else ""
         extra = ""
         if r["verdict"] == "ERROR":
             extra = f" stderr_hint={extract_error_reason(r['stderr'])[:160]!r}"
-        print(f"# shadow (NON-VOTING): {r['role']} verdict={r['verdict']}{used}{extra}")
+        print(f"# layer-2 (NON-VOTING): {r['role']} verdict={r['verdict']}{used}{extra}")
     if shadow_results:
+        print()
+
+    # Layer-2 REASONING, surfaced IN FULL so Claude can SEE the argument -- not just
+    # the verdict. Shown for EVERY layer-2 result that returned text, PASS INCLUDED:
+    # the layer-2 prompt asks for a short note even when it agrees with the council,
+    # and filtering to WARN/BLOCK would silently drop that note -- both a rule-2 loss
+    # and a breach of the "entirely visible to Claude" directive. Only empty/ERROR
+    # results (no text) are skipped; their one-liner above already carries the stderr
+    # hint. Placed BEFORE the PASS early-return below, so it shows even when the
+    # voting council PASSed: a layer-2 disagreement with a council PASS is the single
+    # most useful thing to read. Non-voting; changes no verdict. council_shadow_audit.py
+    # is where you (not the council) rule on whether a layer-2 catch was actually right.
+    layer2_detail = [r for r in (shadow_results or [])
+                     if (r.get("text") or "").strip()]
+    for r in layer2_detail:
+        print(f"## layer-2 {r['role']} (NON-VOTING, verdict {r['verdict']}) -- "
+              f"advisory only, changes no verdict")
+        print()
+        print((r.get("text") or "").strip())
         print()
 
     # Fail LOUD. A lost vote used to disappear into the WARN branch of
@@ -2347,6 +2407,12 @@ async def main() -> int:
         print(f"ERROR: missing system prompt at {SYSTEM_PROMPT_PATH}", file=sys.stderr)
         return 3
     system_prompt = SYSTEM_PROMPT_PATH.read_text()
+    # Layer-2 inspector prompt = the same quality bar plus the post-council
+    # addendum. Falls back to the bare critic prompt if the addendum file is
+    # missing, so a partial install still runs layer 2, just without the framing.
+    layer2_prompt = system_prompt
+    if LAYER2_PROMPT_PATH.exists():
+        layer2_prompt = system_prompt + "\n\n" + LAYER2_PROMPT_PATH.read_text()
 
     members = parse_members(args.members)
     # Drop deepseek when its key is absent from the environment, so a
@@ -2407,24 +2473,15 @@ async def main() -> int:
     # it is not a full filesystem sandbox.
     member_cwd = Path(tempfile.mkdtemp(prefix="council_member_"))
 
-    # Layer-2 SHADOW members (OpenRouter) run CONCURRENTLY with the voting rounds and
-    # INDEPENDENTLY of them: they get the same proposal/evidence/standing-rules but
-    # NOT the members' round-1 verdicts (round1_block=""), so their catches are
-    # de-anchored. The task is created here -- so it starts and overlaps the voting
-    # rounds -- and awaited below; its results go into their own `shadow_results`,
-    # never into `all_results`, so a shadow can neither vote nor trigger auto-revert.
-    # Gated on BOTH the explicit SHADOW opt-in marker AND the key: absent either,
-    # the roster is empty. Requiring the marker (not the key alone) is what keeps a
-    # user who merely has OPENROUTER_API_KEY exported for other tooling from paying
-    # for silent shadow calls on every edit.
+    # LAYER 2 (kimi/glm/grok via OpenRouter) is gated on BOTH the explicit SHADOW
+    # opt-in marker AND the key: absent either, the roster is empty. Requiring the
+    # marker (not the key alone) keeps a user who merely has OPENROUTER_API_KEY
+    # exported for other tooling from paying for silent layer-2 calls per edit.
+    # It does NOT run here: layer 2 inspects the council's CONCLUSION, so it is
+    # fired AFTER the voting rounds finish (see below). This replaces the older
+    # design where it ran concurrently and de-anchored from the verdict.
     shadow_enabled = SHADOW_PATH.exists() and bool(os.environ.get(OPENROUTER_KEY_ENV))
     shadow_roles = list(SHADOW_MEMBERS) if shadow_enabled else []
-    shadow_task = asyncio.gather(*[
-        run_openrouter(r, list(SHADOW_MEMBERS[r]), pitch, system_prompt,
-                       evidence_block, user_directives_block, "",
-                       assistant_block, standing_rules_block)
-        for r in shadow_roles
-    ]) if shadow_roles else None
 
     # Round 1: each member sees the proposal independently and emits
     # an initial verdict.
@@ -2462,13 +2519,27 @@ async def main() -> int:
                                                  member_cwd)
 
     shutil.rmtree(member_cwd, ignore_errors=True)
-    # Retrieve the shadow task created before the voting rounds (it ran concurrently
-    # with them -- verified: asyncio.gather schedules its coroutines as Tasks on
-    # creation). shadow_results stays OUT of all_results, so determine_final_verdict
-    # never sees it and a shadow can neither vote nor trigger auto-revert.
-    shadow_results = list(await shadow_task) if shadow_task is not None else []
     all_results = list(builtin_results) + external
     final_verdict = determine_final_verdict(all_results)
+
+    # LAYER 2 runs HERE, AFTER the council concluded, because it inspects that
+    # conclusion. It receives the transcript and proposal (as the voting members
+    # did) PLUS the council's conclusion as a trailing block, under the layer-2
+    # inspector prompt. shadow_results stays OUT of all_results (already computed
+    # above), so layer 2 cannot vote or trigger auto-revert -- advisory, visible
+    # only to Claude. It is sequential after the rounds (it needs the concluded
+    # verdict), so it adds its own round-trip to the feedback: the cost of
+    # inspecting the conclusion rather than running blind to it.
+    shadow_results: list[dict] = []
+    if shadow_roles:
+        conclusion_block = format_council_conclusion(all_results, final_verdict)
+        shadow_results = list(await asyncio.gather(*[
+            run_openrouter(r, list(SHADOW_MEMBERS[r]), pitch, layer2_prompt,
+                           evidence_block, user_directives_block, "",
+                           assistant_block, standing_rules_block,
+                           conclusion_block)
+            for r in shadow_roles
+        ]))
     log_path = write_log(args.layer, args.tool_name, args.target_path,
                          pitch, all_results, final_verdict,
                          session_id=args.session_id,
