@@ -1,0 +1,48 @@
+body {
+  /* --vscode-font-family is not on the documented webview variable list
+     (code.visualstudio.com/api/extension-guides/webview documents only the
+     editor.font* trio, checked 2026-07-18), so a fallback guards it. All
+     other --vscode-* names below map 1:1 to keys on the theme-color
+     reference via the documented prefix-and-hyphen convention. */
+  font-family: var(--vscode-font-family, sans-serif);
+  color: var(--vscode-foreground);
+  padding: 0 1rem 2rem;
+}
+h1 { font-size: 1.3em; }
+h2 { font-size: 1.1em; margin-top: 1.4em; }
+table { border-collapse: collapse; }
+th, td { text-align: left; padding: 0.25em 0.9em 0.25em 0; }
+input[type="text"], textarea, select {
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, transparent);
+  padding: 0.25em;
+}
+textarea { width: 100%; box-sizing: border-box; }
+button {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border: none;
+  padding: 0.35em 0.9em;
+  cursor: pointer;
+}
+button:hover { background: var(--vscode-button-hoverBackground); }
+button:disabled { opacity: 0.5; cursor: default; }
+.row { display: flex; gap: 0.5em; margin: 0.6em 0; align-items: center; }
+.error { color: var(--vscode-errorForeground); }
+.warning { color: var(--vscode-editorWarning-foreground, orange); }
+#verdict-output {
+  white-space: pre-wrap;
+  border-top: 1px solid var(--vscode-panel-border);
+  padding-top: 0.5em;
+}
+#verdict-output.pass { border-left: 3px solid #2da042; padding-left: 0.5em; }
+#verdict-output.warn { border-left: 3px solid #d19a1e; padding-left: 0.5em; }
+#verdict-output.block { border-left: 3px solid #d13438; padding-left: 0.5em; }
+label { margin-right: 0.6em; }
+/* Keep each tier radio glued to its own text so a wrap can never split "voting" from its
+   button; the gap BETWEEN the two tier labels comes from the label margin-right above. */
+.tier-choice { white-space: nowrap; }
+.hint { opacity: 0.85; font-size: 0.9em; margin: 0.3em 0 0.7em; }
+#markers-section label { display: block; margin: 0.3em 0; }
+#markers-status { color: var(--vscode-errorForeground); }

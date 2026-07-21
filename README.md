@@ -212,6 +212,20 @@ environment. A common trap is exporting them below the early-return guard in
 `touch <council_root>/DISABLED` silences every hook, and `rm` re-enables it. It
 is checked per call, so it works mid-session.
 
+### FAST mode (speed vs depth)
+
+`touch <council_root>/FAST` drops every non-Claude member to its lowest reasoning
+effort; `rm <council_root>/FAST` restores full depth. Checked per call, so it works
+mid-session. It is faster per fire, but nothing measured it to be as GOOD -- lower
+effort is faster, not better. It ANNOUNCES itself in the verdict (a `# FAST MODE`
+banner from emit_output), because a fast PASS otherwise reads exactly like a
+full-depth one. Two warnings:
+
+- FAST is a SINGLE FILE on the install, not a per-session flag, so arming it sets
+  review depth for EVERY concurrent session that shares this install, not just yours.
+  Treat a FAST PASS as "no objection at reduced depth", not a clean bill of health.
+- It changes only the reasoning effort each member is sent, not which models run.
+
 ## What this costs you
 
 - **Two to six model calls per Write/Edit/NotebookEdit** from the voting members,

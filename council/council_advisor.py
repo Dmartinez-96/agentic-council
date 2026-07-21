@@ -737,6 +737,10 @@ def main() -> int:
         "--layer", "posttool",
         "--tool-name", tool_name,
         "--target-path", target_for_log,
+        # The containment jail for member REQUEST_FILE retrieval. Passed
+        # explicitly rather than inherited through the subprocess cwd, so the
+        # engine's jail root never depends on an implicit contract.
+        "--workdir", cwd,
     ]
     if session_id:
         cmd.extend(["--session-id", session_id])

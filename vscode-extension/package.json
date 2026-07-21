@@ -1,0 +1,48 @@
+{
+  "name": "workers-council",
+  "displayName": "Workers' Council",
+  "description": "Panel for the multi-LLM adversarial review council: assign members to layers, choose billing routes, and consult the panel. Shells out to consult_council.py; never handles API keys itself.",
+  "version": "0.1.0",
+  "publisher": "agentic-council",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "council.openPanel",
+        "title": "Council: Open Panel"
+      }
+    ],
+    "configuration": {
+      "title": "Workers' Council",
+      "properties": {
+        "council.rootPath": {
+          "type": "string",
+          "default": "",
+          "description": "Directory containing consult_council.py. When empty, each workspace folder is searched, then its council/ and Council/ subdirectories, then its parent directory."
+        },
+        "council.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python interpreter used to run the council engine."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
