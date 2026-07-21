@@ -1916,8 +1916,11 @@ async def run_deepseek(pitch: str, system_prompt: str, cwd: Path,
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
 
-# Opt-in marker for the layer-2 shadow critics (toggled with `touch`/`rm SHADOW`).
-SHADOW_PATH = COUNCIL_ROOT / "SHADOW"
+# Layer 2 (the inspector tier) is HALF THE COUNCIL and runs BY DEFAULT whenever
+# OPENROUTER_API_KEY is set -- disabling it neuters the council's diverse-critic half.
+# `touch <root>/NO_SHADOW` turns it off; checked per fire. (The legacy opt-in `SHADOW`
+# marker is retired: the behaviour it used to enable is now the default.)
+NO_SHADOW_PATH = COUNCIL_ROOT / "NO_SHADOW"
 
 
 def openrouter_effort() -> str:
@@ -4063,14 +4066,12 @@ async def main() -> int:
     # it is not a full filesystem sandbox.
     member_cwd = Path(tempfile.mkdtemp(prefix="council_member_"))
 
-    # LAYER 2 (kimi/glm/grok via OpenRouter) is gated on BOTH the explicit SHADOW
-    # opt-in marker AND the key: absent either, the roster is empty. Requiring the
-    # marker (not the key alone) keeps a user who merely has OPENROUTER_API_KEY
-    # exported for other tooling from paying for silent layer-2 calls per edit.
-    # It does NOT run here: layer 2 inspects the council's CONCLUSION, so it is
-    # fired AFTER the voting rounds finish (see below). This replaces the older
-    # design where it ran concurrently and de-anchored from the verdict.
-    shadow_enabled = SHADOW_PATH.exists() and bool(os.environ.get(OPENROUTER_KEY_ENV))
+    # LAYER 2 (kimi/glm/grok via OpenRouter) is HALF THE COUNCIL and runs BY DEFAULT: enabled
+    # whenever OPENROUTER_API_KEY is set, unless `NO_SHADOW` is present to turn it off. (It was
+    # formerly opt-in behind a SHADOW marker; that default was wrong -- disabling it neuters the
+    # council's diverse-critic half.) It does NOT run here: layer 2 inspects the council's
+    # CONCLUSION, so it is fired AFTER the voting rounds finish (see below).
+    shadow_enabled = bool(os.environ.get(OPENROUTER_KEY_ENV)) and not NO_SHADOW_PATH.exists()
     shadow_roles = list(SHADOW_MEMBERS) if shadow_enabled else []
 
     # Round 1: each member sees the proposal independently and emits

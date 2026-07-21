@@ -16,15 +16,17 @@ Usage:
 Prerequisites the script verifies:
     Python 3.10+         (the council scripts use 3.10+ type syntax)
     codex CLI on PATH    (authenticated; gpt-5.6-sol model accessible)
-    GEMINI_API_KEY       (the gemini member is a REST call, NOT a CLI)
-    DEEPSEEK_API_KEY     (optional third member; skipped when absent)
-    bubblewrap on PATH   (Linux only; warning if missing)
+    OPENROUTER_API_KEY   (gemini + deepseek voting members AND the layer-2
+                          inspectors kimi/glm/grok all route through OpenRouter)
+    bubblewrap on PATH   (Linux only; warning if missing -- gates the exec sandbox)
 
-The gemini member deliberately requires an API KEY and NOT the gemini CLI.
-An agentic CLI used as a council member is a member that can WRITE: the
-Antigravity gemini CLI, run as a read-only critic, rewrote six council files
-plus settings.json in a single review. A council member must never be able to
-mutate state. Do not "improve" this installer by probing a gemini CLI.
+A council member must never be able to mutate state. An agentic CLI used as a
+council member is a member that can WRITE: an agentic gemini CLI, run as a
+read-only critic, rewrote six council files plus settings.json in a single
+review. So members hold no write access: gemini/deepseek and the inspectors are
+stateless API calls, codex is a read-only sandboxed subprocess, and each has only
+harness-mediated read-only tools. Do not "improve" this installer by probing an
+agentic CLI.
 
 Files this installer touches:
     <council_root>/                    council scripts (copied from
@@ -61,6 +63,7 @@ STATE_DIR = CLAUDE_HOME / "state"
 
 COUNCIL_FILES = [
     "consult_council.py",
+    "council_leader.py",
     "council_advisor.py",
     "council_dialogue.py",
     "council_outcome.py",
@@ -152,52 +155,26 @@ def check_codex(rep: Reporter) -> bool:
     return True
 
 
-def check_gemini_key(rep: Reporter) -> bool:
-    """The gemini member is a REST call. It needs a KEY, not a CLI.
+def check_openrouter_key(rep: Reporter) -> bool:
+    """The gemini and deepseek voting members AND the layer-2 inspector tier
+    (kimi/glm/grok) all run through OpenRouter, so OPENROUTER_API_KEY is required.
+    Without it only codex remains -- a single voting member, which cannot reach the
+    BLOCK quorum and leaves layer 2 (half the council) dark.
 
-    Deliberately does NOT look for a `gemini` binary. consult_council.py drops
-    the gemini member outright when GEMINI_API_KEY is absent; it never falls
-    back to a CLI. See the removal rationale at the GEMINI_API_URL definition.
+    Presence test only. NEVER interpolate the value: a `${KEY:-...}` style expansion
+    in a shell, or an f-string here, prints the secret.
     """
-    # Presence test only. NEVER interpolate the value: a `${KEY:-...}` style
-    # expansion in a shell, or an f-string here, prints the secret.
-    if not os.environ.get("GEMINI_API_KEY"):
-        rep.err("GEMINI_API_KEY not set. The gemini member is a direct REST "
-                "call to the Gemini API and is DROPPED without a key. Export "
-                "it in the environment Claude Code itself launches under -- "
-                "the council runs as a child process and inherits that env.")
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        rep.err("OPENROUTER_API_KEY not set. The gemini and deepseek voting members "
+                "and the layer-2 inspectors (kimi/glm/grok) all route through "
+                "OpenRouter, so without this key only codex remains. Export it in the "
+                "environment Claude Code itself launches under -- the council runs as "
+                "a child process and inherits that env.")
         return False
-    rep.ok("GEMINI_API_KEY present (value not printed).")
+    rep.ok("OPENROUTER_API_KEY present (value not printed): gemini + deepseek + the "
+           "layer-2 inspector tier are enabled. Layer 2 is ON BY DEFAULT; "
+           "`touch <council_root>/NO_SHADOW` disables it.")
     return True
-
-
-def check_deepseek(rep: Reporter) -> None:
-    """Informational only. DeepSeek is an optional third council member,
-    gated on DEEPSEEK_API_KEY and dropped at runtime when the key is
-    absent, so its absence is never a fatal install error."""
-    if os.environ.get("DEEPSEEK_API_KEY"):
-        rep.ok("DEEPSEEK_API_KEY present (value not printed): deepseek enabled.")
-    else:
-        rep.info("DEEPSEEK_API_KEY not set: the optional deepseek member "
-                 "will be skipped at runtime (council runs on codex + "
-                 "gemini). Set the key in the environment Claude Code "
-                 "runs under to enable it.")
-
-
-def check_openrouter(rep: Reporter) -> None:
-    """Informational. OpenRouter powers the OPTIONAL, non-voting layer-2 shadow
-    critics (kimi/glm/grok). They are OFF by default and require TWO things: the
-    OPENROUTER_API_KEY here AND a `SHADOW` marker file in the council root. The key
-    alone does nothing, by design, so nobody pays for shadow calls merely for
-    having the key exported for another tool."""
-    if os.environ.get("OPENROUTER_API_KEY"):
-        rep.info("OPENROUTER_API_KEY present (value not printed): the optional "
-                 "non-voting shadow tier (kimi/glm/grok) is AVAILABLE but stays "
-                 "OFF until you `touch <council_root>/SHADOW`.")
-    else:
-        rep.info("OPENROUTER_API_KEY not set: the optional layer-2 shadow critics "
-                 "(kimi/glm/grok via OpenRouter) are unavailable. Set the key AND "
-                 "`touch <council_root>/SHADOW` to enable them; both are required.")
 
 
 def check_standing_rules(rep: Reporter) -> None:
@@ -278,57 +255,42 @@ def probe_codex_model(rep: Reporter) -> bool:
     return True
 
 
-def probe_gemini_api(rep: Reporter) -> bool:
-    """Probe the Gemini REST API directly, with no CLI in the picture.
+def probe_openrouter(rep: Reporter) -> bool:
+    """Probe OpenRouter with the configured key. gemini, deepseek, and the layer-2
+    inspectors all route through it, so this verifies the key actually AUTHENTICATES,
+    not merely that it is set.
 
-    Imports the model + URL from the council's own wrapper rather than
-    restating them, so the installer cannot drift from what actually runs.
+    Uses GET /api/v1/key, which requires auth and returns the key's own metadata.
+    Measured 2026-07-21: a valid key -> HTTP 200, an invalid one -> HTTP 401. (The
+    /models endpoint, by contrast, returns 200 with NO key, so it cannot verify
+    credentials.) No completion is spent.
     """
-    rep.step("Probing the Gemini REST API...")
-    sys.path.insert(0, str(COUNCIL_SRC_DIR))
-    try:
-        import consult_council as cc
-    except Exception as e:  # noqa: BLE001
-        rep.err(f"could not import the council wrapper to read its Gemini "
-                f"config: {e}")
-        return False
-
-    key = os.environ.get("GEMINI_API_KEY")
+    key = os.environ.get("OPENROUTER_API_KEY")
     if not key:
-        rep.err("GEMINI_API_KEY not set; cannot probe.")
+        rep.err("OPENROUTER_API_KEY not set; cannot probe.")
         return False
-    body = json.dumps({
-        "contents": [{"parts": [{"text": "Reply with exactly: PROBE OK"}]}]
-    }).encode()
+    rep.step("Probing OpenRouter (GET /api/v1/key)...")
     req = urllib.request.Request(
-        cc.GEMINI_API_URL,
-        data=body,
-        headers={"Content-Type": "application/json", "x-goog-api-key": key},
-        method="POST",
+        "https://openrouter.ai/api/v1/key",
+        headers={"Authorization": f"Bearer {key}"},
+        method="GET",
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            payload = json.loads(resp.read().decode())
+            code = resp.status
     except urllib.error.HTTPError as e:
-        # The body can echo request context; the KEY travels in a header, not
-        # the body, so this is safe to surface. Truncated regardless.
-        rep.err(f"Gemini API probe failed: HTTP {e.code}. Check that "
-                f"GEMINI_API_KEY is valid and that the model "
-                f"'{cc.GEMINI_API_MODEL}' is available to it.")
+        if e.code == 401:
+            rep.err("OpenRouter rejected OPENROUTER_API_KEY (HTTP 401). Check the key.")
+        else:
+            rep.err(f"OpenRouter probe failed: HTTP {e.code}.")
         return False
     except Exception as e:  # noqa: BLE001
-        rep.err(f"Gemini API probe failed: {e}")
+        rep.err(f"OpenRouter probe failed: {e}")
         return False
-
-    text = ""
-    for cand in payload.get("candidates", []):
-        for part in (cand.get("content") or {}).get("parts", []):
-            text += part.get("text") or ""
-    if "PROBE OK" not in text:
-        rep.warn(f"Gemini API answered but not with `PROBE OK`: "
-                 f"{text.strip()[:200]}")
+    if code != 200:
+        rep.warn(f"OpenRouter /key returned HTTP {code}, expected 200.")
         return False
-    rep.ok(f"Gemini API probe succeeded (model={cc.GEMINI_API_MODEL}).")
+    rep.ok("OpenRouter probe succeeded (OPENROUTER_API_KEY authenticates).")
     return True
 
 
@@ -525,10 +487,8 @@ def main() -> int:
         ok = False
     if not check_codex(rep):
         ok = False
-    if not check_gemini_key(rep):
+    if not check_openrouter_key(rep):
         ok = False
-    check_deepseek(rep)
-    check_openrouter(rep)
     check_standing_rules(rep)
     check_bubblewrap(rep)
 
@@ -546,9 +506,9 @@ def main() -> int:
                     "working combination: codex-cli 0.144.1 + gpt-5.6-sol. "
                     "Pass --skip-probes to bypass.")
             return 2
-        if not probe_gemini_api(rep):
-            rep.err("Gemini API probe failed. Check GEMINI_API_KEY. Pass "
-                    "--skip-probes to bypass.")
+        if not probe_openrouter(rep):
+            rep.err("OpenRouter probe failed (see above). Check OPENROUTER_API_KEY. "
+                    "Pass --skip-probes to bypass.")
             return 2
 
     if not copy_council_scripts(rep, council_root, args.force):
