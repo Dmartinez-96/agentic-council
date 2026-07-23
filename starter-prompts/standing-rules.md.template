@@ -1,6 +1,14 @@
-# CLAUDE.md starter template
+# Standing-rules starter template
 
-Copy this to `~/.claude/CLAUDE.md` (or merge it into the one you already have).
+An agent-agnostic starter for the standing-rules / context file the council injects
+in front of every member. Install it one of two ways:
+
+- Copy it to `~/.claude/CLAUDE.md` (the path the council reads by default). If your
+  access method is Claude Code, that same path is also auto-loaded into the leader
+  every session (code.claude.com/docs/en/memory.md, checked 2026-07-23) -- so rename
+  this file to `CLAUDE.md` and place it there.
+- Or keep any name/location and set `COUNCIL_STANDING_RULES_PATH` to this file's path
+  -- the council reads it there, no `CLAUDE.md` required (the fully agent-agnostic option).
 
 ## Why this file matters to the council
 
@@ -11,12 +19,12 @@ broke instead of inferring one.
 To be precise about what you lose without it: bar item 12 ALSO covers the
 directives you type during a session, which the council extracts from the
 transcript and enforces whether or not this file exists. So the council is not
-toothless without a `CLAUDE.md`. What is missing is the STANDING half -- the rules
+toothless without a standing-rules file. What is missing is the STANDING half -- the rules
 that hold across every session and that you should not have to restate.
 
 The block is placed AFTER the evidence in a member's prompt, on purpose. Part of
-this file ends up being written by Claude about Claude, and a reviewer who reads
-the accused's account of his own defects before reading a single fact has been
+this file ends up being written by the agent about itself, and a reviewer who reads
+the reviewed party's account of its own defects before reading a single fact has been
 framed.
 
 ## READ THIS BEFORE COPYING IT

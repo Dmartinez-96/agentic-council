@@ -16,7 +16,7 @@ Concrete steps (do all of them; do NOT skip any):
 
 2. Build the evidence file path: `~/.claude/state/<session_id>/evidence.jsonl`. Verify existence via `test -f` before passing it; if it does not exist, skip the `--evidence-file` flag.
 
-3. Build the pitch. The pitch should be the subject text above PLUS, if helpful for the council's evaluation, a short framing of (a) what the design decision is, (b) what alternatives are on the table, (c) what you (Claude) are leaning toward and why. Do NOT add unverified claims; if you do not have a leaning yet, just state the question.
+3. Build the pitch. The pitch should be the subject text above PLUS, if helpful for the council's evaluation, a short framing of (a) what the design decision is, (b) what alternatives are on the table, (c) what you (the agent) are leaning toward and why. Do NOT add unverified claims; if you do not have a leaning yet, just state the question.
 
 4. Invoke the wrapper via Bash, piping the pitch on stdin. Pattern:
 

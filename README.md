@@ -317,19 +317,21 @@ warnings:
   over-flagging is exactly the question `council_outcome.py` exists to answer.
   Measure it on your own work rather than trusting this README.
 
-## Your own standing rules (CLAUDE.md)
+## Your own standing rules
 
-The council READS `~/.claude/CLAUDE.md` and shows it to every member, so a member can
-cite the exact rule of YOURS that a proposal broke, rather than inferring one. Without
-that file the council still enforces the directives you type during a session; what it
-lacks is the STANDING half.
+The council injects your standing rules in front of every member, so a member can cite
+the exact rule of YOURS that a proposal broke rather than inferring one. It reads them
+from `~/.claude/CLAUDE.md` by default (the path Claude Code also auto-loads, if that is
+your access method); set `COUNCIL_STANDING_RULES_PATH` to point it at any other file
+instead. Without a standing-rules file the council still enforces the directives you
+type during a session; what it lacks is the STANDING half.
 
-`starter-prompts/CLAUDE.md.template` is a starting point. **Read it before you copy
-it.** Its failure-mode list was observed across thousands of council-reviewed edits on
-a single machine's logs. Whether the same failures show up for your agent, on your
-codebase, is not something we measured. The list is a floor, not a ceiling. The piece
-we would expect to outlast the specific rules is the loop at the end -- when a failure
-repeats, amend the file.
+`starter-prompts/standing-rules.md.template` is an agent-agnostic starting point. **Read
+it before you copy it.** Its failure-mode list was observed across thousands of
+council-reviewed edits on a single machine's logs. Whether the same failures show up for
+your agent, on your codebase, is not something we measured. The list is a floor, not a
+ceiling. The piece we would expect to outlast the specific rules is the loop at the end
+-- when a failure repeats, amend the file.
 
 The installer will tell you if the file is missing. It deliberately will NOT write it
 for you -- those are your instructions to your agent, and an installer that silently

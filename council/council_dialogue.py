@@ -2,8 +2,11 @@
 """Workers' Council - dialogue mode (Claude-driven round-table).
 
 A multi-turn, round-table dialogue between Claude (the lead worker and
-spokesperson to the user) and the council members (codex, gemini,
-deepseek). Unlike the one-shot PostToolUse council, here Claude is a
+spokesperson to the user) and the FULL council bench -- every registry
+member of every tier: the VOTING layer (codex, gemini, deepseek) AND the
+non-voting INSPECTOR layer (kimi, glm, grok), plus any future members
+(the user 2026-07-21: dialogues default to the entire bench, not just
+voters). Unlike the one-shot PostToolUse council, here Claude is a
 participant: members can interrogate Claude, Claude answers with
 evidence, and the thread iterates to convergence.
 
@@ -19,22 +22,28 @@ Design (hardened against the design-review findings):
   - Convergence and consensus are MACHINE-COMPUTED, never Claude-judged.
     Every command prints an authoritative CONVERGENCE / CONSENSUS line.
   - A member is terminal iff verdict in {PASS,WARN,BLOCK} AND it has no
-    open QUESTIONS. An open question blocks convergence regardless of
-    verdict. DELIBERATING requires >=1 question, else normalized to WARN.
-  - Consensus (only meaningful once converged): BLOCK if any BLOCK; PASS
-    if all PASS; else WARN.
+    open QUESTIONS. An open question -- from ANY member, voting or
+    inspector -- blocks convergence regardless of verdict, so the full
+    bench actually participates. DELIBERATING requires >=1 question, else
+    normalized to WARN.
+  - Consensus (only meaningful once converged) is over the VOTING members
+    ONLY -- inspectors are advisory and never change the label: BLOCK if
+    any voter BLOCKs; PASS if all voters PASS; else WARN.
   - Hard MAX_TURNS cap; at the cap `say` refuses and points to resolve.
     resolve coerces non-terminal members to WARN (never silently PASS)
     and stamps PREMATURE if forced before convergence.
-  - Roster frozen at start (deepseek dropped once if no key). Mid-dialogue
-    ERROR carries forward the member's last good verdict (marked stale);
-    a member dropped after MAX_CONSEC_ERRORS consecutive errors.
+  - Roster is the full bench frozen at start; a member whose transport
+    needs an absent API key is dropped with a note (codex needs none).
+    Mid-dialogue ERROR carries forward the member's last good verdict
+    (marked stale); a member dropped after MAX_CONSEC_ERRORS consecutive
+    errors.
   - resolve writes an immutable ASCII FINAL artifact under logs/<date>/.
   - Thread state mutations are atomic (os.replace) under an flock.
 
-Reuses consult_council's member runners unchanged; the one-shot wrapper
-is not modified. The full dialogue transcript is passed to each member
-via consult_council's round1_block prompt slot.
+Reuses consult_council's per-member runners (BENCH_RUNNERS -- the full
+bench, every tier) unchanged; the one-shot wrapper is not modified. The
+full dialogue transcript is passed to each member via consult_council's
+round1_block prompt slot.
 """
 
 from __future__ import annotations
@@ -269,13 +278,18 @@ def build_directives_block(transcript_path: str | None,
 
 async def _run_members(active: list[str], sys_prompt: str, proposal: str,
                        evidence_block: str, directives_block: str,
-                       thread_block: str) -> list[dict]:
+                       thread_block: str,
+                       delivery: dict[str, str] | None = None) -> list[dict]:
+    """`delivery` carries each member's PRIVATE result block for the REQUEST_*
+    lines it emitted THIS round (its pass-1 request); the mediated leg appends it
+    to that member's prompt alone for a pass-2 re-run."""
+    delivery = delivery or {}
     cwd = Path(tempfile.mkdtemp(prefix="council_member_"))
     try:
         results = await asyncio.gather(*[
-            cc.MEMBER_RUNNERS[m](proposal, sys_prompt, cwd,
-                                 evidence_block, directives_block,
-                                 thread_block)
+            cc.BENCH_RUNNERS[m](
+                proposal, sys_prompt, cwd, evidence_block, directives_block,
+                thread_block + (("\n\n" + delivery[m]) if delivery.get(m) else ""))
             for m in active
         ])
     finally:
@@ -332,6 +346,55 @@ def live_context(thread: dict) -> tuple[str, str]:
     return evidence_block, directives_block
 
 
+def _apply_mediated_leg(recs: list[dict], sys_prompt: str, proposal: str,
+                        evidence_block: str, directives_block: str,
+                        thread_block: str,
+                        workdir: Path) -> tuple[list[dict], dict]:
+    """Mediated tool leg, IN-ROUND (mirrors the one-shot council's inspector
+    pass1->pass2): the HARNESS -- never a member -- executes the REQUEST_FILE /
+    REQUEST_URL / REQUEST_EXEC lines these member records emitted (file reads
+    jailed to workdir, https fetches SSRF-checked, exec in a bubblewrap sandbox),
+    then RE-RUNS only the requesters with their PRIVATE result block appended, so
+    each acts on the delivered content within THIS SAME round.
+
+    The delivered content BLOCKS are not persisted -- they live only in the pass-2
+    prompt. A member's pass-2 PROSE may quote delivered content, which is then
+    saved and shared with peers next round -- the same as the one-shot council's
+    pass-2/round-2 responses. Returns (records, redacted_tooling_log); the log
+    keeps host+hash/sha256, never a raw arg or content. On ANY harness error
+    (collect_* OR the pass-2 re-run) it degrades to the pass-1 records."""
+    exfil_context = "\n".join(
+        x for x in (evidence_block, directives_block, proposal) if x)
+    try:
+        ret_b, ret_log = cc.collect_file_requests(recs, workdir)
+        web_b, web_log = cc.collect_web_requests(recs, exfil_context)
+        exec_b, exec_log = cc.collect_exec_requests(recs, workdir)
+    except Exception as e:  # noqa: BLE001
+        print(f"# note: mediated tool leg (collect) failed this round: {e}",
+              file=sys.stderr)
+        return recs, {}
+    tooling = {"retrieval": ret_log, "web": web_log, "exec": exec_log}
+    delivery: dict[str, str] = {}
+    for r in recs:
+        name = r["role"]
+        block = "\n\n".join(b[name] for b in (ret_b, web_b, exec_b)
+                            if name in b)
+        if block:
+            delivery[name] = block
+    if not delivery:
+        return recs, tooling
+    try:
+        recs2 = asyncio.run(_run_members(list(delivery), sys_prompt, proposal,
+                                         evidence_block, directives_block,
+                                         thread_block, delivery))
+    except Exception as e:  # noqa: BLE001
+        print(f"# note: mediated pass-2 re-run failed this round: {e}",
+              file=sys.stderr)
+        return recs, tooling
+    by = {r["role"]: r for r in recs2}
+    return [by.get(r["role"], r) for r in recs], tooling
+
+
 def run_round(thread: dict, claude_msg: str, round_n: int) -> dict:
     sys_prompt = load_dialogue_system_prompt()
     proposal = thread["proposal"]
@@ -342,8 +405,24 @@ def run_round(thread: dict, claude_msg: str, round_n: int) -> dict:
     recs = asyncio.run(_run_members(active, sys_prompt, proposal,
                                     evidence_block, directives_block,
                                     thread_block))
+    # MEDIATED TOOL LEG: any REQUEST_FILE/URL/EXEC lines these members emitted are
+    # executed by the HARNESS and delivered back to the requester IN THIS ROUND via
+    # a pass-2 re-run -- the same request/deliver leg the one-shot council uses, so
+    # inspectors keep independent verification past round 1 rather than reasoning
+    # from recollection. `tooling` is the redacted provenance (host+hash/sha256).
+    workdir = Path(thread.get("workdir") or COUNCIL_ROOT)
+    recs, tooling = _apply_mediated_leg(recs, sys_prompt, proposal, evidence_block,
+                                        directives_block, thread_block, workdir)
+    # Redact every REQUEST_* ARGUMENT from the text stored in the thread, so a
+    # url/command/path never fans out to peers (format_thread_block), persists in
+    # the saved thread, or echoes to the console. A requester that got a delivery
+    # was re-run and its pass-2 text carries no request line; a DENIED requester's
+    # pass-1 request line is redacted here.
+    for r in recs:
+        r["text"] = cc._redact_request_lines(r.get("text") or "")
     return {"n": round_n, "claude": claude_msg,
-            "members": {r["role"]: r for r in recs}}
+            "members": {r["role"]: r for r in recs},
+            "tooling": tooling}
 
 
 # --------------------------------------------------------------------------
@@ -353,6 +432,40 @@ def run_round(thread: dict, claude_msg: str, round_n: int) -> dict:
 def active_roster(thread: dict) -> list[str]:
     dropped = set(thread.get("dropped", []))
     return [m for m in thread["members"] if m not in dropped]
+
+
+def voting_set(thread: dict) -> set:
+    """Names whose verdicts count toward convergence and consensus. Falls back
+    to ALL members for legacy threads created before the voting/non-voting
+    split (those predate the full-bench round-table and held voters only)."""
+    v = thread.get("voting")
+    return set(v) if v is not None else set(thread["members"])
+
+
+def build_bench_roster() -> tuple[list[str], list[str]]:
+    """The full bench for a round-table: EVERY registry member (voting AND
+    non-voting inspectors), voting-first, derived from the registry so a member
+    added at any tier joins automatically (the user 2026-07-21: dialogues default
+    to the entire bench, not just voters). Drops any member whose transport
+    needs an API key that is absent -- generic gating that mirrors the one-shot
+    engine's main(); codex has no key entry (it authenticates via its CLI) so it
+    is never dropped for a missing key. Returns (members, voting): `voting` is
+    the subset whose verdicts count toward convergence/consensus; inspectors
+    participate but do not vote."""
+    members: list[str] = []
+    voting: list[str] = []
+    for name in cc.BENCH_MEMBERS:
+        rec = cc.member_by_name(name)
+        if rec is None:
+            continue
+        key_env = cc.TRANSPORT_KEY_ENV.get(rec.transport)
+        if key_env and not os.environ.get(key_env):
+            print(f"# note: {name} dropped ({key_env} not set)", file=sys.stderr)
+            continue
+        members.append(name)
+        if rec.tier == cc.VOTING:
+            voting.append(name)
+    return members, voting
 
 
 def member_standing(thread: dict, role: str) -> dict:
@@ -403,8 +516,17 @@ def effective_state(standing: dict) -> tuple[str, str, str]:
 
 
 def assess(thread: dict) -> dict:
-    """Compute convergence + consensus over the active roster."""
+    """Convergence requires EVERY live member (voting AND non-voting inspector)
+    to be terminal -- an open question from ANYONE keeps the round-table going,
+    so the full bench truly participates (the user 2026-07-21: the entire bench,
+    and the delay is worthwhile). Consensus, once converged, is computed over
+    the VOTING members ONLY: inspectors participate and can hold the dialogue
+    open with a question, but never change the final PASS/WARN/BLOCK label
+    (layer 2 stays advisory, as in the one-shot council). A consensus needs >=1
+    live voter. Legacy threads with no `voting` key treat every member as
+    voting (see voting_set)."""
     roster = active_roster(thread)
+    voting = voting_set(thread)
     per = {}
     newly_dropped = []
     for role in roster:
@@ -415,12 +537,17 @@ def assess(thread: dict) -> dict:
         per[role] = {"terminality": term, "verdict": eff, "note": note,
                      "consec_errors": st["consec_errors"],
                      "questions": (st["good"] or {}).get("questions", []),
-                     "duration_s": (st["latest"] or {}).get("duration_s")}
+                     "duration_s": (st["latest"] or {}).get("duration_s"),
+                     "voting": role in voting}
     live = [r for r in roster if r not in newly_dropped]
-    converged = bool(live) and all(
+    voting_live = [r for r in live if r in voting]
+    # Gate convergence on the FULL live roster (any open question blocks), but
+    # require at least one live voter so a consensus can form.
+    converged = bool(voting_live) and all(
         per[r]["terminality"] == "terminal" for r in live)
     if converged:
-        verdicts = [per[r]["verdict"] for r in live]
+        # Consensus over VOTING members only -- inspectors are advisory.
+        verdicts = [per[r]["verdict"] for r in voting_live]
         if "BLOCK" in verdicts:
             consensus = "BLOCK"
         elif all(v == "PASS" for v in verdicts):
@@ -430,7 +557,8 @@ def assess(thread: dict) -> dict:
     else:
         consensus = "PENDING"
     return {"per": per, "converged": converged, "consensus": consensus,
-            "live": live, "newly_dropped": newly_dropped}
+            "live": live, "voting_live": voting_live,
+            "newly_dropped": newly_dropped}
 
 
 # --------------------------------------------------------------------------
@@ -474,12 +602,13 @@ def print_status(thread: dict, a: dict) -> None:
         qstr = f" q:{q}" if q else ""
         mark = {"terminal": "", "pending": " [pending]",
                 "dead": " [DROPPED]"}[p["terminality"]]
+        vtag = "" if p.get("voting", True) else " [inspector, non-voting]"
         note = f"  - {p['note']}" if p["note"] else ""
-        print(f"#   {role:<9} {p['verdict']:<13} ({durs}){qstr}{mark}{note}")
+        print(f"#   {role:<9} {p['verdict']:<13} ({durs}){qstr}{mark}{vtag}{note}")
     if a["converged"]:
-        verds = ", ".join(f"{r}={a['per'][r]['verdict']}" for r in a["live"])
+        verds = ", ".join(f"{r}={a['per'][r]['verdict']}" for r in a["voting_live"])
         print("CONVERGENCE: YES")
-        print(f"CONSENSUS: {a['consensus']}  ({verds})")
+        print(f"CONSENSUS: {a['consensus']}  (voting: {verds})")
     else:
         pend = [r for r in a["live"] if a["per"][r]["terminality"] != "terminal"]
         print(f"CONVERGENCE: NO  (still pending: {', '.join(pend) or 'none'})")
@@ -498,7 +627,7 @@ def write_final_artifact(thread: dict, a: dict, premature: bool) -> Path:
         f"Members: {', '.join(thread['members'])}"
         + (f" (dropped: {', '.join(thread['dropped'])})" if thread.get("dropped") else ""),
         f"Premature: {'YES - forced before convergence' if premature else 'no'}",
-        f"Consensus: {a['consensus']}",
+        f"Consensus (voting members; inspectors advisory): {a['consensus']}",
         "",
         "## Per-member final verdict",
     ]
@@ -507,8 +636,9 @@ def write_final_artifact(thread: dict, a: dict, premature: bool) -> Path:
         if not p:
             lines.append(f"- {role}: DROPPED")
             continue
+        vtag = "" if p.get("voting", True) else " [inspector, non-voting]"
         extra = f" - {p['note']}" if p["note"] else ""
-        lines.append(f"- {role}: {p['verdict']}{extra}")
+        lines.append(f"- {role}{vtag}: {p['verdict']}{extra}")
         for q in p["questions"]:
             lines.append(f"    (open question) {q}")
     lines.append("")
@@ -545,11 +675,11 @@ def cmd_start(args) -> int:
         print("ERROR: empty proposal", file=sys.stderr)
         return 2
 
-    members = list(cc.ALL_MEMBERS)
-    if "deepseek" in members and not os.environ.get("DEEPSEEK_API_KEY"):
-        members = [m for m in members if m != "deepseek"]
-        print("# note: deepseek dropped (DEEPSEEK_API_KEY not set)",
+    members, voting = build_bench_roster()
+    if not members:
+        print("ERROR: no council members available (check API keys)",
               file=sys.stderr)
+        return 2
 
     evidence_block = ""
     if args.evidence_file:
@@ -568,6 +698,7 @@ def cmd_start(args) -> int:
             "created": now_iso(),
             "status": "open",
             "members": members,
+            "voting": voting,
             "dropped": [],
             "proposal": proposal,
             # Source paths, so every round can re-read them and see probes
@@ -589,7 +720,9 @@ def cmd_start(args) -> int:
         save_thread(thread)
 
     print(f"# thread started: {tid}")
-    print(f"# members: {', '.join(members)}\n")
+    _vset = set(voting)
+    _desc = ", ".join(m if m in _vset else f"{m} (non-voting)" for m in members)
+    print(f"# members: {_desc}\n")
     print_round_responses(rnd, members)
     print_status(thread, a)
     print(f"\n# next: council_dialogue.py say {tid} \"<your reply / evidence>\""
@@ -662,7 +795,8 @@ def cmd_resolve(args) -> int:
                   file=sys.stderr)
             print_status(thread, a)
             return 1
-        # Coerce non-terminal members to WARN for the final consensus.
+        # Coerce non-terminal members to WARN for the record. Consensus is still
+        # computed over the VOTING members only (inspectors stay advisory).
         if premature:
             for role in a["live"]:
                 if a["per"][role]["terminality"] != "terminal":
@@ -670,9 +804,9 @@ def cmd_resolve(args) -> int:
                     a["per"][role]["note"] = (
                         "coerced to WARN (forced resolve before convergence; "
                         + a["per"][role]["note"] + ")")
-            verds = [a["per"][r]["verdict"] for r in a["live"]]
+            verds = [a["per"][r]["verdict"] for r in a["voting_live"]]
             a["consensus"] = ("BLOCK" if "BLOCK" in verds
-                              else "PASS" if all(v == "PASS" for v in verds)
+                              else "PASS" if (verds and all(v == "PASS" for v in verds))
                               else "WARN")
             a["converged"] = True
         thread["status"] = "resolved"
@@ -683,14 +817,15 @@ def cmd_resolve(args) -> int:
     if premature:
         print("# PREMATURE RESOLVE: forced before convergence; non-terminal "
               "members were coerced to WARN.")
-    print(f"CONSENSUS: {a['consensus']}")
+    print(f"CONSENSUS: {a['consensus']}  (voting members; inspectors advisory)")
     for role in thread["members"]:
         p = a["per"].get(role)
         if not p:
             print(f"#   {role:<9} DROPPED")
             continue
+        vtag = "" if p.get("voting", True) else " [inspector, non-voting]"
         extra = f"  - {p['note']}" if p["note"] else ""
-        print(f"#   {role:<9} {p['verdict']}{extra}")
+        print(f"#   {role:<9} {p['verdict']}{vtag}{extra}")
     print(f"\n# FINAL artifact (surface this to the user): {artifact}")
     print(f"# raw thread: council_dialogue.py show {tid}")
     return 0
@@ -751,14 +886,31 @@ def cmd_escalate(args) -> int:
         print(f"ERROR: log has no pitch to escalate: {log_path}", file=sys.stderr)
         return 2
     log_members = log.get("members", [])
-    members: list[str] = []
+    logged_roles: list[str] = []
     for m in log_members:
         r = m.get("role")
-        if r and r not in members:
-            members.append(r)
-    if not members:
+        if r and r not in logged_roles:
+            logged_roles.append(r)
+    if not logged_roles:
         print(f"ERROR: log has no members: {log_path}", file=sys.stderr)
         return 2
+
+    # Convene the full current bench (the user 2026-07-21: dialogues default to
+    # the entire bench). Logged members that are still on the bench are seeded
+    # into round 1 below; bench members absent from the one-shot log (e.g. the
+    # inspectors) start pending and join as they answer in later rounds.
+    bench_members, _ = build_bench_roster()
+    members = list(bench_members)
+    # A logged member NOT on the current bench is not enrolled as a live
+    # participant: it is either gone from the registry (no runner) or gated out
+    # for a missing API key, so it could not take a useful turn and would only
+    # stall convergence. Its round-1 critique is not carried forward -- noted,
+    # not silently dropped.
+    off_bench = [r for r in logged_roles if r not in members]
+    if off_bench:
+        print(f"# note: logged members not on the current bench (removed or "
+              f"unavailable), not enrolled: {', '.join(off_bench)}",
+              file=sys.stderr)
 
     evidence_block = ""
     if args.evidence_file:
@@ -790,6 +942,13 @@ def cmd_escalate(args) -> int:
     directives_block = build_directives_block(
         getattr(args, "transcript_path", None), args.evidence_file)
 
+    # Voters among the seeded members. One-shot council logs hold voting-layer
+    # members; a name not in the current registry (e.g. a since-removed member)
+    # is treated as a voter, matching the pre-full-bench behavior.
+    voting = [m for m in members
+              if (cc.member_by_name(m) is None
+                  or cc.member_by_name(m).tier == cc.VOTING)]
+
     tid = new_thread_id()
     with ThreadLock(tid):
         thread = {
@@ -797,6 +956,7 @@ def cmd_escalate(args) -> int:
             "created": now_iso(),
             "status": "open",
             "members": members,
+            "voting": voting,
             "dropped": [],
             "proposal": proposal,
             # Source paths, so every round can re-read them and see probes
@@ -818,8 +978,11 @@ def cmd_escalate(args) -> int:
 
     print(f"# dialogue escalated from log: {log_path}")
     print(f"# thread: {tid}")
-    print(f"# members: {', '.join(members)} (round 1 seeded from the logged "
-          f"one-shot critiques; not re-run)\n")
+    _vset = set(voting)
+    _desc = ", ".join(m if m in _vset else f"{m} (non-voting)" for m in members)
+    print(f"# members: {_desc}\n"
+          f"# (round 1 seeded from the logged one-shot critiques; bench members "
+          f"not in the log start pending until they answer)\n")
     print_round_responses(thread["rounds"][0], members)
     print_status(thread, a)
     print(f"\n# next: respond to the council's concerns with\n"

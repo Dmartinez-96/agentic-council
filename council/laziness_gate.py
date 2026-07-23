@@ -1,40 +1,56 @@
 #!/usr/bin/env python3
 """PreToolUse laziness gate.
 
-Fires before Write / Edit / NotebookEdit. Scans the
-proposed content for council rule-11 trigger phrases ("out of scope",
-"GPU required", "compute required", "fetch too large", "not feasible",
-"smoke-tested by reading", "would require", "not run end-to-end").
-For each trigger, checks the per-session evidence file at
-~/.claude/state/<session_id>/evidence.jsonl for a matching probe
-event. If a trigger is present and no matching probe is in evidence,
-denies the tool call via the PreToolUse permissionDecision output schema
-documented in the plugin-dev hook-development SKILL.md (which specifies
-that a PreToolUse hook can deny permission by returning a JSON payload
-with hookSpecificOutput.permissionDecision set to "deny").
+Fires before Write / Edit / NotebookEdit. Scans the proposed content for council
+rule-11 trigger phrases ("out of scope", "GPU required", "compute required", "fetch
+too large", "not feasible", "smoke-tested by reading", "would require", "not run
+end-to-end"). For each trigger with a probe-marker list, it checks the per-session
+evidence file at ~/.claude/state/<session_id>/evidence.jsonl -- ONLY the last
+EVIDENCE_RECENCY_EVENTS events, so a stale probe from an unrelated earlier task does
+NOT back a fresh caveat (relevance fix) -- for a matching Bash command. If a trigger is
+present and no recent matching probe is found, the write is denied via the PreToolUse
+permissionDecision output schema documented in the plugin-dev hook-development SKILL.md
+(a PreToolUse hook denies by returning JSON with hookSpecificOutput.permissionDecision
+set to "deny").
 
-Why this is a hard gate rather than a council WARN: rule 11 violations
-waste the user's API spend, time, and trust. The council exists to
-catch them at PostToolUse, but at that point the lazy write has
-already landed and reverting is on me. PreToolUse can refuse the
-write before it happens. This file enforces the rule synchronously
-without an LLM call: pure regex + evidence-file lookup, runs in
+BLIND-CASE POLICY (fail-open, the user sign-off 2026-07-22). If the gate cannot READ the
+evidence at all -- no session_id in the payload, no evidence file, or a read error -- it
+cannot AFFIRM that a caveat is unbacked ("unbacked" requires having looked and not found,
+not "could not look"). It therefore ALLOWS the write and prints an observable note naming
+the reason, instead of denying with the false claim that no probe was found. Enforcement
+is not lost so much as SOFTENED: the write still reaches the PostToolUse council and the
+Stop-hook prose audit, which are instructed by rule 11 to flag an unbacked caveat -- an
+advisory / quorum review after the write lands, not a pre-write deny. (That downstream
+behaviour under blindness is the design's expectation, not a guarantee this gate can
+enforce.) Fail-closed here would permanently block any non-exempt write containing a
+trigger phrase, in any environment that cannot supply a session_id.
+
+Some triggers carry an EMPTY probe list ("out of scope", "not feasible"): no command
+clears them, so the ONLY way past the gate is to REWRITE the content -- remove the bare
+hedge or replace it with a concrete reference (a spec quote, or the specific failed run).
+"would require" keeps recency-gated compute markers but no longer clears on a bare shell
+command.
+
+Why this is a hard gate rather than a council WARN: rule 11 violations waste the user's
+API spend, time, and trust. The council catches them at PostToolUse, but by then the lazy
+write has already landed and reverting is on me. PreToolUse refuses the write before it
+happens, synchronously, without an LLM call: pure regex + a recent-evidence lookup, in
 milliseconds.
 
-Conservative design: it is better to over-block (Claude is forced to
-run the probe before the caveat can land) than under-block (a lazy
-caveat slips through). False positives are addressable by running the
-required probe, which is what the rule asks for in the first place.
+Conservative design: for a trigger the gate CAN evaluate, it is better to over-block
+(Claude is forced to run the probe first) than under-block. The fail-open path above is
+NOT a weakening of that -- it applies only when the gate is blind and cannot evaluate a
+trigger at all.
 
 Output schema (Claude Code PreToolUse hook):
 - Exit 0 with NO stdout = allow.
 - Exit 0 with stdout JSON `{"hookSpecificOutput": {"permissionDecision":
   "deny", ...}, "systemMessage": "..."}` = deny with explanation.
 
-The PreToolUse output schema and hook exit-code semantics are documented
-in the plugin-dev hook-development SKILL.md (which details the JSON payload format
-for hookSpecificOutput/permissionDecision and specifies that exit code 2 blocks
-execution, routing stderr back to the assistant).
+The PreToolUse output schema and hook exit-code semantics are documented in the plugin-dev
+hook-development SKILL.md (which details the JSON payload format for
+hookSpecificOutput/permissionDecision and specifies that exit code 2 blocks execution,
+routing stderr back to the assistant).
 """
 
 from __future__ import annotations
@@ -45,15 +61,22 @@ import sys
 from pathlib import Path
 
 STATE_ROOT = Path.home() / ".claude" / "state"
-EVIDENCE_SCAN_LAST_N_EVENTS = 250
+# Relevance window (Fix 2a, 2026-07-22): only the last N evidence events are scanned for a
+# backing probe, so a stale probe from an unrelated earlier task does not clear a fresh
+# caveat. 30 accommodates the natural probe->write loop (a probe and the caveat that cites
+# it are usually a few turns apart) while purging commands from tasks run long before.
+# Tunable.
+EVIDENCE_RECENCY_EVENTS = 30
 
 
 TRIGGERS: list[tuple[str, str, list[str]]] = [
     # (regex_pattern, human_label, probe_markers)
-    # probe_markers: any of these substrings in the `command` field of a
-    # Bash event in evidence satisfies the probe requirement; an empty
-    # list means there is no easy auto-detectable probe and the trigger
-    # is always denied when present.
+    # probe_markers: any of these substrings in the `command` field of a recent Bash
+    # event (or a recent tool name) satisfies the probe requirement; an EMPTY list means
+    # there is no command that cleanly backs the caveat, so it is always denied when
+    # present -- the ONLY way past it is to REWRITE the content so the trigger phrase is
+    # gone (a spec read or a concrete failed run is context for HOW to rewrite, not a
+    # clearance path).
     (
         r"\bGPU\s+(required|needed|necessary)\b",
         "GPU required without probe",
@@ -66,52 +89,61 @@ TRIGGERS: list[tuple[str, str, list[str]]] = [
     ),
     (
         r"\bcompute\s+(would\s+be\s+)?required\b",
-        "compute-required without probe",
+        "compute-required without a recent probe",
         ["python", "python3", "uv ", "pip ", "cuda", "venv"],
     ),
     (
+        # NARROWED 2026-07-22 (the user "split" decision): a vague feasibility hedge is not
+        # cleanly backed by any bare command, so this is always-deny like "out of scope".
         r"\bnot\s+feasible\b",
-        "not-feasible without probe",
-        ["python", "python3", "uv ", "pip ", "Bash"],
+        "not-feasible (always-deny: only removing/rephrasing the phrase passes the gate)",
+        [],
     ),
     (
         r"\bnot\s+run\s+end[- ]to[- ]end\b",
-        "not-run-end-to-end without probe",
+        "not-run-end-to-end without a recent probe",
         ["python", "python3", "uv ", "pip "],
     ),
     (
         r"\bsmoke[- ]tested\s+by\s+reading\b",
-        "smoke-tested-by-reading without an actual test",
+        "smoke-tested-by-reading without an actual recent test",
         ["python", "python3", "pytest", "uv ", "pip "],
     ),
     (
         r"\bout\s+of\s+scope\b",
-        "out-of-scope without spec read",
+        "out-of-scope (always-deny: only removing/rephrasing the phrase passes the gate)",
         [],
     ),
     (
+        # NARROWED 2026-07-22 (the user "split" decision): dropped the bare "Bash" marker
+        # (it matched ANY shell command); recency-gated so only a RECENT compute probe
+        # clears it. "would require" is common prose, so it is NOT made always-deny.
         r"\bwould\s+(need\s+to\s+run|require)\b",
-        "would-need-to-run without probe",
-        ["python", "python3", "uv ", "pip ", "Bash"],
+        "would-need-to-run / would-require without a recent probe",
+        ["python", "python3", "uv ", "pip "],
     ),
 ]
 
 
-def collect_evidence_commands(session_id: str) -> str:
-    """Return a single concatenated string of recent Bash commands and
-    tool descriptors from the per-session evidence file. Empty string
-    if file does not exist.
+def collect_evidence_commands(session_id: str) -> tuple[str, str | None]:
+    """Return (recent_commands, blind_reason).
+
+    blind_reason is None when the evidence file was READ (recent_commands may still be ""
+    if it held no relevant events); it is a human-readable reason string in the three
+    BLIND cases where the gate cannot read the evidence at all: no session_id, no evidence
+    file, or a read error. Only the last EVIDENCE_RECENCY_EVENTS events are scanned, so a
+    stale probe from an unrelated earlier task does not back a fresh caveat.
     """
     if not session_id:
-        return ""
+        return "", "no session_id in the hook payload"
     p = STATE_ROOT / session_id / "evidence.jsonl"
     if not p.exists():
-        return ""
+        return "", f"no evidence file at {p}"
     try:
         lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
-    recent = lines[-EVIDENCE_SCAN_LAST_N_EVENTS:]
+    except OSError as e:
+        return "", f"evidence file unreadable ({e.__class__.__name__})"
+    recent = lines[-EVIDENCE_RECENCY_EVENTS:]
     parts: list[str] = []
     for line in recent:
         line = line.strip()
@@ -129,7 +161,7 @@ def collect_evidence_commands(session_id: str) -> str:
             parts.append(ev.get("url", ""))
         elif tool == "WebSearch":
             parts.append(ev.get("query", ""))
-    return " || ".join(parts)
+    return " || ".join(parts), None
 
 
 def proposed_content_from_tool_input(tool_name: str, tool_input: dict) -> str:
@@ -137,9 +169,11 @@ def proposed_content_from_tool_input(tool_name: str, tool_input: dict) -> str:
     if tool_name == "Write":
         return tool_input.get("content", "") or ""
     if tool_name == "Edit":
-        old = tool_input.get("old_string", "") or ""
-        new = tool_input.get("new_string", "") or ""
-        return new + "\n" + old
+        # Scan only new_string -- the text being WRITTEN. Scanning old_string (the text
+        # being REMOVED) would deny an Edit that DELETES an always-deny caveat like "out
+        # of scope" / "not feasible", blocking the gate's own prescribed remedy (rewrite
+        # to remove the hedge). Caught by the council 2026-07-22.
+        return tool_input.get("new_string", "") or ""
     if tool_name == "NotebookEdit":
         return json.dumps(tool_input, default=str)
     return ""
@@ -152,12 +186,12 @@ def emit_deny(reasons: list[str], required_probes: list[str]) -> int:
         "COUNCIL PreToolUse LAZINESS GATE: write denied.",
         "",
         "Council rule 11 (caveat-phrases-require-probe) triggers were "
-        "detected in your proposed write/edit content, and the "
-        "session evidence does not contain a matching probe for at "
+        "detected in your proposed write/edit content, and the session's "
+        "RECENT evidence does not contain a matching probe for at "
         "least one of them. The denial is enforced before the write "
         "lands so you can run the probe FIRST, then re-attempt.",
         "",
-        "Triggers detected without backing probe:",
+        "Triggers detected without a recent backing probe:",
     ]
     for r in reasons:
         body_lines.append(f"  - {r}")
@@ -170,10 +204,11 @@ def emit_deny(reasons: list[str], required_probes: list[str]) -> int:
             body_lines.append(f"  - {p}")
     body_lines.append("")
     body_lines.append(
-        "If a trigger phrase has no auto-detectable probe (e.g. 'out "
-        "of scope'), the disciplined response is to Read the spec or "
-        "task-definition file with a quote that explicitly scopes the "
-        "work out, OR to rewrite the proposal without the caveat."
+        "Some triggers ('out of scope', 'not feasible') have NO "
+        "auto-detectable probe, so no command clears the gate: the only "
+        "way past it is to REWRITE the proposed content -- remove the bare "
+        "hedge, or replace it with a concrete reference (a spec quote that "
+        "scopes the work out, or the specific failed run that shows it)."
     )
 
     body = "\n".join(body_lines)
@@ -239,7 +274,20 @@ def main() -> int:
     if not triggers_hit:
         return 0
 
-    evidence_commands = collect_evidence_commands(session_id)
+    evidence_commands, blind_reason = collect_evidence_commands(session_id)
+    if blind_reason is not None:
+        # FAIL-OPEN when blind (the user sign-off 2026-07-22): the gate can only DENY an
+        # affirmatively-unbacked caveat, and it cannot affirm anything without reading the
+        # evidence. Allow the write and emit an OBSERVABLE note naming the reason (never
+        # the false "no matching probe"); the PostToolUse council + Stop audit still review
+        # this write under the same blindness and are told by rule 11 to flag an unbacked
+        # caveat there too.
+        labels = ", ".join(label for _, label, _ in triggers_hit)
+        print(f"laziness-gate: could not read this session's evidence ({blind_reason}); "
+              f"allowing the write without a pre-write probe check. Triggers present but "
+              f"unverifiable here: {labels}", file=sys.stderr)
+        return 0
+
     unbacked: list[str] = []
     required_probes_acc: list[str] = []
     for _, label, probes in triggers_hit:
