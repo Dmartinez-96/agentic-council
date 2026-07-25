@@ -12,6 +12,7 @@ Usage:
     python3 install.py --council-root /custom/path
     python3 install.py --dry-run       # print actions, do not write
     python3 install.py --force         # overwrite existing files
+    python3 install.py --uninstall     # remove the council (keeps roster.json + logs)
 
 Prerequisites the script verifies:
     Python 3.10+         (the council scripts use 3.10+ type syntax)
@@ -141,8 +142,12 @@ def which(cmd: str) -> str | None:
 def check_codex(rep: Reporter) -> bool:
     path = which("codex")
     if not path:
-        rep.err("codex CLI not found on PATH. Install it per your "
-                "vendor's official instructions before re-running.")
+        rep.err("codex CLI not found on PATH. Install it "
+                "(`npm install -g @openai/codex` [Node 16+], `brew install --cask "
+                "codex`, or the installer at github.com/openai/codex), then "
+                "authenticate: run `codex` and Sign in with ChatGPT, or "
+                "`printenv OPENAI_API_KEY | codex login --with-api-key`. Re-run "
+                "install once codex is ready.")
         return False
     rep.ok(f"codex CLI on PATH: {path}")
     try:
@@ -329,6 +334,74 @@ def render_hooks_template(council_root: Path) -> dict:
     return json.loads(rendered)
 
 
+COUNCIL_SCRIPTS = frozenset(f for f in COUNCIL_FILES if f.endswith(".py"))
+
+
+def is_council_handler(h) -> bool:
+    """True when a hook handler's command contains a path-shaped token whose basename
+    is EXACTLY one of our council scripts.
+
+    ``h`` is a settings.json handler dict; a non-dict (malformed settings) is never
+    ours -- preserved, not crashed on. The command is tokenised with ``shlex`` (so a
+    quoted path with spaces stays one token), and a token counts as ours only when it
+    is PATH-SHAPED (contains a separator) AND its basename is exactly a council script:
+
+      - EVERY token is checked, not just the first, because a hook may be written
+        ``python3 /opt/council/laziness_gate.py`` (token 0 is "python3").
+      - PATH-SHAPED, not any bare token, so a bare ``stop_audit.py`` appearing as an
+        argument (``lint --exclude stop_audit.py``) does NOT match.
+
+    RESIDUAL, stated honestly: because every path-shaped token is checked, the match is
+    NOT limited to the script the handler invokes -- a path-shaped ARGUMENT with a
+    council basename (e.g. ``lint --config /tmp/stop_audit.py``) also returns True, and
+    that foreign hook would be pruned. A suffix test would be worse still
+    (``"claude_council_advisor.py".endswith("council_advisor.py")`` is True). Exact
+    basename on path-shaped tokens is the rule the installer uses; it is not
+    collision-proof. Both ``merge_settings`` (prune-on-reinstall) and
+    ``prune_council_from_hooks`` inherit this limit.
+    """
+    if not isinstance(h, dict):
+        return False
+    cmd = str(h.get("command") or "")
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:                       # unbalanced quotes: not ours, leave it
+        return False
+    return any(os.sep in tok and Path(tok).name in COUNCIL_SCRIPTS
+               for tok in tokens)
+
+
+def prune_council_from_hooks(existing_hooks: dict) -> tuple[dict, int]:
+    """Remove council handlers from EVERY hook event; return (new_hooks, pruned_count).
+
+    Entries whose handlers were all council are dropped, and an event left with no
+    entries is omitted. Foreign handlers -- and any unrecognised shape -- are preserved
+    (subject to the exact-basename residual in ``is_council_handler``). Used by the
+    uninstaller; ``merge_settings`` prunes the same way before re-adding the fresh set.
+    """
+    new_hooks: dict = {}
+    pruned = 0
+    for event, entries in existing_hooks.items():
+        if not isinstance(entries, list):
+            new_hooks[event] = entries            # shape we do not own; leave it
+            continue
+        kept = []
+        for entry in entries:
+            handlers = entry.get("hooks") if isinstance(entry, dict) else None
+            if not isinstance(handlers, list):
+                kept.append(entry)                 # shape we do not own; leave it
+                continue
+            survivors = [h for h in handlers if not is_council_handler(h)]
+            pruned += len(handlers) - len(survivors)
+            if survivors:
+                kept.append({**entry, "hooks": survivors})
+            # an entry whose handlers were ALL ours is dropped entirely
+        if kept:
+            new_hooks[event] = kept
+        # an event left with no entries is dropped
+    return new_hooks, pruned
+
+
 def merge_settings(rep: Reporter, council_root: Path, force: bool) -> bool:
     rep.step(f"Merging hook block into {SETTINGS_PATH}")
     hooks_to_add = render_hooks_template(council_root)
@@ -358,9 +431,10 @@ def merge_settings(rep: Reporter, council_root: Path, force: bool) -> bool:
     # IDEMPOTENT re-install. The previous version did a bare `.extend()`, so
     # running the installer twice appended a SECOND copy of every council hook
     # and the council then fired twice on every single edit -- double the calls,
-    # double the cost, two verdicts per write. So: drop any entry that points at
-    # one of OUR scripts, then add the fresh set. Entries belonging to hooks the
-    # user installed themselves are matched by nothing here and are preserved.
+    # double the cost, two verdicts per write. So: drop any HANDLER that points at
+    # one of OUR scripts, then add the fresh set. Hooks the user installed
+    # themselves are preserved -- unless a handler's command collides on an exact
+    # council-script basename (the residual documented on is_council_handler).
     # The settings schema nests: hooks[event] is a list of ENTRIES, each with a
     # "matcher" and its own "hooks" list of HANDLERS (verified against a real
     # settings.json and against our own template).
@@ -371,40 +445,9 @@ def merge_settings(rep: Reporter, council_root: Path, force: bool) -> bool:
     # party's hook in a single PostToolUse entry. Dropping whole entries would
     # have deleted that third-party hook without a word.
     #
-    # Matching is on the EXACT basename, so that a previous install at a
-    # DIFFERENT council_root is still recognised and replaced.
-    #
-    # It must be exact. A suffix test (`cmd.endswith(name)`) looks equivalent and
-    # is not: "claude_council_advisor.py".endswith("council_advisor.py") is True,
-    # so a suffix test silently deletes a DIFFERENT tool's hook -- and the real
-    # settings.json this was written against contains exactly that handler.
-    #
-    # The honest residual limit: a hook of the user's whose script is named
-    # exactly e.g. `stop_audit.py` would still be pruned. Not detected.
-    council_scripts = {f for f in COUNCIL_FILES if f.endswith(".py")}
-
-    def is_council_handler(h: dict) -> bool:
-        # A token is ours when it is PATH-SHAPED and its basename is exactly one
-        # of our scripts. Both halves are load-bearing:
-        #
-        #   every token, not just the first -- a hook may be written as
-        #     `python3 /opt/council/laziness_gate.py`, where token 0 is "python3".
-        #     Matching only token 0 fails to recognise our own hook and appends a
-        #     duplicate on every reinstall, which is the bug this exists to stop.
-        #
-        #   path-shaped (contains a separator), not any bare token -- otherwise
-        #     someone else's `lint --exclude stop_audit.py` matches on an
-        #     ARGUMENT and we silently delete their hook.
-        #
-        # shlex, not .split(), so a quoted path containing spaces stays one token.
-        cmd = str(h.get("command") or "")
-        try:
-            tokens = shlex.split(cmd)
-        except ValueError:              # unbalanced quotes: not ours, leave it
-            return False
-        return any(os.sep in tok and Path(tok).name in council_scripts
-                   for tok in tokens)
-
+    # Matching is on the EXACT basename (see the module-level is_council_handler),
+    # so a previous install at a DIFFERENT council_root is still recognised and
+    # replaced. That function owns the exact-basename rule and its collision residual.
     for event, entries in hooks_to_add.items():
         cur = existing_hooks.get(event) or []
         if not isinstance(cur, list):
@@ -424,7 +467,7 @@ def merge_settings(rep: Reporter, council_root: Path, force: bool) -> bool:
             # an entry whose handlers were ALL ours is dropped entirely
         if pruned:
             rep.info(f"  hooks[{event}]: pruned {pruned} stale council "
-                     f"handler(s); all non-council handlers preserved")
+                     f"handler(s); handlers not matched as council preserved")
         existing_hooks[event] = kept + entries
     current["hooks"] = existing_hooks
     SETTINGS_PATH.write_text(json.dumps(current, indent=2) + "\n")
@@ -459,6 +502,88 @@ def ensure_state_dir(rep: Reporter) -> None:
     rep.ok(f"state directory ready: {STATE_DIR}/")
 
 
+def uninstall(rep: Reporter, council_root: Path) -> int:
+    """Remove the council's hooks, /council command, and installed scripts; keep the rest.
+
+    Removes: the council hook handlers from ~/.claude/settings.json (other handlers
+    kept, subject to is_council_handler's exact-basename residual); the /council slash
+    command (~/.claude/commands/council.md); and the installed council scripts (the
+    COUNCIL_FILES) under council_root. Preserves: roster.json, logs/, reverted/,
+    threads/, marker files and any other data under council_root, plus every
+    non-council setting in settings.json. Removing hooks takes effect live via Claude
+    Code's settings file-watcher -- no restart. Existing settings.json .pre-*.bak
+    backups are left in place. Re-running the installer REINSTALLS; only this removes.
+    Returns a process exit code (0 ok; 2 on an unreadable settings.json). Honours dry-run.
+    """
+    rep.info("agentic-council uninstaller")
+    rep.info(f"  council root: {council_root}")
+    rep.info(f"  dry-run:      {rep.dry_run}")
+    rep.info("")
+
+    # 1. settings.json: prune council hook handlers, preserve everything else.
+    if SETTINGS_PATH.exists():
+        try:
+            current = json.loads(SETTINGS_PATH.read_text())
+        except json.JSONDecodeError as e:
+            rep.err(f"{SETTINGS_PATH} is not valid JSON: {e}. Remove the council hook "
+                    "entries by hand.")
+            return 2
+        hooks = current.get("hooks")
+        if isinstance(hooks, dict):
+            pruned_hooks, n = prune_council_from_hooks(hooks)
+            if not n:
+                rep.info(f"no council hook handlers found in {SETTINGS_PATH}")
+            elif rep.dry_run:
+                rep.info(f"  would remove {n} council hook handler(s) from "
+                         f"{SETTINGS_PATH}; handlers not matched as council preserved")
+            else:
+                backup = SETTINGS_PATH.with_suffix(".json.pre-uninstall.bak")
+                shutil.copy2(SETTINGS_PATH, backup)
+                rep.ok(f"backed up settings.json to {backup}")
+                current["hooks"] = pruned_hooks
+                SETTINGS_PATH.write_text(json.dumps(current, indent=2) + "\n")
+                rep.ok(f"removed {n} council hook handler(s); handlers not matched as council preserved")
+        else:
+            rep.info(f"{SETTINGS_PATH} has no hooks dict to prune")
+    else:
+        rep.info(f"no {SETTINGS_PATH}; nothing to unhook")
+
+    # 2. the /council slash command.
+    cmd_file = COMMANDS_DIR / "council.md"
+    if not cmd_file.exists():
+        rep.info(f"no slash command at {cmd_file}")
+    elif rep.dry_run:
+        rep.info(f"  would remove {cmd_file}")
+    else:
+        cmd_file.unlink()
+        rep.ok(f"removed {cmd_file}")
+
+    # 3. the installed council scripts (leave roster.json, logs/, markers, user data).
+    removed = 0
+    for name in COUNCIL_FILES:
+        f = council_root / name
+        if not f.exists():
+            continue
+        if rep.dry_run:
+            rep.info(f"  would remove {f}")
+        else:
+            f.unlink()
+            removed += 1
+    if not rep.dry_run:
+        rep.ok(f"removed {removed} council script(s) from {council_root}")
+
+    rep.info("")
+    if rep.dry_run:
+        rep.info("Dry run: nothing was changed.")
+    else:
+        rep.info("Uninstall complete. Removing hooks takes effect live (the settings "
+                 "file-watcher picks it up) -- no restart needed.")
+        rep.info(f"  Left in place, yours to delete if you want: user data under "
+                 f"{council_root} (roster.json, logs/, markers) and any settings.json "
+                 f".pre-*.bak backups.")
+    return 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--council-root", type=Path, default=None,
@@ -468,6 +593,10 @@ def parse_args() -> argparse.Namespace:
                         help="Print actions but do not write any files.")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite existing files.")
+    parser.add_argument("--uninstall", action="store_true",
+                        help="Remove the council's hooks, the /council command, and "
+                             "the installed council scripts, then exit. Re-running "
+                             "the installer REINSTALLS.")
     parser.add_argument("--skip-probes", action="store_true",
                         help="Skip the codex / gemini live probes.")
     parser.add_argument("--quiet", action="store_true",
@@ -479,6 +608,8 @@ def main() -> int:
     args = parse_args()
     rep = Reporter(dry_run=args.dry_run, quiet=args.quiet)
     council_root = (args.council_root or DEFAULT_COUNCIL_ROOT).expanduser()
+    if args.uninstall:
+        return uninstall(rep, council_root)
     rep.info("agentic-council installer")
     rep.info(f"  repo root:    {REPO_ROOT}")
     rep.info(f"  council root: {council_root}")
@@ -526,19 +657,30 @@ def main() -> int:
     rep.info("")
     rep.info("Install complete.")
     rep.info("")
+    rep.info("Activation:")
+    rep.info("  - The council is LIVE now -- no restart. Claude Code's settings "
+             "file-watcher picks up the new hooks, so the PreToolUse gate and the "
+             "PostToolUse council fire on your next Write/Edit/NotebookEdit, and the "
+             "Stop audit runs when a response ends.")
+    rep.info("  - The one piece that waits for a session boundary is the SessionStart "
+             "probe (it seeds hardware/disk/python evidence). If Claude Code was "
+             "already running, start a new session or /resume to run it; if you "
+             "installed before launching Claude Code, it runs from session one.")
+    rep.info("  - Confirm it works: make a trivial edit and watch for the council's "
+             "verdict (PASS / WARN / BLOCK). The /council command is installed; use "
+             "it in a new session.")
+    rep.info("")
     rep.info("Next steps:")
-    rep.info("  1. Restart Claude Code so the new hooks are loaded "
-             "(hook config is read at session start).")
-    rep.info("  2. Edit the system prompt to match your workflow: "
+    rep.info("  1. Edit the quality bar to match your workflow: "
              f"{council_root / 'council_system_prompt.md'}")
-    rep.info("  3. Optionally tune the rule-11 trigger phrase list in "
-             f"{council_root / 'laziness_gate.py'} and "
-             f"{council_root / 'stop_audit.py'} for false positives "
+    rep.info("  2. Optionally tune the trigger-phrase list in "
+             f"{council_root / 'laziness_gate.py'} AND "
+             f"{council_root / 'stop_audit.py'} (edit both) for false positives "
              "specific to your domain.")
-    rep.info("  4. On your next Claude Code session, the SessionStart "
-             "probe will run automatically and land hardware/disk/"
-             "python info in the per-session evidence file at "
-             "~/.claude/state/<session_id>/evidence.jsonl.")
+    rep.info("  3. Optionally install your standing rules: copy "
+             f"{REPO_ROOT / 'starter-prompts' / 'standing-rules.md.template'} to "
+             "~/.claude/CLAUDE.md (or set COUNCIL_STANDING_RULES_PATH). Read it "
+             "before copying.")
     rep.info("")
     if rep.warnings:
         rep.info(f"{len(rep.warnings)} warning(s) emitted; review above.")

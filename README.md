@@ -17,6 +17,54 @@ The review runs in **two tiers**: three voting critics plus a non-voting inspect
 tier from other model families. It does not trust the actor's account of its own
 work. Neither should you.
 
+## Quickstart
+
+The full two-tier council needs an **OpenRouter API key** and the **codex CLI**. (You
+can run codex-only without OpenRouter, but that leaves a single voting member, so the
+`BLOCK` quorum is unreachable and the inspector tier stays dark.)
+
+Platforms: developed and tested on **Linux**; other platforms are untested. The
+exec-sandbox tool needs `bwrap` on `PATH` -- without it `REQUEST_EXEC` is denied and
+everything else works -- and the SessionStart probes call Unix tools (the Tuning section
+notes the macOS swaps).
+
+1. **OpenRouter key** -- create one at [openrouter.ai/keys](https://openrouter.ai/keys)
+   and make `OPENROUTER_API_KEY` visible to the process Claude Code launches under.
+   Simplest: `export OPENROUTER_API_KEY=...` in the shell you start Claude Code from. To
+   persist it, put that `export` in your login-shell file -- bash uses the first of
+   `~/.bash_profile`, `~/.bash_login`, and `~/.profile` that exists and is readable, so
+   put it in that same first file (or create `~/.profile` if you have none) -- and NOT
+   below the
+   `case $- ... *) return` guard in `~/.bashrc`, which non-interactive shells never
+   reach. If you instead launch Claude Code from a graphical desktop menu, put a plain
+   `OPENROUTER_API_KEY=...` line (no `export`) in `~/.config/environment.d/*.conf` and
+   re-login, since that file is read at graphical login. The default members are standard (non-free) OpenRouter models billed per
+   call, so keep some credit on the account.
+2. **codex CLI** -- `npm install -g @openai/codex` (Node 16+), `brew install --cask
+   codex`, or the installer at [github.com/openai/codex](https://github.com/openai/codex).
+   Authenticate: run `codex` and choose *Sign in with ChatGPT*, or
+   `printenv OPENAI_API_KEY | codex login --with-api-key`. (`codex doctor` diagnoses the
+   install/auth.)
+3. **bubblewrap** (Linux, optional) -- `bwrap` on `PATH` enables the exec-sandbox tool;
+   without it `REQUEST_EXEC` is denied and everything else still works.
+4. **Install** -- `git clone <this-repo> && cd agentic-council && python3 install.py`
+   (`--dry-run` to preview, `--council-root` to relocate). It verifies prerequisites,
+   probes codex + OpenRouter, copies the scripts, merges the hook block into
+   `~/.claude/settings.json`, and installs the `/council` command.
+5. **Standing rules** (optional) -- copy `starter-prompts/standing-rules.md.template` to
+   `~/.claude/CLAUDE.md` (or set `COUNCIL_STANDING_RULES_PATH`); read it before copying.
+6. **It's live -- no restart.** Claude Code's settings file-watcher picks up the hooks,
+   so the gate and council fire on your next `Write`/`Edit`. Only the SessionStart
+   environment probe waits for a session boundary: if Claude Code was already running,
+   start a new session or `/resume`; if you installed before launching it, everything is
+   live from session one. Confirm by making a trivial edit and watching for the council's
+   verdict. (The `/council` command loads in a new session.)
+
+To remove it later: `python3 install.py --uninstall` (keeps `roster.json` and your logs).
+
+Everything below is the how and the why -- read on to tune it, or stop here if you just
+wanted it running.
+
 ## The members (layer 1: voting)
 
 | member | model | effort | transport |
@@ -116,6 +164,14 @@ fire and logged. `python3 council/consult_council.py --print-roster` prints the
 active roster (members, tiers, transports, and the leader) as JSON -- the read path
 the GUI uses, so what the UI shows is the engine's own view, not a separate copy.
 
+Roster changes are **plug-and-play**: each fire is a fresh `consult_council.py`
+subprocess that re-reads `roster.json`, so editing the roster (or toggling the
+`FAST` / `NO_SHADOW` / `DISABLED` / `NO_AUTO_REVERT` markers) takes effect on the
+**next fire** -- no restart. Keep the one activation distinction straight: the
+registry and markers reload live per fire, the settings-file hooks reload live via
+Claude Code's file-watcher, and only the SessionStart environment probe waits for a
+session boundary (a new session, `/resume`, or a compact).
+
 ## The leader (interchangeable tool-using role)
 
 The council reviews an actor. By default that actor is Claude, driven by Claude
@@ -158,7 +214,7 @@ place, so no voting or inspecting member can ever hold it.
   file so hardware claims have a probe from minute zero, and injects a standing
   research directive.
 
-Verdicts are `PASS` (silent), `WARN` (surfaced to Claude), and `BLOCK`. `PASS`
+Verdicts are `PASS` (silent), `WARN` (surfaced to the leader), and `BLOCK`. `PASS`
 requires unanimity among the voting members, and a lost or unparseable vote forces
 `WARN` rather than being silently discarded. **`BLOCK` is a quorum, not a veto:**
 `BLOCK_QUORUM = 2`, so two voting members must `BLOCK` to auto-revert. A lone
@@ -170,12 +226,12 @@ restriction.)
 ## AUTO-REVERT: read this before you install
 
 **On a quorum `BLOCK` (two or more voting members), this software will undo
-Claude's write.** It is on by default (`AUTO_REVERT_ON_BLOCK` in
+the leader's write.** It is on by default (`AUTO_REVERT_ON_BLOCK` in
 `council_advisor.py`). You should know exactly what that means before you let it
 near your files.
 
 The council reviews at PostToolUse, which is AFTER the write lands, so a `BLOCK`
-could historically only ASK Claude to revert -- and Claude could ignore it. The
+could historically only ASK the leader to revert -- and the leader could ignore it. The
 PreToolUse gate, the only layer that can deny a write outright, is a regex and
 catches only the literal trigger phrases. Auto-revert is what makes a quorum
 `BLOCK` mean something.
@@ -231,7 +287,7 @@ separates them, and every control in it assumes **Claude will cheat if allowed t
   draw until its own concerns are labelled and adjudicated. That file is ordinary
   JSONL, so the record survives only as long as nobody edits it out; see the caveat
   below.
-- `adjudicate` has **the council rule on Claude's label**, with the member who raised
+- `adjudicate` has **the council rule on the leader's label**, with the member who raised
   the concern excluded from judging it. A tie fails closed, so a single dissent
   disputes a label, and `DISPUTED` labels are excluded from the outcome columns
   entirely.
@@ -239,8 +295,8 @@ separates them, and every control in it assumes **Claude will cheat if allowed t
   cross-section numbers, and raises a banner on any label re-written after the
   council disputed it.
 
-None of this is cryptographically enforced against the agent it audits. Claude can
-edit these files. What the tool actually provides is that faking a clean history
+None of this is cryptographically enforced against the agent it audits. The leader
+can edit these files. What the tool actually provides is that faking a clean history
 requires deliberately rewriting an audit record, rather than merely staying quiet.
 
 ## The VS Code extension
@@ -259,15 +315,29 @@ cd agentic-council
 python3 install.py            # --dry-run to preview, --council-root to relocate
 ```
 
-Then **restart Claude Code**, because hook configuration is read at session start.
+The council is live immediately -- **no restart needed.** Claude Code's settings
+file-watcher picks up the new hooks, so the gate and council fire on your next
+`Write`/`Edit`. The one piece that waits for a session boundary is the SessionStart
+environment probe: if Claude Code was already running, start a new session or
+`/resume` to run it (see the Quickstart above).
 
 The installer copies the scripts and merges the hook block into
 `~/.claude/settings.json` **idempotently**, so re-running it replaces the council's
 own hooks rather than appending a second copy. It prunes at the handler level and by
 exact script basename, so other tools' hooks survive -- the one hole, stated plainly:
-a hook of your own whose script is named exactly `stop_audit.py` (or any other
-council filename) would also be pruned. Your prior `settings.json` is backed up
+if any path in one of your own hooks' commands has a council script's exact basename
+(e.g. `stop_audit.py`), whether that path is its script or an argument, it is pruned too. Your prior `settings.json` is backed up
 first.
+
+To remove the council later, run `python3 install.py --uninstall`. It strips the
+council's hook handlers from `settings.json` (handlers not matched as council, and
+your other settings, stay),
+deletes the `/council` command, and removes the installed scripts, while keeping your
+`roster.json`, logs, and marker files. It backs `settings.json` up before pruning, and
+-- like the prune-on-reinstall above -- removes a foreign hook if its command contains
+a path (a token with a directory separator) whose final component is a council script's
+name, whether that path is the hook's own script or an argument. Re-running
+the installer instead REINSTALLS. (`--dry-run` previews the removal.)
 
 ### Prerequisites
 
