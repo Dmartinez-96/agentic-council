@@ -13,8 +13,8 @@ it reviews -- the tool-using **leader** -- is now a selectable role, not only
 Claude. A model named in the roster's `leader` field takes the turns, and every
 file it writes is reviewed by the council *before* it touches disk.
 
-The review runs in **two tiers**: three voting critics plus a non-voting inspector
-tier from other model families. It does not trust the actor's account of its own
+The review runs in **two tiers**: six voting critics plus a six-model non-voting
+inspector tier from further model families. It does not trust the actor's account of its own
 work. Neither should you.
 
 ## Quickstart
@@ -67,23 +67,27 @@ wanted it running.
 
 ## The members (layer 1: voting)
 
-| member | model | effort | transport |
+| member | model | fallback | transport |
 |---|---|---|---|
-| codex | `gpt-5.6-sol` | reasoning `high` | `codex exec`, read-only sandbox |
-| gemini | `gemini-3.5-flash` | high | OpenRouter |
-| deepseek | `deepseek-v4-pro` | high | OpenRouter |
+| codex | `gpt-5.6-sol` | `openai/gpt-5.6-sol` | `codex exec`, read-only sandbox |
+| gemini | `google/gemini-3.6-flash` | `google/gemini-3.5-flash` | OpenRouter |
+| deepseek | `deepseek/deepseek-v4-pro` | `deepseek/deepseek-v4-flash` | OpenRouter |
+| kimi | `moonshotai/kimi-k3` | `moonshotai/kimi-k2-thinking` | OpenRouter |
+| glm | `z-ai/glm-5.2` | `z-ai/glm-5.1` | OpenRouter |
+| grok | `x-ai/grok-4.5` | `x-ai/grok-4.3` | OpenRouter |
 
-These three are the **voting** members. Whoever is present runs concurrently for
+These six are the **voting** members. Whoever is present runs concurrently for
 two rounds: in round 1 each sees the proposal independently, and in round 2 each
 sees the others' round-1 verdicts and may revise. That is two model calls per
-active voting member per fire.
+active voting member per fire. Reasoning effort on the OpenRouter route is
+`high`, or `low` under FAST.
 
 Membership is key-gated **by transport**. codex authenticates through its own CLI
-and needs no key. gemini and deepseek run through **OpenRouter**, so both are
-dropped when `OPENROUTER_API_KEY` is absent -- and with fewer than two voting
-members present, `BLOCK`/auto-revert becomes unreachable (see the quorum note
-below), which the engine warns about at load time. The roster is configurable
-(see "Configuring the roster" below); the table above is the built-in default.
+and needs no key. The other five run through **OpenRouter**, so all five are
+dropped when `OPENROUTER_API_KEY` is absent, leaving codex alone -- and a
+one-member panel means a single critic can auto-revert, which the engine warns
+about at load time. The roster is configurable (see "Configuring the roster"
+below); the table above is the built-in default.
 
 Reasoning effort is FAST-aware: `touch FAST` drops the members to their lowest
 effort (see "FAST mode").
@@ -120,25 +124,29 @@ So the wall still holds -- a member cannot change your files -- but it can now
 
 ## Layer 2: the inspector tier (non-voting, and core -- run with it on)
 
-Behind the three voting members is a second tier of critics from other model
-families -- **kimi, glm, and grok** -- queried through OpenRouter. They are
-**non-voting**: an inspector's verdict is logged and shown to you (marked
-`NON-VOTING`), but it is held out of consensus -- it cannot change a verdict and
-can never trigger auto-revert. It is a different-family second look that runs
-alongside the voting panel so you see what it uniquely catches, without letting it
-touch your files.
+Behind the six voting members is a second tier of critics from six further model
+families, queried through OpenRouter. They are **non-voting**: an inspector's
+verdict is logged and shown to you (marked `NON-VOTING`), but it is held out of
+consensus -- it cannot change a verdict and can never trigger auto-revert. It is a
+different-family second look at the concluded review, so you see what it uniquely
+catches, without letting it touch your files.
 
 This tier is **not a frill** -- removing it neuters what the council is for, which
 is diverse, independent scrutiny. Run with it enabled.
 
 | inspector | primary model | fallback |
 |---|---|---|
-| kimi | `moonshotai/kimi-k2-thinking` | `moonshotai/kimi-k2.6` |
-| glm  | `z-ai/glm-5.2` | `z-ai/glm-5` |
-| grok | `x-ai/grok-4.5` | `x-ai/grok-4.3` |
+| muse | `meta/muse-spark-1.1` | *(none listed in the catalog)* |
+| qwen | `qwen/qwen3.7-max` | `qwen/qwen3.7-plus` |
+| minimax | `minimax/minimax-m3` | `minimax/minimax-m2.7` |
+| mimo | `xiaomi/mimo-v2.5-pro` | `xiaomi/mimo-v2.5` |
+| nemotron | `nvidia/nemotron-3-ultra-550b-a55b` | `nvidia/nemotron-3-super-120b-a12b` |
+| mistral | `mistralai/mistral-medium-3-5` | `mistralai/mistral-medium-3.1` |
 
 Each pair is passed to OpenRouter as a `models` array (primary, then fallback), and
-the engine records which model actually answered (`model_used` in the log).
+the engine records which model actually answered (`model_used` in the log). `muse`
+has no sibling in the catalog, so it runs single-slug: a route failure drops that
+seat for the fire rather than falling back.
 
 **It is ON BY DEFAULT** whenever `OPENROUTER_API_KEY` is set in the environment
 Claude Code launches under -- layer 2 is half the council, so running without it is
@@ -217,9 +225,13 @@ place, so no voting or inspecting member can ever hold it.
 Verdicts are `PASS` (silent), `WARN` (surfaced to the leader), and `BLOCK`. `PASS`
 requires unanimity among the voting members, and a lost or unparseable vote forces
 `WARN` rather than being silently discarded. **`BLOCK` is a quorum, not a veto:**
-`BLOCK_QUORUM = 2`, so two voting members must `BLOCK` to auto-revert. A lone
-`BLOCK` is surfaced loudly but the file **stands** -- so a single critic cannot
-revert work on its own. (The quality bar directs members to reserve `BLOCK` for a
+the threshold is `block_quorum()`, **derived from the panel size** as ceil(n/2) --
+half the voting bench, rounded up. On the six-member default that is 3. A lone
+`BLOCK` is surfaced loudly but the file **stands**, so a single critic cannot
+revert work on its own at any panel of three or more. (Two exceptions follow from
+the arithmetic and are not hidden: at one or two voting members ceil(n/2) is 1, so
+a single `BLOCK` does revert. The engine warns at load time when a roster puts you
+there.) (The quality bar directs members to reserve `BLOCK` for a
 caveat asserted without a probe -- that is prompt guidance, not an engine-enforced
 restriction.)
 
@@ -345,9 +357,9 @@ the installer instead REINSTALLS. (`--dry-run` previews the removal.)
 - **codex CLI**, authenticated -- the one voting member that is a subprocess. An
   older CLI may not know `gpt-5.6-sol`, and a rejection can also come from your
   account tier rather than the CLI version.
-- **`OPENROUTER_API_KEY`** -- required for the gemini and deepseek voting members
-  (both run through OpenRouter) and for the layer-2 inspectors. Without it the
-  council falls back to codex alone.
+- **`OPENROUTER_API_KEY`** -- required for five of the six voting members (gemini,
+  deepseek, kimi, glm, grok all run through OpenRouter) and for every layer-2
+  inspector. Without it the council falls back to codex alone.
 - **bubblewrap** (`bwrap` on `PATH`), Linux only -- required for the exec-sandbox
   tool; without it, `REQUEST_EXEC` is denied (fail-closed), the rest still works.
 
@@ -378,9 +390,14 @@ warnings:
 ## What this costs you
 
 - **Model calls per Write/Edit/NotebookEdit**: two per voting member (round 1 +
-  round 2), so up to six for the full voting panel, plus one per layer-2 inspector.
-  A member that requests a tool between rounds adds its own follow-up call. Check
-  your vendors' pricing.
+  round 2), so up to 12 for the full six-member voting panel. Each layer-2
+  inspector costs **one** call, plus a **second only if it requests a file, URL, or
+  command** -- the harness re-runs just those inspectors with their results, so the
+  inspector tier costs at least 6 calls and at most 12, depending on how many
+  inspectors reach for a tool on that fire. A voting member
+  that requests a tool between rounds likewise adds its own follow-up call. That is
+  a large default -- trim the roster (see "Configuring the roster") if it is more
+  than you want to spend, and check your vendors' pricing.
 - **Latency**: members run in parallel, so wall time per fire is roughly the slowest
   member's round trip times the number of rounds, not the sum of all of them.
 - **Noise**: `WARN` is common and a `BLOCK` quorum is not. Whether that is signal or

@@ -50,3 +50,11 @@ council/FAST
 council/SHADOW
 # roster.json -> user-local roster override (who is on the council); per-install, like the markers
 council/roster.json
+# brain/ ships SCAFFOLDING only (schema, templates, validator). A VAULT is private
+# content -- your facts, your paths, your commands -- and must never be committed
+# here. The validator has NO default vault path -- it takes one as an argument --
+# so `_brain/` below is a SUGGESTED name this ignore covers, not a convention the
+# tooling knows about. Point the validator wherever your vault lives; it writes its
+# attestation ledger inside that directory.
+_brain/
+**/.attestations.json

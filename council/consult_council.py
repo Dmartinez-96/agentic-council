@@ -197,10 +197,14 @@ GEMINI_THINKING_LEVEL = "high"
 
 # OpenRouter slug for the gemini voting member (same billing directive as
 # DEEPSEEK_OPENROUTER_MODEL). Listed in OpenRouter's public models API
-# (GET openrouter.ai/api/v1/models), checked 2026-07-18. On this route the effort
-# sent is openrouter_effort(), not GEMINI_THINKING_LEVEL, which applies only to
-# the direct gemini_rest transport.
-GEMINI_OPENROUTER_MODEL = "google/gemini-3.5-flash"
+# (GET openrouter.ai/api/v1/models), re-checked 2026-07-25. On this route the
+# effort sent is openrouter_effort(), not GEMINI_THINKING_LEVEL, which applies
+# only to the direct gemini_rest transport.
+# 2026-07-25: 3.5-flash -> 3.6-flash, the highest-versioned gemini flash in that
+# catalog. That is a VERSION fact, not a capability measurement -- nothing here
+# compared the two. 3.5-flash is kept as the fallback.
+GEMINI_OPENROUTER_MODEL = "google/gemini-3.6-flash"
+GEMINI_OPENROUTER_FALLBACK = "google/gemini-3.5-flash"
 
 # --- FAST mode ---------------------------------------------------------------
 #
@@ -299,14 +303,42 @@ PITCH_LOG_MAX_BYTES = 200_000
 # How many members must cast BLOCK before the fire BLOCKs and the file is
 # auto-reverted.
 #
-# 2 = a quorum: a lone dissenting member warns loudly (see emit_output) but does
-#     NOT revert, so no single critic can destroy work on its own; two must agree.
-# 1 = the older behaviour, where any single BLOCK reverts. Auto-revert destroys
-#     work, so raising or lowering this threshold is a deliberate policy choice.
+# Auto-revert destroys work, so this threshold is a deliberate policy choice for
+# whoever runs the council, not a tuning knob. How it arrived at the current rule:
+#   1 = the original behaviour: ANY single member could revert the file.
+#   a FIXED NUMBER = the next attempt. It holds its intended meaning only at the
+#       panel sizes it happens to suit, and changes meaning silently at others: a
+#       threshold of 3 is half of a six-member bench but UNANIMITY on a
+#       three-member one.
+#   DERIVED = the current rule, below: the threshold follows the panel size, so it
+#       keeps its meaning when members are added or removed.
 #
-# Do not raise it above the member count, or BLOCK becomes unreachable and
-# enforcement is theatre.
-BLOCK_QUORUM = 2
+# It is now IMPOSSIBLE to raise the threshold above the member count, which the
+# fixed value could do; ceil(n/2) <= n for all n >= 1, so BLOCK stays reachable
+# and enforcement never becomes theatre.
+#
+# KNOWN EDGE, stated because it is a real regression at one panel size and was
+# NOT hidden inside the formula: at n=2, ceil(2/2) = 1, so a LONE member can
+# auto-revert -- the veto behaviour that setting 1 was abandoned for. At n=1 that
+# is unavoidable if BLOCK is to be reachable at all. Every n >= 3 needs at least
+# two members. If a floor at 2 is wanted for n=2, that is a decision for the user,
+# not a formula to change quietly.
+
+
+def block_quorum(n_voting: int | None = None) -> int:
+    """How many voting members must cast BLOCK before the file is auto-reverted.
+
+    DERIVED from the panel size rather than pinned: ceil(n/2), i.e. half the
+    voting bench rounded up. `(n + 1) // 2` is exact ceiling division for
+    non-negative ints and avoids importing math for one call.
+
+    n_voting is passed explicitly by the roster VALIDATOR, which must reason about
+    a candidate roster before it becomes the active one. Everywhere else it
+    defaults to the live voting bench. voting_members() is defined later in the
+    module; every call to this function happens at runtime, after load.
+    """
+    n = len(voting_members()) if n_voting is None else n_voting
+    return (n + 1) // 2
 
 
 def now_iso() -> str:
@@ -2084,19 +2116,35 @@ class Member:
                                         # derives that from the transport.
 
 
-# THE DEFAULT ROSTER (user-confirmed 2026-07-18): codex+gemini+deepseek voting,
-# kimi+glm+grok inspecting. Per the same-day billing directive, non-subscription
-# members run through the common OpenRouter key -- gemini and deepseek included --
-# while codex stays on subscription (the codex CLI) with an OpenRouter fallback;
-# the direct-vendor transports (gemini_rest, deepseek_https) remain available if a
-# member is reassigned to them. Order within a tier is preserved into the derived
-# structures. All OpenRouter slugs are PINNED (not *-latest auto-routes -- a
-# silently changing model would contaminate the logs the way an unrecorded FAST
-# run did); the inspectors carry a [primary, fallback] `models` array: OpenRouter
-# fails the primary over to the fallback on downtime, rate-limits, moderation
-# refusals, or context-length errors, walking the list once in order (OpenRouter
-# Model Fallbacks docs, checked 2026-07-18). (Kimi's primary is the reasoning
-# variant, not the code one.)
+# THE DEFAULT ROSTER (user-set 2026-07-25): SIX voting -- codex, gemini, deepseek,
+# kimi, glm, grok -- and SIX inspecting: muse, qwen, minimax, mimo, nemotron,
+# mistral. kimi/glm/grok were PROMOTED from inspector to voting that day, and the
+# six inspectors are new seats, making this the 6+6 bench (plus the leader role,
+# which is not a members-list record -- see _validate_leader).
+# Per the 2026-07-18 billing directive, non-subscription members run through the
+# common OpenRouter key -- gemini and deepseek included -- while codex stays on
+# subscription (the codex CLI) with an OpenRouter fallback; the direct-vendor
+# transports (gemini_rest, deepseek_https) remain available if a member is
+# reassigned to them. Order within a tier is preserved into the derived structures.
+# All OpenRouter slugs are PINNED (not *-latest auto-routes -- a silently changing
+# model would contaminate the logs the way an unrecorded FAST run did). Each
+# OpenRouter member that HAS a sibling in its family carries a [primary, fallback]
+# `models` array: OpenRouter fails the primary over to the fallback on downtime,
+# rate-limits, moderation refusals, or context-length errors, walking the list once
+# in order (OpenRouter Model Fallbacks docs, checked 2026-07-18). muse is the one
+# exception -- the catalog listed no sibling for it -- so it runs single-slug and a
+# route failure drops that seat for the fire rather than falling back.
+# WHAT WAS VERIFIED about these slugs, and what was NOT: every primary and fallback
+# below was confirmed PRESENT in OpenRouter's public catalog (GET
+# openrouter.ai/api/v1/models, 345 models, fetched 2026-07-25), and each primary is
+# the highest-versioned entry in its family there EXCEPT codex and grok, which the
+# user chose to leave ("leave grok and sol as is for now"). A higher version number
+# is NOT a capability measurement; nothing here compared any of these models against
+# any other. Do not restate this as "SOTA".
+# BENCH SIZE IS AN INSTRUMENT PROPERTY: a fire's active roster is recorded per fire
+# in the log (write_log "roster"), so analyses can split on the bench that actually
+# ran rather than on a date. Pooling fires from the 3+3 bench with the 6+6 bench is
+# pooling two instruments.
 # Default grant: EVERY member holds EVERY capability (the user 2026-07-20: "everybody
 # should have web and whatever other capabilities, even inspectors"; "all members, even
 # ones to be added in the future, need their tool access"). Must stay a subset of
@@ -2106,19 +2154,38 @@ _DEFAULT_CAPS = ("file_retrieval", "web", "exec_sandbox")
 MUTATE = "mutate"                        # capability string for applying writes/edits.
 LEADER_CAPS = _DEFAULT_CAPS + (MUTATE,)  # the three member caps plus "mutate".
 DEFAULT_REGISTRY: tuple[Member, ...] = (
+    # --- LAYER 1: voting (6) ---
     Member("codex",    VOTING, "codex_subprocess", CODEX_MODEL,
            fallback_model=CODEX_OPENROUTER_FALLBACK, capabilities=_DEFAULT_CAPS),
     Member("gemini",   VOTING, "openrouter", GEMINI_OPENROUTER_MODEL,
-           capabilities=_DEFAULT_CAPS),
+           GEMINI_OPENROUTER_FALLBACK, capabilities=_DEFAULT_CAPS),
     Member("deepseek", VOTING, "openrouter", DEEPSEEK_OPENROUTER_MODEL,
+           "deepseek/deepseek-v4-flash", capabilities=_DEFAULT_CAPS),
+    Member("kimi",     VOTING, "openrouter",
+           "moonshotai/kimi-k3", "moonshotai/kimi-k2-thinking",
            capabilities=_DEFAULT_CAPS),
-    Member("kimi", INSPECTOR, "openrouter",
-           "moonshotai/kimi-k2-thinking", "moonshotai/kimi-k2.6",
-           capabilities=_DEFAULT_CAPS),
-    Member("glm", INSPECTOR, "openrouter",
-           "z-ai/glm-5.2", "z-ai/glm-5", capabilities=_DEFAULT_CAPS),
-    Member("grok", INSPECTOR, "openrouter",
+    Member("glm",      VOTING, "openrouter",
+           "z-ai/glm-5.2", "z-ai/glm-5.1", capabilities=_DEFAULT_CAPS),
+    Member("grok",     VOTING, "openrouter",
            "x-ai/grok-4.5", "x-ai/grok-4.3", capabilities=_DEFAULT_CAPS),
+    # --- LAYER 2: non-voting inspectors (6) ---
+    # muse runs single-slug: the catalog listed no sibling to fall back to.
+    Member("muse",     INSPECTOR, "openrouter",
+           "meta/muse-spark-1.1", capabilities=_DEFAULT_CAPS),
+    Member("qwen",     INSPECTOR, "openrouter",
+           "qwen/qwen3.7-max", "qwen/qwen3.7-plus", capabilities=_DEFAULT_CAPS),
+    Member("minimax",  INSPECTOR, "openrouter",
+           "minimax/minimax-m3", "minimax/minimax-m2.7",
+           capabilities=_DEFAULT_CAPS),
+    Member("mimo",     INSPECTOR, "openrouter",
+           "xiaomi/mimo-v2.5-pro", "xiaomi/mimo-v2.5",
+           capabilities=_DEFAULT_CAPS),
+    Member("nemotron", INSPECTOR, "openrouter",
+           "nvidia/nemotron-3-ultra-550b-a55b",
+           "nvidia/nemotron-3-super-120b-a12b", capabilities=_DEFAULT_CAPS),
+    Member("mistral",  INSPECTOR, "openrouter",
+           "mistralai/mistral-medium-3-5", "mistralai/mistral-medium-3.1",
+           capabilities=_DEFAULT_CAPS),
 )
 
 # User-selectable roster override (the GUI writes this file; any editor works).
@@ -2263,10 +2330,14 @@ def _validate_roster(raw: object) -> tuple[tuple[Member, ...], list[str],
                       "verdict")
     if not errors:
         n_vote = sum(1 for m in out if m.tier == VOTING)
-        if n_vote < BLOCK_QUORUM:
-            warnings.append(f"only {n_vote} voting member(s) but BLOCK_QUORUM="
-                            f"{BLOCK_QUORUM}: BLOCK/auto-revert is unreachable "
-                            f"at this roster")
+        # The quorum is DERIVED from this candidate roster's own voting count, not
+        # from the live one, because this roster is not active yet. ceil(n/2) can
+        # never exceed n, so the old "unreachable quorum" warning is now dead for
+        # any n >= 1; what remains worth saying is the LONE-REVERTER edge.
+        if n_vote and block_quorum(n_vote) < 2:
+            warnings.append(f"only {n_vote} voting member(s): quorum is "
+                            f"{block_quorum(n_vote)}, so a SINGLE member can "
+                            f"auto-revert at this roster")
     return tuple(out), errors, warnings
 
 
@@ -3619,7 +3690,7 @@ def determine_final_verdict(active_results: list[dict]) -> str:
     if not active_results:
         return "ERROR"
     verdicts = [r["verdict"] for r in active_results]
-    if sum(1 for v in verdicts if v == "BLOCK") >= BLOCK_QUORUM:
+    if sum(1 for v in verdicts if v == "BLOCK") >= block_quorum():
         return "BLOCK"
     # A BLOCK below quorum does NOT revert, but it must not be swallowed either: it
     # is a member demanding the work be undone. It comes out as WARN, and
@@ -3818,9 +3889,10 @@ def emit_output(results: list[dict], final_verdict: str, log_path: Path,
     # would be the dangerous part: a member demanded the work be undone and the
     # only trace would be a WARN indistinguishable from a style nit. Name it.
     blockers = [r["role"] for r in results if r.get("verdict") == "BLOCK"]
-    if blockers and len(blockers) < BLOCK_QUORUM:
+    if blockers and len(blockers) < block_quorum():
         print(f"# SUB-QUORUM BLOCK: {', '.join(blockers)} voted BLOCK, but "
-              f"{BLOCK_QUORUM} are required to auto-revert, so the file STANDS.")
+              f"{block_quorum()} of {len(voting_members())} voting members are "
+              f"required to auto-revert, so the file STANDS.")
         print("# This is not a downgrade of the objection. A member is saying the "
               "work should be undone.")
         print("# Answer it on the merits or revert by hand; do not read the "
