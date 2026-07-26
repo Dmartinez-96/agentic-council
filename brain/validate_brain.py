@@ -410,6 +410,13 @@ def main():
 
     notes = []
     for p in sorted(vault.rglob("*.md")):
+        # Skip anything under a DOT-DIRECTORY. Opening a vault in Obsidian creates
+        # `.obsidian/` inside it (measured 2026-07-26: app.json, appearance.json,
+        # core-plugins.json, workspace.json), and a community plugin shipping a
+        # README.md or docs there would otherwise be parsed as a NOTE, fail the schema,
+        # and make the whole run exit non-zero. Also covers .git/, .trash/, .stfolder/.
+        if any(part.startswith(".") for part in p.relative_to(vault).parts[:-1]):
+            continue
         if p.name.startswith("_") or p.name == "README.md":
             continue
         fields, body, errs = parse_note(p)
