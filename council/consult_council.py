@@ -2194,11 +2194,86 @@ def _cache_accounting(data: dict) -> dict:
     return out
 
 
-def _openrouter_call_blocking(role: str, models: list[str], prompt: str) -> dict:
+# Model-slug prefixes that send an explicit cache breakpoint. Each is here for a
+# stated reason, because the source does NOT support one blanket rule:
+#  - anthropic/, qwen/ : openrouter.ai/docs/features/prompt-caching (fetched
+#    2026-07-28) lists Anthropic and Alibaba Qwen under providers requiring explicit
+#    cache_control, and says both allow up to four breakpoints per request.
+# google/ WAS HERE AND WAS REMOVED THE SAME DAY, BY MEASUREMENT. It was added because
+# gemini logged cached_tokens 0 on the first fires sampled; a wider sample refuted that.
+# The full multiset over 13 pre-change fires was [0 x7, 8187 x2, 57313, 57314, 57315,
+# 57315] -- mean 18,894.7, with FOUR fires near 57,3xx (~92% of the prompt). With an
+# explicit breakpoint it became CONSISTENT and far smaller: 6/6 fires cached exactly
+# 6,231 tokens, mean 6,231. (6,231 is the provider's token count, not a measurement that
+# it equals the system prompt -- nothing here tokenized that file.) So the plain string
+# is the better bet for Gemini and google/ stays out.
+# HONESTLY BOUNDED: n=13 vs 6, uncontrolled, different fires reviewing different edits,
+# and the implicit path was erratic (7 of 13 zeros), so this is an ASSOCIATION and not a
+# demonstrated cause. The decision rests on the CAP's exactness -- 6,231 on 6 of 6 across
+# prompts of differing length -- which is what a breakpoint at that boundary would do.
+# DELIBERATELY ABSENT: the automatic providers. That page says they ignore explicit
+# breakpoints, and glm and deepseek already cache 86.5% and 54.2% of their prompt
+# tokens under the plain-string shape (measured 2026-07-28), which is not worth
+# risking on a shape change the page never documents as neutral for them.
+# qwen/ IS RETAINED ON THE DOC, NOT ON A RESULT: OpenRouter lists Alibaba as requiring
+# explicit cache_control, and the breakpoint is delivered (test_cache_control.py), but
+# qwen logged cached_tokens 0 on all 19 fires sampled 2026-07-28 -- 13 without the
+# breakpoint and 6 with it. It has bought nothing measurable so far.
+CACHE_CONTROL_MODEL_PREFIXES = ("anthropic/", "qwen/")
+
+
+def _needs_explicit_cache_control(models: list[str]) -> bool:
+    """True when ANY candidate slug belongs to an explicit-breakpoint provider.
+
+    ANY rather than just the primary because `models` is [primary, fallback] and
+    OpenRouter may answer with either; a breakpoint the answering provider ignores is
+    documented as harmless, whereas omitting one it needs silently costs the cache.
+    """
+    return any(isinstance(m, str) and m.startswith(CACHE_CONTROL_MODEL_PREFIXES)
+               for m in models)
+
+
+def _message_content(prompt: str, cache_prefix: str):
+    """The `content` value for the user message: a plain string, or typed text parts
+    with one ephemeral cache breakpoint at the end of `cache_prefix`.
+
+    THE INVARIANT, and the reason this is written as a prefix/remainder split rather
+    than as a re-join of the caller's sections: concatenating the returned parts
+    reproduces `prompt` BYTE FOR BYTE. Nothing is re-serialised, re-joined or
+    re-ordered, so a member cannot receive different text because of how the request
+    happened to be framed. `_nogit/test_cache_control.py` asserts that reassembly.
+
+    Falls back to the plain string whenever the split cannot be made safely -- an empty
+    prefix, a prompt that does not actually start with it, or an empty remainder -- so
+    the failure mode is "no breakpoint", never "altered prompt".
+
+    Shape is from the same OpenRouter page: content becomes an array of
+    {"type": "text", "text": ...} objects and the breakpoint rides on the block whose
+    end is being marked, as {"cache_control": {"type": "ephemeral"}}.
+    """
+    if not cache_prefix or not prompt.startswith(cache_prefix):
+        return prompt
+    remainder = prompt[len(cache_prefix):]
+    if not remainder:
+        return prompt
+    return [
+        {"type": "text", "text": cache_prefix,
+         "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": remainder},
+    ]
+
+
+def _openrouter_call_blocking(role: str, models: list[str], prompt: str,
+                              cache_prefix: str = "") -> dict:
     """Blocking OpenAI-compatible POST to OpenRouter. Same result shape as
     _deepseek_call_blocking; any failure -> ERROR so the member degrades gracefully.
     `models` is [primary, fallback]; the response's `model` field records which one
-    actually answered, kept as `model_used` for fallback provenance."""
+    actually answered, kept as `model_used` for fallback provenance.
+
+    `cache_prefix` is the leading span of `prompt` that is identical on every fire.
+    It is used ONLY for explicit-breakpoint providers; everyone else keeps the plain
+    string. Defaulting it to "" keeps every existing caller byte-identical on the
+    wire."""
     t0 = time.monotonic()
 
     def fail(msg: str) -> dict:
@@ -2212,9 +2287,11 @@ def _openrouter_call_blocking(role: str, models: list[str], prompt: str) -> dict
     if not api_key:
         return fail(f"{OPENROUTER_KEY_ENV} not set in environment")
 
+    content = (_message_content(prompt, cache_prefix)
+               if _needs_explicit_cache_control(models) else prompt)
     body = json.dumps({
         "models": models,          # [primary, fallback] -> automatic model failover
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": content}],
         "stream": False,
         "reasoning": {"effort": openrouter_effort()},
     }).encode("utf-8")
@@ -2275,7 +2352,15 @@ async def run_openrouter(role: str, models: list[str], pitch: str,
                           user_directives_block, round1_block,
                           assistant_block, standing_rules_block,
                           council_conclusion_block)
-    return await asyncio.to_thread(_openrouter_call_blocking, role, models, prompt)
+    # build_prompt puts system_prompt first and joins sections with a separator, so
+    # system_prompt is a genuine LEADING span of `prompt`. It is not the only stable
+    # content -- the standing-rules block is stable across fires too -- but it is the
+    # only stable span that is CONTIGUOUS FROM BYTE 0, and a prefix breakpoint can mark
+    # nothing else. The standing rules sit behind the evidence and directives blocks,
+    # which change every fire. _message_content re-checks the startswith itself and
+    # falls back to the plain string if it ever stops holding.
+    return await asyncio.to_thread(_openrouter_call_blocking, role, models, prompt,
+                                   system_prompt)
 
 
 # --- Member registry: the declarative single source of truth for the roster ---
