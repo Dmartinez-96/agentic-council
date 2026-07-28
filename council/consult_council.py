@@ -448,6 +448,45 @@ the corpus from a real one.
 --- end of your previous response ---
 """
 
+# STAGE 2 of the ladder. Stage 1 asks a member to RESTATE a position it already
+# took; a member that never took one correctly answers NONE and the vote dies. That
+# is the largest remaining cause of lost votes -- measured over the corpus, the
+# no-position bucket is dominated by members spending their FINAL response on
+# REQUEST_ lines that can never be honoured, plus a smaller class of "I need to
+# verify two things before finalizing" where no further round exists to verify in.
+# So stage 2 does what stage 1 explicitly must not: it invites a decision.
+#
+# THE MANUFACTURING RISK IS REAL AND IS WHY THE RELEASE VALVE IS FIRST-CLASS. Asking
+# a member to judge without evidence it said it wanted can produce a vote it does not
+# hold -- the same family as the defect that turned refusals into WARNs. So NONE is
+# offered as an equal, named outcome rather than a failure, and every verdict this
+# stage produces is stamped so the corpus can be analysed with them excluded.
+VERDICT_COMMIT_PROMPT = """Your previous response to a council review did not
+reach a verdict, and a follow-up asking you to restate one confirmed that.
+
+THIS IS YOUR LAST TURN ON THIS REVIEW. There is no further round, and no
+additional files, command output or evidence are coming. If you asked for any,
+that request cannot be honoured now -- requests are only served from a member's
+FIRST response.
+
+So decide on what you already have. Emit exactly one line, alone:
+VERDICT: PASS
+VERDICT: WARN
+VERDICT: BLOCK
+
+If you genuinely cannot reach a position on the evidence in front of you, that is
+a legitimate answer and NOT a failure. Emit exactly:
+VERDICT: NONE
+
+Do not pick a verdict you do not hold in order to produce one. A manufactured
+verdict is worse than a recorded abstention, because the corpus cannot tell it
+apart from a real judgement. NONE is recorded honestly as its own outcome.
+
+--- your previous response ---
+{text}
+--- end of your previous response ---
+"""
+
 
 async def reformat_unparseable(results: list[dict], cwd: Path) -> list[dict]:
     """One formatting-only retry for any member whose verdict did not parse.
@@ -499,46 +538,123 @@ async def reformat_unparseable(results: list[dict], cwd: Path) -> list[dict]:
             return None
         return await run_member(rec, prompt, VERDICT_REFORMAT_SYSTEM, cwd)
 
+    def _classify(text: str) -> tuple[str, str | None]:
+        """('OK', verdict) | ('NONE', None) | ('AMBIGUOUS', None) | ('UNPARSEABLE', None).
+
+        "I never reached a position" is its OWN outcome and must not be laundered
+        into a substantive verdict. The stage-1 prompt used to instruct WARN there,
+        and a refusal then entered the corpus indistinguishable from a real concern
+        -- observed live twice on 2026-07-27, deepseek returning a refusal in Chinese
+        and the retry recording WARN.
+        AMBIGUITY is detected with VERDICT_RE rather than parse_verdict's success,
+        because a leading "VERDICT: NONE" makes parse_verdict return UNPARSEABLE even
+        when a real verdict follows, which would mislabel "NONE then PASS" as a clean
+        no-position.
+        """
+        v = parse_verdict(text)
+        said_none = bool(NO_POSITION_RE.search(text))
+        if said_none and VERDICT_RE.search(text):
+            return "AMBIGUOUS", None
+        if said_none:
+            return "NONE", None
+        if v == "UNPARSEABLE":
+            return "UNPARSEABLE", None
+        return "OK", v
+
     async def retry(r: dict) -> None:
+        """The escalation ladder. Each stage handles a cause the one before cannot.
+
+        There is deliberately NO CLASSIFIER deciding which cause applies: no length
+        threshold, no keyword refusal detector. An earlier design tried to separate
+        "canned refusal" from "reasoned no-position" and the corpus killed it -- a
+        13-character refusal and a 147-character deliberation are both non-answers
+        while an 802-character one is too, so any threshold was fitted to the sample.
+        Escalating uniformly needs no such judgement and has no false-positive surface.
+        """
         name = r.get("role", "")
-        prompt = VERDICT_REFORMAT_PROMPT.format(text=(r.get("text") or "")[:8000])
+        original = (r.get("text") or "")[:8000]
+
+        # STAGE 1 -- formatting repair. Recovers a member that VOTED but wrote the
+        # line wrong. Cannot help one that never reached a position, by design: it
+        # says "restate the position you already took".
         try:
-            out = await _dispatch(name, prompt)
+            out = await _dispatch(name, VERDICT_REFORMAT_PROMPT.format(text=original))
         except Exception as e:  # noqa: BLE001
             r["reformat_error"] = str(e)
             return
         if out is None:          # no runner and no registry record: nothing to ask
             return
-        text = out.get("text") or ""
-        # "I never reached a position" is its OWN outcome and must not be
-        # laundered into a substantive verdict. The prompt used to instruct
-        # WARN here; a refusal then entered the corpus indistinguishable from a
-        # real concern. Observed live on 2026-07-27, twice: deepseek returned a
-        # refusal in Chinese and the retry recorded WARN. The FINAL VERDICT is
-        # unaffected either way -- a lost vote already forces WARN downstream --
-        # so this changes the RECORD, not the outcome, which is the point.
-        v = parse_verdict(text)
-        said_none = bool(NO_POSITION_RE.search(text))
-        # Detect a stated verdict with VERDICT_RE, not with parse_verdict's
-        # success: "VERDICT: NONE" on the first line makes parse_verdict return
-        # UNPARSEABLE even when a real verdict follows, which would mislabel
-        # "NONE then PASS" as a clean no-position.
-        if said_none and VERDICT_RE.search(text):
-            # Emitted BOTH a verdict and NONE. That is self-contradictory, and
-            # the ambiguity is not ours to resolve -- same principle as
-            # parse_verdict refusing conflicting verdict lines. Conservative:
-            # lose the vote rather than pick one of the two things it said.
+        kind, v = _classify(out.get("text") or "")
+        if kind == "AMBIGUOUS":
+            # Emitted BOTH a verdict and NONE. Self-contradictory, and the ambiguity
+            # is not ours to resolve -- the same principle as parse_verdict refusing
+            # conflicting verdict lines. Lose the vote rather than pick one.
             r["reformat_failed"] = True
             r["reformat_ambiguous"] = True
             return
-        if said_none:
-            r["reformat_no_position"] = True
+        if kind == "OK":
+            r["verdict"] = v
+            r["reformatted"] = True
+            r["verdict_stage"] = 1
             return
-        if v == "UNPARSEABLE":
+        if kind == "UNPARSEABLE":
             r["reformat_failed"] = True
             return
-        r["verdict"] = v
-        r["reformatted"] = True
+
+        # kind == "NONE": the member confirms it never reached a position. Record
+        # that before escalating -- the abstention is preserved whatever follows.
+        r["reformat_no_position"] = True
+
+        # STAGE 2 -- invite a decision on what it already has. See the prompt above
+        # for why NONE is offered as an equal outcome rather than a failure.
+        try:
+            out2 = await _dispatch(name, VERDICT_COMMIT_PROMPT.format(text=original))
+        except Exception as e:  # noqa: BLE001
+            r["commit_error"] = str(e)
+            return
+        if out2 is not None:
+            kind2, v2 = _classify(out2.get("text") or "")
+            if kind2 == "OK":
+                r["verdict"] = v2
+                r["reformatted"] = True
+                r["verdict_stage"] = 2
+                return
+            if kind2 == "NONE":
+                # An INFORMED ABSTENTION: asked directly, with the finality spelled
+                # out, it still declines. That is a real answer and is kept in the
+                # record even though the ladder continues.
+                r["commit_declined"] = True
+
+        # STAGE 3 -- the seat's PRIMARY will not answer. Ask its fallback model.
+        # This exists because OpenRouter's own [primary, fallback] failover cannot
+        # see this case: measured, all 48 deepseek refusals in the corpus were
+        # answered by the PRIMARY slug, so a 200-with-content refusal never triggers
+        # it and the fallback is never tried.
+        rec = member_by_name(name)
+        fb = getattr(rec, "fallback_model", None) if rec is not None else None
+        if not fb:
+            # codex and muse have none. Skipped explicitly and recorded with the
+            # reason, never silently, and never by substituting another seat's model.
+            r["fallback_unavailable"] = True
+            return
+        try:
+            out3 = await run_openrouter(
+                name, [fb], VERDICT_COMMIT_PROMPT.format(text=original),
+                VERDICT_REFORMAT_SYSTEM)
+        except Exception as e:  # noqa: BLE001
+            r["fallback_error"] = str(e)
+            return
+        kind3, v3 = _classify(out3.get("text") or "")
+        if kind3 == "OK":
+            r["verdict"] = v3
+            r["reformatted"] = True
+            r["verdict_stage"] = 3
+            # A DIFFERENT MODEL PRODUCED THIS. Stamped so no later reader mistakes a
+            # fallback vote for the seat's primary judgement -- with commit_declined
+            # alongside it when the primary explicitly abstained first.
+            r["verdict_model"] = out3.get("model_used") or fb
+        else:
+            r["fallback_no_position"] = True
 
     targets = [r for r in results if r.get("verdict") == "UNPARSEABLE"]
     if targets:
@@ -3749,6 +3865,48 @@ async def run_member(member: Member, pitch: str, system_prompt: str, cwd: Path,
     base_prompt = system_prompt
     system_prompt = base_prompt + "\n\n" + capability_block(member)
     t = member.transport
+
+    async def _dispatch_once() -> dict:
+        return await _run_member_transport(
+            member, base_prompt, system_prompt, t, pitch, cwd, evidence_block,
+            user_directives_block, round1_block, assistant_block,
+            standing_rules_block, council_conclusion_block)
+
+    result = await _dispatch_once()
+    # ONE RETRY ON A NO-USABLE-RESPONSE. Measured across the corpus: 50 records
+    # carried verdict ERROR with EMPTY text -- 38 stderr-stripped shadow records, 8
+    # "empty content in response", 4 "non-JSON response", and zero HTTPErrors or
+    # timeouts. One inspected instance returned whitespace after 716 seconds. No HTTP
+    # transport had any retry at all, and the formatting repair below cannot help:
+    # it needs prior text to re-read and there is none.
+    # The trigger is deliberately NARROW -- ERROR *and* nothing came back. A refusal
+    # or a 4xx carries text or a diagnostic and will not improve on a second call, so
+    # those are left to the escalation ladder rather than retried blindly here.
+    # SAFE TO REPEAT, checked rather than assumed: the member itself cannot write
+    # (codex runs under --sandbox read-only; the HTTP paths have no filesystem-writing
+    # calls even transitively), and the two harness-side writes on the codex path are
+    # both retry-safe -- _ensure_nogit_stub is idempotent by construction, and
+    # _run_subprocess unlinks only its own per-call /tmp/council_codex_<uuid>.txt.
+    if result.get("verdict") == "ERROR" and not (result.get("text") or "").strip():
+        first_err = (result.get("stderr") or "").strip()[:200]
+        retried = await _dispatch_once()
+        retried["empty_response_retry"] = True
+        # Keep WHY the first attempt failed even when the retry succeeds, so a member
+        # that only ever answers on the second call stays visible as unhealthy rather
+        # than looking clean in the record.
+        retried["first_attempt_error"] = first_err or "(no diagnostic recorded)"
+        return retried
+    return result
+
+
+async def _run_member_transport(member: "Member", base_prompt: str,
+                                system_prompt: str, t: str, pitch: str, cwd: Path,
+                                evidence_block: str, user_directives_block: str,
+                                round1_block: str, assistant_block: str,
+                                standing_rules_block: str,
+                                council_conclusion_block: str) -> dict:
+    """The transport switch, split out of run_member so a retry can re-enter it
+    without re-running prompt assembly or recursing through the retry check."""
     if t == "codex_subprocess":
         result = await run_codex(pitch, system_prompt, cwd, evidence_block,
                                  user_directives_block, round1_block,
@@ -4028,6 +4186,51 @@ def determine_final_verdict(active_results: list[dict]) -> str:
     return "WARN"
 
 
+# stderr in the logs was previously DROPPED from the round1 and shadow legs "for
+# size", which made inspector-leg failures undiagnosable -- measured over
+# logs/2026-07-2*: 38 ERROR records carried no diagnostic at all, and every one of
+# them sat under the shadow key. It is bounded instead, on all three legs.
+# THE CAP IS CHOSEN FROM THE DISTRIBUTION rather than picked. Measured over 1,662
+# records in the `members` leg: raw mean ~195 KB, total ~324 MB. Candidate caps and
+# the resulting volume for that field, from _nogit/stderr_bounding_evidence.py:
+#     400 -> 0.20%   1,000 -> 0.51%   2,000 -> 1.02%   4,000 -> 2.04%   8,000 -> 4.09%
+# 2,000 keeps ~1% of the volume. NOTE what that does NOT mean: at this cap 399 of 400
+# sampled records still trim, because the corpus is dominated by very large codex
+# subprocess logs. The short ERROR strings this fix exists to preserve are a few
+# hundred characters and pass through whole, but their size distribution was never
+# measured as a class -- do not read "ERROR records are untouched" as established.
+STDERR_LOG_CAP = 2_000
+_STDERR_MARKER = "\n...[trimmed]...\n"
+# Key-shaped strings only. The obvious `sk-[A-Za-z0-9_-]{8,}` was measured firing on
+# 99.3% of real records because "task-notification" ends in "sk-"; \b plus a 16-char
+# floor drops that to ~2.8%, and the only remaining matches are test sentinels. No
+# live key value was found in any `members` stderr across logs/2026-07-2* -- that is
+# a scan of one field over one date range, NOT a claim that nothing has ever leaked
+# anywhere. This is defence in depth, and a battery against synthetic controls rather
+# than a proof.
+_SECRET_RE = re.compile(r"(Bearer\s+[A-Za-z0-9._\-]{12,}|\bsk-[A-Za-z0-9_\-]{16,})")
+
+
+def _bound_stderr(s: str | None, cap: int = STDERR_LOG_CAP) -> str:
+    """Redact key-shaped strings, squeeze whitespace runs, then HEAD+marker+TAIL.
+
+    Never a bare tail: measured, the largest record's diagnostic sits at character 0,
+    so keeping only the end returns trailing chatter and loses the error itself.
+    """
+    s = _SECRET_RE.sub("<redacted>", s or "")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"(\n\s*){2,}", "\n", s).strip()
+    if len(s) <= cap:
+        return s
+    if cap <= len(_STDERR_MARKER):
+        return s[:cap]
+    keep_tail = max(0, min(cap // 8, cap - len(_STDERR_MARKER) - 1))
+    head = cap - keep_tail - len(_STDERR_MARKER)
+    if head <= 0:
+        return s[:cap]
+    return s[:head] + _STDERR_MARKER + (s[-keep_tail:] if keep_tail else "")
+
+
 def write_log(layer: str, tool_name: str | None, target_path: str | None,
               pitch: str, all_results: list[dict], final_verdict: str,
               session_id: str = "",
@@ -4060,7 +4263,11 @@ def write_log(layer: str, tool_name: str | None, target_path: str | None,
         "tool_name": tool_name,
         "target_path": target_path,
         "pitch": pitch_logged,
-        "members": all_results,
+        # BOUNDED like the other two legs. This field holds the bulk -- ~324 MB across
+        # 1,662 records -- and leaving it unbounded would have fixed the diagnosability
+        # of the inspector leg while leaving the log weight entirely untouched.
+        "members": [{**r, "stderr": _bound_stderr(r.get("stderr"))}
+                    for r in (all_results or [])],
         "final_verdict": final_verdict,
 
         # DEPTH PROVENANCE. Before these two fields existed, the entry recorded
@@ -4164,22 +4371,23 @@ def write_log(layer: str, tool_name: str | None, target_path: str | None,
         # shared signal AND with anchoring, and the logs could not tell them apart
         # because round 1 was computed, used, and thrown away on every fire.
         #
-        # It is kept WITHOUT stderr, which is the bulky part and is already captured
-        # for round 2. Absent key means the fire predates this, i.e. UNKNOWN -- same
-        # rule as fast_mode, for the same reason. Empty list is different: it means
-        # the round genuinely did not run (fewer than two members, see main()).
+        # stderr is BOUNDED here rather than dropped. Absent key means the fire
+        # predates this, i.e. UNKNOWN -- same rule as fast_mode, for the same reason.
+        # Empty list is different: it means the round genuinely did not run (fewer
+        # than two members, see main()).
         "round1": [
-            {k: v for k, v in r.items() if k != "stderr"}
+            {**r, "stderr": _bound_stderr(r.get("stderr"))}
             for r in (round1_results or [])
         ],
 
         # LAYER-2 SHADOW members' results (kimi/glm/grok via OpenRouter), kept in
         # their OWN field and NEVER merged into `members`. That separation is the
         # point: anything that reads `members` to compute the council's verdict or
-        # outcome stats cannot count a non-voting shadow as a real vote. stderr
-        # dropped for size, as with round1.
+        # outcome stats cannot count a non-voting shadow as a real vote. stderr is
+        # BOUNDED, as with round1 -- dropping it entirely is what made every
+        # inspector-leg failure undiagnosable.
         "shadow": [
-            {k: v for k, v in r.items() if k != "stderr"}
+            {**r, "stderr": _bound_stderr(r.get("stderr"))}
             for r in (shadow_results or [])
         ],
     }
