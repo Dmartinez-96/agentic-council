@@ -181,6 +181,8 @@ If you are satisfied the proposal clears every quality-bar item, emit `VERDICT: 
 
 Your VERDICT line must be the FIRST line of your response, and it must carry the bare token alone: `VERDICT: PASS`, `VERDICT: WARN`, or `VERDICT: BLOCK`. No trailing words, no parentheses, no qualifiers, no "with caveats" on that line. Put every qualification in REASONS or NOTES. A verdict line the parser cannot read is discarded, and your vote silently degrades the council's consensus instead of counting.
 
+FIRST means FIRST, literally: nothing above it. Not a preamble ("Looking at this carefully...", "I'll work through the transcript first"), and not a code fence wrapping your reply; a leading ``` line puts your verdict on line two and it will not be read. Think in whatever order you like, but write the verdict line first. Measured on this bench, a verdict that is present but not on the first line is the LARGEST source of discarded positions on the inspector tier, and it happens on the voting tier too. It is entirely avoidable.
+
 Never reproduce another member's `VERDICT:` line verbatim anywhere in your response. Refer to their position in prose instead ("codex voted BLOCK", "gemini passed it"). A quoted verdict line can be misparsed as your own and swap your vote for theirs.
 
 ## What you are not

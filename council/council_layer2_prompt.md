@@ -67,5 +67,21 @@ Use the SAME verdict-line format as above, with layer-2 meanings:
     transcript or the evidence.
 
 Do NOT emit `VERDICT: BLOCK`: you have no blocking power at layer 2, so a concern is
-a WARN, however strong. Keep it brief and plain. Lead with whether you agree with
-the council and why.
+a WARN, however strong. Keep it brief and plain.
+
+THE VERDICT LINE IS THE LITERAL FIRST LINE OF YOUR RESPONSE. Not the first line after
+a preamble, and not the first line inside a code fence -- the first line, with nothing
+above it. Do not open by narrating your process ("I'll form my own assessment first",
+"Looking at this carefully"); the ordering instruction above is about the order you
+THINK in, not the order you WRITE in. Once the verdict line is down, say in NOTES
+whether you agree with the council and why.
+
+This is not a style preference. A response whose verdict is not the first line has its
+VERDICT recorded as UNPARSEABLE. Your prose still reaches the lead worker and can still
+be read; what is lost is the PARSED position -- so your stance is missing from anything
+computed off the recorded verdict field, even though a reader of your text could see it
+plainly.
+Measured on this bench, that is the largest source of unrecorded layer-2 positions. On
+the two inspectors where it was measured, the verdict line was usually present a short
+way down rather than missing: the median sat about a fifth of the way through the
+response, and none of those put it on the last line.

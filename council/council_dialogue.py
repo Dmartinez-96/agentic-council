@@ -885,7 +885,16 @@ def cmd_escalate(args) -> int:
     if not proposal.strip():
         print(f"ERROR: log has no pitch to escalate: {log_path}", file=sys.stderr)
         return 2
-    log_members = log.get("members", [])
+    # BOTH LEGS. A one-shot log stores the voting members under "members" and the
+    # layer-2 inspectors under "shadow". This used to read "members" ONLY, which
+    # silently dropped every inspector critique on escalation -- measured on a real
+    # fire whose shadow leg held six records (five parsed verdicts plus one
+    # UNPARSEABLE), among them the only dissent in that fire, a lone PASS against
+    # WARNs. The thread then rendered the absence as ERROR, which reads as six models
+    # failing when nothing had failed. Seeding them does NOT make them voters:
+    # `voting` below is derived from each member's REGISTRY TIER, never from the
+    # seeded set.
+    log_members = list(log.get("members", [])) + list(log.get("shadow", []))
     logged_roles: list[str] = []
     for m in log_members:
         r = m.get("role")
@@ -895,10 +904,13 @@ def cmd_escalate(args) -> int:
         print(f"ERROR: log has no members: {log_path}", file=sys.stderr)
         return 2
 
-    # Convene the full current bench (the user 2026-07-21: dialogues default to
-    # the entire bench). Logged members that are still on the bench are seeded
-    # into round 1 below; bench members absent from the one-shot log (e.g. the
-    # inspectors) start pending and join as they answer in later rounds.
+    # Convene the full current bench (dialogues default to the entire bench).
+    # Logged members that are still on the bench are seeded into round 1 below; any
+    # bench member genuinely absent from the log starts pending and joins as it
+    # answers in a later round. An earlier version of this comment named the
+    # INSPECTORS as that absent case, which was false -- they were in the log all
+    # along, under "shadow". They were dropped by the log-reading line back when it
+    # fetched only "members"; that line now fetches both keys, so they are seeded.
     bench_members, _ = build_bench_roster()
     members = list(bench_members)
     # A logged member NOT on the current bench is not enrolled as a live

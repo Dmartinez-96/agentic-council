@@ -477,15 +477,37 @@ async def reformat_unparseable(results: list[dict], cwd: Path) -> list[dict]:
 
     Mutates and returns `results`.
     """
+    async def _dispatch(name: str, prompt: str):
+        """Run the formatting retry for ANY seat, voting or inspecting.
+
+        MEMBER_RUNNERS holds closures for the VOTING bench only, so the original
+        `MEMBER_RUNNERS.get(...) or return` meant every inspector fell out of this
+        function silently -- the retry did not fail for them, it never ran. Measured
+        before this changed: across the 6+6 corpus the reformat flags appear on the
+        voting leg 142/46/2 and on the inspector leg ZERO times, because inspectors
+        were never passed in AND had no runner if they had been.
+        The registry fallback dispatches through run_member, which is what the
+        inspector leg itself uses. Every context block on run_member defaults to "",
+        so this preserves the context-restriction described above exactly: no
+        proposal, no diff, no evidence, no peer verdicts are re-supplied.
+        """
+        runner = MEMBER_RUNNERS.get(name)
+        if runner is not None:
+            return await runner(prompt, VERDICT_REFORMAT_SYSTEM, cwd)
+        rec = member_by_name(name)
+        if rec is None:
+            return None
+        return await run_member(rec, prompt, VERDICT_REFORMAT_SYSTEM, cwd)
+
     async def retry(r: dict) -> None:
-        runner = MEMBER_RUNNERS.get(r.get("role", ""))
-        if runner is None:
-            return
+        name = r.get("role", "")
         prompt = VERDICT_REFORMAT_PROMPT.format(text=(r.get("text") or "")[:8000])
         try:
-            out = await runner(prompt, VERDICT_REFORMAT_SYSTEM, cwd)
+            out = await _dispatch(name, prompt)
         except Exception as e:  # noqa: BLE001
             r["reformat_error"] = str(e)
+            return
+        if out is None:          # no runner and no registry record: nothing to ask
             return
         text = out.get("text") or ""
         # "I never reached a position" is its OWN outcome and must not be
@@ -4640,6 +4662,23 @@ async def main() -> int:
             shadow_results = [final.get(r.get("role"), r) for r in pass1]
         else:
             shadow_results = pass1
+        # THE SAME FORMATTING RETRY THE VOTING LEG GETS. Without this an inspector
+        # that stated a position but wrote the line wrong lost its assessment
+        # outright, while a voting member in the identical situation was asked again
+        # and recovered. Measured across the 6+6 corpus before this landed: mimo 72
+        # and minimax 41 UNPARSEABLE, the large majority carrying a verdict token that
+        # simply was not the first line -- typically a short preamble ahead of it --
+        # and ZERO reformat flags ever recorded on the inspector leg against 190 on
+        # the voting leg.
+        # PLACEMENT: after pass-2 delivery is complete, so it cannot disturb the
+        # request/delivery budget (collect_* run once, over pass1, and are not
+        # re-entered), and before the member_cwd teardown below, which the retry needs.
+        # An inspector does not vote, so a recovered verdict changes no outcome; what
+        # it changes is that the assessment is RECORDED rather than discarded. That
+        # matters for any measurement OF THE INSPECTOR TIER -- its flag rates, its
+        # agreement with the voting leg, its apparent reliability -- and not for the
+        # voting-leg figures quoted above, which were produced without this path.
+        shadow_results = await reformat_unparseable(list(shadow_results), member_cwd)
     # member_cwd is the layer-1 subprocess workdir; it is cleaned up here, AFTER
     # both layers have run, so a non-HTTP inspector (were one configured on a
     # subprocess transport) could still use it.
