@@ -294,6 +294,11 @@ def effort_for(member: str) -> str:
 
 VERDICT_RE = re.compile(r"^VERDICT:\s*(PASS|WARN|BLOCK)\s*$", re.MULTILINE)
 
+# "I never reached a position" is NOT one of the three verdicts, and must never be
+# recorded as one. Deliberately OUTSIDE VERDICT_RE so parse_verdict still treats it
+# as a lost vote; only the formatting retry reads it, to label WHY the vote was lost.
+NO_POSITION_RE = re.compile(r"^VERDICT:\s*NONE\s*$", re.MULTILINE)
+
 PER_CRITIC_TIMEOUT_S = 600
 PITCH_LOG_MAX_BYTES = 200_000
 
@@ -428,8 +433,15 @@ Below is your own previous response. Do NOT re-evaluate the proposal. Do NOT
 change your position. Do NOT add reasoning. Read the position you already took
 and emit ONLY the single verdict line that expresses it. Output nothing else.
 
-If your previous response genuinely never reached a position, emit
-VERDICT: WARN.
+If your previous response genuinely never reached a position -- you refused, you
+answered about something else, or you never evaluated the proposal at all -- then
+do NOT pick one of the three. Emit exactly:
+VERDICT: NONE
+
+That records the vote as LOST, which is what actually happened. It is handled
+conservatively and cannot buy a PASS. Do not emit WARN to mean "no position":
+a WARN is a substantive concern, and a manufactured one is indistinguishable in
+the corpus from a real one.
 
 --- your previous response ---
 {text}
@@ -475,7 +487,31 @@ async def reformat_unparseable(results: list[dict], cwd: Path) -> list[dict]:
         except Exception as e:  # noqa: BLE001
             r["reformat_error"] = str(e)
             return
-        v = parse_verdict(out.get("text") or "")
+        text = out.get("text") or ""
+        # "I never reached a position" is its OWN outcome and must not be
+        # laundered into a substantive verdict. The prompt used to instruct
+        # WARN here; a refusal then entered the corpus indistinguishable from a
+        # real concern. Observed live on 2026-07-27, twice: deepseek returned a
+        # refusal in Chinese and the retry recorded WARN. The FINAL VERDICT is
+        # unaffected either way -- a lost vote already forces WARN downstream --
+        # so this changes the RECORD, not the outcome, which is the point.
+        v = parse_verdict(text)
+        said_none = bool(NO_POSITION_RE.search(text))
+        # Detect a stated verdict with VERDICT_RE, not with parse_verdict's
+        # success: "VERDICT: NONE" on the first line makes parse_verdict return
+        # UNPARSEABLE even when a real verdict follows, which would mislabel
+        # "NONE then PASS" as a clean no-position.
+        if said_none and VERDICT_RE.search(text):
+            # Emitted BOTH a verdict and NONE. That is self-contradictory, and
+            # the ambiguity is not ours to resolve -- same principle as
+            # parse_verdict refusing conflicting verdict lines. Conservative:
+            # lose the vote rather than pick one of the two things it said.
+            r["reformat_failed"] = True
+            r["reformat_ambiguous"] = True
+            return
+        if said_none:
+            r["reformat_no_position"] = True
+            return
         if v == "UNPARSEABLE":
             r["reformat_failed"] = True
             return
@@ -2593,6 +2629,206 @@ def read_repo_file(workdir: Path, rel_path: str) -> tuple[str | None, str]:
     return text, note
 
 
+# --- The brain retrieval gate --------------------------------------------------
+#
+# A member may request any repo file, and a BRAIN VAULT NOTE is just a file. Until
+# this existed, a note arrived with its claim and NO indication of whether that claim
+# had ever been checked -- and the attestation ledger that holds the status is a
+# dotfile, so `read_repo_file`'s dotfile rule denies it. A member therefore could not
+# find out even if it tried. Proven end to end before this was written: a TESTIMONY
+# note, which the schema says is NEVER citable as ground truth, was delivered in full
+# with nothing marking it as such.
+# That is the laundering surface: an unverified claim of mine returns to me as an
+# established fact through six reviewers. Design ruled by round-table thread
+# 20260727T172058Z-7ca480.
+#
+# WITHHOLDING IS NARROW AND DELIBERATE. The gloss is withheld only when a note's own
+# claim is REFUTED, REPLACED or INVALID, because prose written in support of a dead
+# claim is what launders. An UNVERIFIED or UNCONFIRMED claim is unconfirmed, not
+# refuted, and its gloss carries the methodology -- which is exactly what lets a
+# reviewer tell us a check is VOID. Denying that would cost more than it buys.
+
+BRAIN_VAULT_ENV = "COUNCIL_BRAIN_VAULT"
+BRAIN_VAULT_DEFAULT = "_brain"
+
+# Frontmatter sniff. Engine-local and dependency-free ON PURPOSE: the gate must be
+# able to tell a note from a non-note even when validate_brain is NOT importable,
+# which is precisely the case it has to fail closed on. A detector that needed the
+# module could not run in the case it exists to handle.
+# Deliberately PERMISSIVE (optional quotes, optional \r) so it accepts at least
+# everything parse_note accepts: a false positive costs one stray banner, while a
+# false negative serves a real note NAKED. Measured against parse_note over 23
+# fixtures including quoted values and CRLF -- zero false negatives. The \r tolerance
+# is load-bearing rather than cosmetic: parse_note reads via Path.read_text (universal
+# newlines, so it never sees \r) while read_repo_file decodes raw bytes and does, so
+# the two genuinely see different text for the same CRLF file.
+_BRAIN_FM_OPEN = re.compile(r"^---[ \t]*\r?\n")
+_BRAIN_FM_CLOSE = re.compile(r"\n---[ \t]*\r?\n")
+_BRAIN_TYPE_RE = re.compile(
+    r"^type:[ \t]*['\"]?(checkable|testimony)['\"]?[ \t]*\r?$", re.MULTILINE)
+
+
+def looks_like_brain_note(text: str) -> str | None:
+    """Return 'checkable', 'testimony', or None -- read from FRONTMATTER only.
+
+    Scanning the whole document would mislabel any markdown file that quotes a note,
+    attaching a status computed against a ledger that does not describe it.
+    """
+    if not _BRAIN_FM_OPEN.match(text or ""):
+        return None
+    close = _BRAIN_FM_CLOSE.search(text, 3)
+    if not close:
+        return None
+    m = _BRAIN_TYPE_RE.search(text[:close.start()])
+    return m.group(1) if m else None
+
+
+def _brain_module():
+    """Import validate_brain lazily, or return None.
+
+    Lazy and inside a function, mirroring validate_brain's own `_engine()`, so the two
+    modules never import each other at load time. Reusing its parser and hash rather
+    than reimplementing them is deliberate: a divergent parser would fail to RECOGNISE
+    a note and serve it naked, which is the dangerous direction.
+    """
+    here = Path(__file__).resolve().parent
+    for cand in (here.parent / "brain",                        # package layout
+                 here.parent / "agentic-council" / "brain"):   # live tree
+        if (cand / "validate_brain.py").is_file():
+            if str(cand) not in sys.path:
+                sys.path.insert(0, str(cand))
+            try:
+                import validate_brain  # noqa: PLC0415
+                return validate_brain
+            except Exception:  # noqa: BLE001 -- a broken brain must not break a fire
+                return None
+    return None
+
+
+def _brain_spec_lines(f: dict) -> str:
+    keys = ("check_kind", "check_path", "check_url", "check_argv", "expect",
+            "exit_status", "falsifier")
+    return "\n".join(f"  {k}: {f[k]}" for k in keys if f.get(k))
+
+
+def brain_note_banner(disp: str, content: str,
+                      workdir: Path) -> tuple[str | None, str | None, str | None]:
+    """Return (status, banner, body).
+
+    status None means 'not a brain note, deliver as-is'; body None means WITHHOLD the
+    authored gloss. The STATUS TOKEN IS RETURNED EXPLICITLY rather than recovered by
+    the caller from the banner text -- an earlier version had the call site split the
+    prose on "STATUS: " and " --", which stored sentence fragments in the log for the
+    two banners that do not follow that shape.
+
+    The banner is in HARNESS voice and sits OUTSIDE the fence, so it is not part of
+    the untrusted document it describes.
+    """
+    if looks_like_brain_note(content) is None:
+        return None, None, content
+
+    vb = _brain_module()
+    if vb is None:
+        return ("GATE_UNAVAILABLE",
+                "HARNESS: BRAIN GATE UNAVAILABLE. This file declares itself a vault "
+                "note, but the validator module could not be imported, so its "
+                "verification status cannot be established. The content is withheld "
+                "rather than served without a status.", None)
+
+    # Parse through the REAL parser so the gate and the validator cannot disagree
+    # about what this note says. parse_note takes a path, hence the temp file.
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                     encoding="utf-8", newline="") as fh:
+        fh.write(content)
+        tmp = Path(fh.name)
+    try:
+        fields, _body, errs = vb.parse_note(tmp)
+        if not errs:
+            errs = vb.validate_fields(fields)
+    except Exception:  # noqa: BLE001 -- fail CLOSED, never serve on a parse crash
+        return ("UNREADABLE",
+                f"HARNESS NOTE ON {disp} -- BRAIN VAULT ENTRY.\nSTATUS: UNREADABLE -- "
+                f"the validator could not parse it. Content withheld.", None)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+    head = f"HARNESS NOTE ON {disp} -- THIS IS A BRAIN VAULT ENTRY."
+    if errs:
+        return ("INVALID",
+                f"{head}\nSTATUS: INVALID -- it does not satisfy the vault schema "
+                f"({errs[0]}). It is not a valid record, so its content is "
+                f"withheld.", None)
+
+    if fields.get("type") == "testimony":
+        return ("TESTIMONY",
+                f"{head}\nSTATUS: TESTIMONY -- attributed to "
+                f"{fields.get('attributed_to', '?')} on {fields.get('date', '?')}. "
+                f"TESTIMONY IS NEVER CITABLE AS GROUND TRUTH: it records that someone "
+                f"said this, not that it is true. Do not cite the text below as an "
+                f"established fact.", content)
+
+    # Re-read from FRONTMATTER, not from the ledger: spec_hash covers neither `type`
+    # nor `superseded_by`, so a superseded note's attestation keeps matching and would
+    # otherwise read as current. Measured.
+    if fields.get("superseded_by"):
+        return ("SUPERSEDED",
+                f"{head}\nSTATUS: SUPERSEDED by '{fields['superseded_by']}'. This "
+                f"note's claim has been REPLACED, so its prose is withheld; request "
+                f"the superseding note instead.", None)
+
+    vault = Path(os.environ.get(BRAIN_VAULT_ENV)
+                 or (Path(workdir) / BRAIN_VAULT_DEFAULT))
+    try:
+        ledger = json.loads((vault / ".attestations.json").read_text())
+    except (OSError, ValueError):
+        ledger = {}
+    entry = ledger.get(fields.get("id")) or {}
+    try:
+        claim = vb.rendered_claim(fields)
+    except Exception:  # noqa: BLE001
+        claim = "(could not be rendered)"
+
+    spec_ok = bool(entry) and entry.get("spec_sha256") == vb.spec_hash(fields)
+    # An entry written before last_status existed attests only "passed at SOME point",
+    # never "passed on its last run". It must therefore default to NOT_RUN, not PASS:
+    # defaulting the other way would make every pre-existing vault immune to this gate
+    # on the day it ships, which is the exact stale-badge failure it exists to stop.
+    last_status = entry.get("last_status", "NOT_RUN") if spec_ok else None
+
+    tail = (f"\nCLAIM (generated FROM the check, never authored): {claim}\n"
+            f"The prose below is the note's GLOSS -- commentary and methodology, NOT "
+            f"the fact.")
+
+    if spec_ok and last_status == "PASS":
+        when = entry.get("last_run") or entry.get("last_pass", "?")
+        return ("CHECKED",
+                f"{head}\nSTATUS: CHECKED -- the check PASSED on its last run "
+                f"({when}).{tail}", content)
+    if spec_ok and last_status == "NEEDS_ADJUDICATION":
+        return ("FAILING",
+                f"{head}\nSTATUS: FAILING -- the check did NOT pass on its most recent "
+                f"run ({entry.get('last_run', '?')}); it last passed "
+                f"{entry.get('last_pass', '?')}. A failing check is NOT a false fact -- "
+                f"the world may have changed or the check may have rotted -- but the "
+                f"claim is NOT established.{tail}\nThe gloss is WITHHELD because it "
+                f"argues for a claim that did not hold. The check itself follows, so "
+                f"you can still judge whether it is sound:\n"
+                f"{_brain_spec_lines(fields)}", None)
+    if spec_ok:
+        return ("UNCONFIRMED",
+                f"{head}\nSTATUS: UNCONFIRMED -- the check was NOT RUN on the last "
+                f"validation pass (recorded status: {last_status}); it last passed "
+                f"{entry.get('last_pass', '?')}. Currency unknown; do not treat the "
+                f"claim as current.{tail}", content)
+    return ("UNVERIFIED",
+            f"{head}\nSTATUS: UNVERIFIED -- there is NO attestation matching this "
+            f"note's CURRENT check: it has never passed, or the check was edited "
+            f"since it last did. The claim is UNVERIFIED.{tail}", content)
+
+
 def collect_file_requests(round1_results: list[dict],
                           workdir: Path) -> tuple[dict[str, str], dict]:
     """Parse round-1 REQUEST_FILE lines from capability-holding members and
@@ -2663,7 +2899,21 @@ def collect_file_requests(round1_results: list[dict],
             if content is None:
                 reason = note
             else:
-                section = f"### {disp} ({note})\n" + _fenced(content)
+                # THE BRAIN GATE. A vault note is annotated in harness voice with what
+                # the vault actually knows about its claim, and its gloss is withheld
+                # when that claim is refuted, replaced or invalid. Non-notes are
+                # untouched: banner is None and the body passes through unchanged, so
+                # ordinary file retrieval is unaffected.
+                b_status, banner, body = brain_note_banner(disp, content, workdir)
+                if b_status is None:
+                    section = f"### {disp} ({note})\n" + _fenced(content)
+                else:
+                    entry["brain_note"] = True
+                    entry["brain_status"] = b_status
+                    entry["gloss_withheld"] = body is None
+                    shown = (_fenced(body) if body is not None else
+                             "[note body withheld by the brain gate; see STATUS above]")
+                    section = f"### {disp} ({note})\n{banner}\n{shown}"
                 gb = len(section.encode("utf-8"))
                 if delivered_total + overhead + gb > RETRIEVAL_PER_FIRE_CAP:
                     reason = "per-fire delivery budget exhausted"
@@ -3394,8 +3644,51 @@ def capability_block(member: Member, *, fallback_route: bool = False) -> str:
             "of the repo) and delivers the combined stdout+stderr, as UNTRUSTED DATA, or "
             "the denial reason, to YOU ALONE before you finalize your review -- a one-time follow-up delivery (any further requests are not processed).", ""]
     if granted:
-        lines += ["Request only what could change your verdict. NEVER claim to have read, "
-                  "fetched, or run anything that was not delivered to you in this prompt."]
+        # WHY THIS IS HERE. A recurring FINAL-round failure: a member emits REQUEST_
+        # lines and NO VERDICT line, so its vote is discarded. The reformat retry
+        # cannot save it -- there is no position to restate -- and the member correctly
+        # answers NONE. Nothing in this prompt had ever said a request does not REPLACE
+        # a verdict, while the capability paragraphs above promise delivery "before you
+        # finalize your review", which invites exactly that deferral.
+        # Re-measure rather than trusting a number frozen here (the corpus grows with
+        # every fire, and an earlier version of this comment pinned counts that were
+        # stale within the hour):
+        #   python3 -c "import json,glob,re; ..." over logs/<date>/*.json, comparing
+        #   each record in the "members" key (FINAL, post-reformat) for verdict ==
+        #   UNPARSEABLE against whether its text matches ^REQUEST_ and lacks ^VERDICT:.
+        # When first measured, the shape accounted for the large majority of all lost
+        # FINAL votes, concentrated in grok and kimi; gemini and codex hit it in round 1
+        # and recovered by round 2.
+        # THE WORDING IS LEG- AND ROUND-AGNOSTIC, after two drafts that were not.
+        # Draft 1 said "if this prompt shows you OTHER MEMBERS' VERDICTS, that round has
+        # passed" -- true for voting round 2, FALSE for layer-2 inspectors, whose PASS-1
+        # prompt carries format_council_conclusion (which emits "### {role}: {verdict}")
+        # and whose pass-1 requests ARE collected and delivered. It would have suppressed
+        # the inspector verification channel entirely.
+        # Draft 2 then said a request-only response "is DISCARDED", which CONTRADICTED
+        # the next paragraph: on a member's FIRST response the requests are precisely
+        # what IS honoured, and a missing round-1 verdict is recoverable because the
+        # aggregated result is the member's LAST response (gemini and codex both hit the
+        # failure in round 1 and finished at zero).
+        # The two facts that are true on every leg and every round, and that the text
+        # below states separately rather than conflating: collect_* run ONCE per leg,
+        # over round1_results for voters and pass1 for inspectors -- i.e. over each
+        # member's FIRST response; and aggregation reads each member's LAST response, so
+        # that is where an absent VERDICT line costs something. An inspector has no vote
+        # to lose either way (shadow_results are kept out of all_results), so the vote
+        # loss is named only for voting members.
+        lines += [
+            "EVERY response you send must contain a VERDICT line. A REQUEST_ line "
+            "SUPPLEMENTS your verdict, it never replaces it: give your best judgment on "
+            "the evidence you have NOW, and revise it in your follow-up response if what "
+            "is delivered changes your assessment.", "",
+            "Requests are honoured ONLY from your FIRST response in a review; repeating "
+            "a request in a later response is not processed. Your LAST response is the "
+            "one that is aggregated -- if it carries no VERDICT line your assessment is "
+            "discarded entirely, and for a VOTING member that is a lost vote, which "
+            "cannot count as a PASS and weakens the council's consensus.", "",
+            "Request only what could change your verdict. NEVER claim to have read, "
+            "fetched, or run anything that was not delivered to you in this prompt."]
     else:
         lines += ["You have NO filesystem, web, or exec access and no request channel: you "
                   "see exactly what this prompt contains, nothing else. Never claim or "
@@ -3989,10 +4282,25 @@ def emit_output(results: list[dict], final_verdict: str, log_path: Path,
         print(f"# LOST VOTES: {len(lost)} of {len(results)} members did not vote.")
         for r in lost:
             if r["verdict"] == "UNPARSEABLE":
-                why = ("no parseable verdict line, and the formatting retry "
-                       "did not recover it"
-                       if r.get("reformat_failed") else
-                       "no parseable verdict line")
+                if r.get("reformat_no_position"):
+                    # Distinct from a failed repair: the member was ASKED to
+                    # restate its position and said it never had one. Recorded
+                    # as its own state so the corpus does not carry a
+                    # manufactured WARN where no concern was ever raised.
+                    why = ("reached NO POSITION -- said so explicitly when asked "
+                           "to restate its verdict")
+                elif r.get("reformat_ambiguous"):
+                    # Deliberately discarded, not failed-to-recover: the retry
+                    # returned BOTH a verdict and NONE, and picking one would be
+                    # guessing at what the member meant.
+                    why = ("contradicted itself on retry -- emitted both a "
+                           "verdict and NONE, so the vote was discarded rather "
+                           "than guessed at")
+                elif r.get("reformat_failed"):
+                    why = ("no parseable verdict line, and the formatting retry "
+                           "did not recover it")
+                else:
+                    why = "no parseable verdict line"
                 if r.get("reformat_error"):
                     why += f" (retry itself failed: {r['reformat_error'][:80]})"
             else:

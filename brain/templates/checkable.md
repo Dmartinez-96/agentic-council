@@ -5,7 +5,6 @@ check_kind: file
 check_path: path/relative/to/--root
 expect: an exact substring that must appear
 falsifier: what this check prints if the fact is FALSE
-expires: 2027-01-01
 supersedes: []
 superseded_by:
 tags: []

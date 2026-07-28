@@ -64,11 +64,11 @@ Run:  python3 brain/validate_brain.py <vault-dir> [--root DIR] [--run-commands]
 import argparse
 import hashlib
 import json
+import os
 import re
 import shlex
 import sys
 import time
-from datetime import date
 from pathlib import Path
 
 CHECK_KINDS = ("file", "url", "command")
@@ -408,15 +408,33 @@ def main():
     root = Path(args.root).resolve()
     engine = _engine()
 
+    # ENUMERATION AND ITS ERROR DETECTION ARE ONE TRAVERSAL, deliberately.
+    # This used to be `vault.rglob("*.md")`, which SILENTLY OMITS the contents of a
+    # directory it cannot read -- no exception, and no per-note parse error either,
+    # because the note is never reached to be parsed (measured: a note under a
+    # chmod-000 subdirectory simply vanished from the listing). Orphan pruning below
+    # would then delete its still-valid attestation.
+    # A SECOND, SEPARATE os.walk probe was the first fix and was not good enough: if a
+    # directory's accessibility changed between the two scans, the probe could report
+    # clean while the enumeration had already missed notes. Walking ONCE and recording
+    # errors from that same pass removes the window entirely.
+    # dirnames is pruned IN PLACE so os.walk never descends into a dot-directory.
+    # Opening a vault in Obsidian creates `.obsidian/` inside it (measured 2026-07-26:
+    # app.json, appearance.json, core-plugins.json, workspace.json), and a community
+    # plugin shipping a README.md there would otherwise be parsed as a NOTE, fail the
+    # schema, and make the whole run exit non-zero. Also covers .git/, .trash/,
+    # .stfolder/ -- and, because they are never entered, an unreadable dot-directory
+    # cannot raise an error that would needlessly disable pruning.
+    walk_errors: list[str] = []
+    md_paths: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(
+            vault, onerror=lambda e: walk_errors.append(
+                f"{e.__class__.__name__}: {getattr(e, 'filename', '?')}")):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        md_paths.extend(Path(dirpath) / fn for fn in filenames if fn.endswith(".md"))
+
     notes = []
-    for p in sorted(vault.rglob("*.md")):
-        # Skip anything under a DOT-DIRECTORY. Opening a vault in Obsidian creates
-        # `.obsidian/` inside it (measured 2026-07-26: app.json, appearance.json,
-        # core-plugins.json, workspace.json), and a community plugin shipping a
-        # README.md or docs there would otherwise be parsed as a NOTE, fail the schema,
-        # and make the whole run exit non-zero. Also covers .git/, .trash/, .stfolder/.
-        if any(part.startswith(".") for part in p.relative_to(vault).parts[:-1]):
-            continue
+    for p in sorted(md_paths):
         if p.name.startswith("_") or p.name == "README.md":
             continue
         fields, body, errs = parse_note(p)
@@ -432,26 +450,73 @@ def main():
 
     started = time.monotonic()
     results, ran = [], 0
+    # Ids CLAIMED by some note in this vault, for the end-of-run orphan prune below.
+    # Collected from every note that yielded an id, INCLUDING schema-invalid ones: an
+    # invalid note still OWNS its id (its own entry is popped separately just below),
+    # and counting it stops a different note's entry from looking orphaned.
+    claimed_ids: set[str] = set()
+    # Notes whose FILE could not be read at all. parse_note reports those with an
+    # "unreadable:" error and EMPTY fields, so they claim no id and are indistinguish-
+    # able by id from a deliberately id-less note. Any one of them disables pruning for
+    # this run. Keyed on the error TEXT, deliberately not on f_id()'s "<no id: ...>"
+    # display string, which is presentation and must not become an interface.
+    unreadable: list[str] = []
+
+    def _now():
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def _record_non_pass(note_id, spec, status_, detail_):
+        """Record that the MOST RECENT run of this check did not pass.
+
+        Keeps last_pass when the spec is unchanged -- the check really did pass then,
+        and erasing that loses the only record of when. What changes is last_run and
+        last_status, which is exactly what a consumer needs to tell "passed on its last
+        run" from "passed at some point and has not been re-run since". A spec that no
+        longer matches loses the attestation outright, as it always did.
+        """
+        prior = ledger.get(note_id)
+        if not prior or prior.get("spec_sha256") != spec:
+            ledger.pop(note_id, None)
+            return
+        entry = dict(prior)
+        entry.update(last_run=_now(), last_status=status_, detail=detail_)
+        ledger[note_id] = entry
+
     for n in notes:
         f, rec = n["fields"], {"file": str(n["path"]), "id": f_id(n)}
+        if f.get("id"):
+            claimed_ids.add(f["id"])
         if n["errors"]:
             # An INVALID note must LOSE any attestation it had. Without this a note
             # that passed, was then edited into an invalid state, would keep a PASS
             # entry in the ledger -- a verification for a check that no longer
             # parses, which is the stale-attestation failure this ledger exists to
             # prevent.
+            if any(str(e).startswith("unreadable:") for e in n["errors"]):
+                unreadable.append(n["path"].name)
             if f.get("id"):
                 ledger.pop(f["id"], None)
             rec.update(status=INVALID, detail="; ".join(n["errors"]))
             results.append(rec)
             continue
         if f["type"] == "testimony":
+            # A testimony note has NO check, so it must hold no attestation at all.
+            # This branch used to return before the ledger was touched, so a note that
+            # passed as `checkable` and was later rewritten as testimony kept its PASS
+            # entry indefinitely (measured, not predicted).
+            ledger.pop(f["id"], None)
             rec.update(status="TESTIMONY",
                        detail=f"{f['attributed_to']} on {f['date']} "
                               "(NOT citable as ground truth)")
             results.append(rec)
             continue
         if f.get("superseded_by"):
+            # spec_hash covers neither `type` nor `superseded_by`, so a superseded
+            # note's entry keeps MATCHING its own spec and would read as current to
+            # any consumer testing the hash. Measured: it survived and read as
+            # attested. Pop it here; a consumer should ALSO re-read superseded_by from
+            # the note's frontmatter rather than trusting the ledger alone.
+            ledger.pop(f["id"], None)
             rec.update(status=SUPERSEDED, detail=f"superseded by {f['superseded_by']}")
             results.append(rec)
             continue
@@ -459,8 +524,10 @@ def main():
         h = spec_hash(f)
         if args.budget_seconds is not None and (
                 time.monotonic() - started) >= args.budget_seconds:
-            # An unrun check must never read as verified.
+            # An unrun check must never read as verified. Recording the NOT_RUN is what
+            # stops a prior PASS from standing in for a run that never happened.
             rec.update(status=NOT_RUN, detail="total budget exhausted", claim=rendered_claim(f))
+            _record_non_pass(f["id"], h, NOT_RUN, "total budget exhausted")
             results.append(rec)
             continue
 
@@ -468,32 +535,100 @@ def main():
         ran += 1
         rec.update(status=status, detail=detail, claim=rendered_claim(f))
 
-        expires = f.get("expires")
-        if expires and status == OK:
-            try:
-                if date.fromisoformat(expires) < date.today():
-                    rec["status"] = NEEDS_ADJ
-                    rec["detail"] = f"check passes but note expired on {expires}"
-            except ValueError:
-                rec["detail"] += f" (unparseable expires: {expires!r})"
-
-        if status == OK:
-            ledger[f["id"]] = {"spec_sha256": h, "last_pass": time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "detail": detail}
-        elif ledger.get(f["id"], {}).get("spec_sha256") != h:
-            # The check changed since its last PASS, so the old attestation cannot
-            # speak for it.
-            ledger.pop(f["id"], None)
+        # THERE IS NO `expires` FIELD, and this is where it used to live. It was
+        # REMOVED on the author's instruction -- nothing used it, and the only
+        # behaviour it ever produced was a bug: it set rec["status"] to
+        # NEEDS_ADJUDICATION while the ledger write was guarded on the untouched local
+        # `status`, so an expired note was REPORTED as failing and ATTESTED as passing
+        # in the same pass. A note carrying `expires:` today is simply an unrecognised
+        # key, ignored like any other, exactly as the flat schema treats anything it
+        # does not define.
+        #
+        # The ledger write is keyed on rec["status"] rather than the raw `status`. With
+        # `expires` gone the two are always equal, so this is not currently load-
+        # bearing -- it is kept because rec["status"] is what the validator REPORTS,
+        # and the ledger agreeing with the report is the property that broke last time.
+        if rec["status"] == OK:
+            now = _now()
+            ledger[f["id"]] = {"spec_sha256": h, "last_pass": now, "last_run": now,
+                               "last_status": OK, "detail": detail}
+        else:
+            _record_non_pass(f["id"], h, rec["status"], rec["detail"])
         results.append(rec)
 
+    # END-OF-RUN ORPHAN PRUNE. An id no note claims is unreachable from the vault and
+    # can only ever do harm: a future note reusing that id with an identical check spec
+    # would inherit a PASS recorded before it existed. Two ways one appears, both
+    # measured -- a note's `id:` line is removed (nothing left to pop), or its id is
+    # changed (the new id is written and the old one stays).
+    # IT RUNS ONLY AFTER THE FULL ENUMERATION, AND ONLY IF THAT ENUMERATION WAS
+    # COMPLETE -- the guard below is `unreadable or walk_errors`, covering BOTH ways a
+    # note can fail to claim its id: a file that could not be READ (per-note
+    # "unreadable:" parse error) and a file that was never ENUMERATED (a directory
+    # os.walk could not descend into). Either one alone disables pruning, because such
+    # a note claims no id and pruning would delete its still-valid attestation. Both
+    # verified by chmod-000 fixtures. The ledger is written once, after this, so a
+    # partial scan cannot half-apply a delete.
+    # `walk_errors` comes from the SINGLE enumeration traversal above -- deliberately
+    # not from a second walk here, which would reopen the window it exists to close.
+    pruned: list[dict] = []
+    prune_skipped = ""
+    if unreadable or walk_errors:
+        why = []
+        if unreadable:
+            why.append(f"{len(unreadable)} note(s) unreadable "
+                       f"({', '.join(sorted(unreadable)[:5])})")
+        if walk_errors:
+            why.append(f"{len(walk_errors)} directory enumeration error(s) "
+                       f"({'; '.join(sorted(walk_errors)[:3])})")
+        prune_skipped = (
+            "orphan pruning SKIPPED: " + "; ".join(why) + ". A note that is unreadable "
+            "or was never enumerated claims no id, so pruning now could delete a "
+            "still-valid attestation.")
+    else:
+        for stale in sorted(set(ledger) - claimed_ids):
+            pruned.append({"id": stale,
+                           "last_pass": ledger[stale].get("last_pass", "?"),
+                           "detail": ledger[stale].get("detail", "")})
+            ledger.pop(stale, None)
+
     problems = integrity(notes)
+    # Every ledger mutation this run made -- writes, pops and prunes alike -- exists
+    # only in memory until this succeeds, so the report below must not present prunes
+    # as deletions that happened unless they did.
+    # WRITE-THEN-REPLACE, not a direct write. Path.write_text opens with mode='w',
+    # which TRUNCATES on open: an I/O failure partway through would leave the ledger
+    # truncated or half-written, destroying every attestation in it rather than
+    # preserving the previous state. Writing a temp file and renaming means the old
+    # ledger survives intact on failure and the new one appears whole -- rename(2) is
+    # atomic WITHIN A SINGLE FILESYSTEM, which holds here because the temp sits in the
+    # same directory as its target. The temp is invisible to the note scanner because
+    # that scanner keeps only names ending in .md and this one does not -- NOT because
+    # it starts with a dot; the scanner's dot test prunes DIRECTORY names, never
+    # filenames.
+    # The pid in the name keeps concurrent validators from clobbering one another's
+    # pending temp, and stops the failure path below from unlinking a temp belonging to
+    # a different run. It does NOT make concurrent runs safe overall: two validators
+    # racing on the same vault still resolve last-writer-wins on the ledger itself.
+    # NOTHING RULES THAT OUT OF SCOPE -- it is an unaddressed limitation, not a
+    # decided non-goal. An earlier version of this comment asserted otherwise.
+    ledger_written = True
+    tmp_path = ledger_path.with_name(f"{ledger_path.name}.{os.getpid()}.tmp")
     try:
-        ledger_path.write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n")
+        tmp_path.write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n")
+        tmp_path.replace(ledger_path)
     except OSError as e:
+        ledger_written = False
         problems.append(f"could not write attestation ledger: {e}")
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
 
     if args.json:
         print(json.dumps({"results": results, "integrity": problems,
+                          "pruned": pruned, "prune_skipped": prune_skipped,
+                          "ledger_written": ledger_written,
                           "ran": ran, "elapsed_s": round(time.monotonic() - started, 2)},
                          indent=2))
     else:
@@ -507,6 +642,17 @@ def main():
             if r["status"] != OK:
                 print(f"\n[{r['status']}] {r['id']}  ({Path(r['file']).name})")
                 print(f"    {r['detail']}")
+        # A deletion is never silent: name what was evicted and when it last passed,
+        # so a human can tell an intended rename from an accident.
+        if pruned:
+            verb = ("PRUNED" if ledger_written else
+                    "WOULD HAVE PRUNED (ledger write FAILED -- nothing was removed)")
+            print(f"\n{verb} {len(pruned)} orphan attestation(s) "
+                  f"(no note claims these ids):")
+            for e in pruned:
+                print(f"  - {e['id']}  last_pass={e['last_pass']}")
+        if prune_skipped:
+            print(f"\n{prune_skipped}")
         if problems:
             print("\nINTEGRITY PROBLEMS:")
             for p in problems:
