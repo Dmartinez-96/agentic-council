@@ -2151,6 +2151,49 @@ def openrouter_effort() -> str:
     return "low" if fast_mode() else "high"
 
 
+def _cache_accounting(data: dict) -> dict:
+    """Pull token and prompt-cache accounting out of an OpenAI-compatible response.
+
+    ONLY fields the provider actually returned are included. An ABSENT key means the
+    provider did not report that field, which is NOT the same as a zero -- the same
+    missing-means-unknown discipline the fast_mode/effort depth fields already follow,
+    and the reason this returns a sparse dict rather than a zero-filled one.
+
+    Field names come from OpenRouter's prompt-caching page (openrouter.ai/docs/
+    features/prompt-caching, fetched 2026-07-28), which names `cache_discount` in the
+    response body and `cached_tokens` / `cache_write_tokens` under
+    `prompt_tokens_details`. `cache_discount` is read from BOTH the usage object and
+    the body top level because the page says "response body" without pinning which.
+
+    WHY THIS EXISTS: the stable-vs-variable prompt split has only ever been measured in
+    BYTES, which is a proxy for the token split and not a measurement of it. Logging
+    the provider's own `prompt_tokens` replaces that proxy with the real number, and
+    the three cache fields are what a later analysis can read to see whether any prefix
+    is being cached under the current single-user-message shape. Which of them a given
+    provider populates is unknown until observed -- that is the point of collecting all
+    three rather than picking one.
+    """
+    out: dict = {}
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens",
+                    "cache_discount", "cost"):
+            if isinstance(usage.get(key), (int, float)) and not isinstance(
+                    usage.get(key), bool):
+                out[key] = usage[key]
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            for key in ("cached_tokens", "cache_write_tokens"):
+                if isinstance(details.get(key), (int, float)) and not isinstance(
+                        details.get(key), bool):
+                    out[key] = details[key]
+    if "cache_discount" not in out and isinstance(
+            data.get("cache_discount"), (int, float)) and not isinstance(
+            data.get("cache_discount"), bool):
+        out["cache_discount"] = data["cache_discount"]
+    return out
+
+
 def _openrouter_call_blocking(role: str, models: list[str], prompt: str) -> dict:
     """Blocking OpenAI-compatible POST to OpenRouter. Same result shape as
     _deepseek_call_blocking; any failure -> ERROR so the member degrades gracefully.
@@ -2213,6 +2256,10 @@ def _openrouter_call_blocking(role: str, models: list[str], prompt: str) -> dict
         "returncode": 0, "verdict": parse_verdict(content),
         "duration_s": round(time.monotonic() - t0, 2),
         "model_used": data.get("model", ""),
+        # Sparse by construction: only fields this provider actually returned. It
+        # reaches the log without a write_log change because every leg spreads the
+        # record with {**r}.
+        **_cache_accounting(data),
     }
 
 
