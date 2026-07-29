@@ -182,31 +182,66 @@ def check_openrouter_key(rep: Reporter) -> bool:
     return True
 
 
-def check_standing_rules(rep: Reporter) -> None:
-    """Informational. The council reads your standing rules from ~/.claude/CLAUDE.md
-    by default (override with COUNCIL_STANDING_RULES_PATH) and shows them to every
-    member, so bar item 12 can cite the user's own rules by name. Without the file
-    that block is simply empty -- the council still enforces the directives typed
-    during a session, so this is a missing capability, not a broken install.
+def check_ground_rules(rep: Reporter, council_root: Path) -> None:
+    """Informational. council_ground_rules.md is the BASE rules layer -- the one every
+    seat receives, ahead of the evidence. Without it that layer is simply empty: the
+    overlay layers still resolve and the council still runs, so this is a missing
+    capability rather than a broken install.
 
-    Deliberately does NOT write the file. Those are the user's own standing
-    instructions to their agent; an installer that silently authors them has
-    overstepped. Point at the template and let them decide.
+    Deliberately does NOT write the file, for the same reason check_standing_rules does
+    not. The template's rules were accrued on one project; copying them in silently
+    would present another project's failure history as this user's own, which is the
+    exact misattribution the base/overlay split exists to remove.
+    """
+    path = council_root / "council_ground_rules.md"
+    if path.exists():
+        rep.ok(f"{path} present: every seat receives it as the base rules layer, "
+               f"ahead of the evidence and inside the cacheable prefix.")
+        return
+    rep.info(f"No base rules at {path}. Seats will receive no ground rules; "
+             f"everything else still runs.")
+    rep.info(f"  A starter you can copy and edit: "
+             f"{REPO_ROOT / 'starter-prompts' / 'ground-rules.md.template'}")
+    rep.info("  Read it before copying. A rule belongs in the base ONLY if it would be "
+             "true and useful for an agent that had never made the mistake -- no agent "
+             "names, no dates, no incident narration. Anything else belongs in an "
+             "overlay under overlays/models/ or overlays/roles/.")
+
+
+def check_standing_rules(rep: Reporter) -> None:
+    """Informational. The standing-rules channel carries the rules the REVIEWED party
+    works under, so a member can cite them by name rather than inferring them. It is a
+    DIFFERENT question from the base/overlay layers, which say what binds the READER.
+
+    IT IS OPT-IN. The council delivers this file only when COUNCIL_STANDING_RULES_PATH
+    is set. It formerly defaulted to ~/.claude/CLAUDE.md, which made one agent's incident
+    log the council's rules layer for every seat whatever model held it -- the exact
+    thing the base/overlay split exists to undo. So an unset variable is reported here as
+    a channel that is OFF, not as a missing file.
+
+    Deliberately does NOT write the file. Those are the user's own standing instructions
+    to their agent; an installer that silently authors them has overstepped.
     """
     env_path = os.environ.get("COUNCIL_STANDING_RULES_PATH")
-    path = Path(env_path).expanduser() if env_path else CLAUDE_HOME / "CLAUDE.md"
-    if path.exists():
-        rep.ok(f"{path} present: the council will show it to every member, and "
-               f"members can cite your rules by name (bar item 12).")
+    if not env_path:
+        rep.info("COUNCIL_STANDING_RULES_PATH is not set, so the standing-rules channel "
+                 "is OFF and no such file is delivered. This is optional: the base and "
+                 "overlay layers are the council's rules layer.")
+        rep.info(f"  To turn it on, point it at a file of your own standing "
+                 f"instructions. A starter you can copy and edit: "
+                 f"{REPO_ROOT / 'starter-prompts' / 'standing-rules.md.template'}")
+        rep.info("  Read it before copying: its failure-mode list was observed on one "
+                 "project and may not be your agent's failures.")
         return
-    rep.info(f"No standing-rules file at {path}. The council will still enforce the "
-             f"directives you type during a session, but it has no STANDING rules of "
-             f"yours to cite.")
-    rep.info(f"  A starter you can copy and edit: "
-             f"{REPO_ROOT / 'starter-prompts' / 'standing-rules.md.template'}")
-    rep.info("  Put it at ~/.claude/CLAUDE.md (or set COUNCIL_STANDING_RULES_PATH to "
-             "its path). Read it before copying: its failure-mode list was observed "
-             "on one project and may not be your agent's failures.")
+    path = Path(env_path).expanduser()
+    if path.exists():
+        rep.ok(f"{path} present and COUNCIL_STANDING_RULES_PATH is set: the council "
+               f"will show it to every member after the evidence, and members can cite "
+               f"your rules by name (bar item 12).")
+        return
+    rep.warn(f"COUNCIL_STANDING_RULES_PATH points at {path}, which does not exist. "
+             f"The channel is configured but delivers nothing; the council falls back "
+             f"to an empty block rather than erroring.")
 
 
 def check_bubblewrap(rep: Reporter) -> None:
@@ -624,6 +659,7 @@ def main() -> int:
         ok = False
     if not check_openrouter_key(rep):
         ok = False
+    check_ground_rules(rep, council_root)
     check_standing_rules(rep)
     check_bubblewrap(rep)
 
@@ -677,10 +713,14 @@ def main() -> int:
              f"{council_root / 'laziness_gate.py'} AND "
              f"{council_root / 'stop_audit.py'} (edit both) for false positives "
              "specific to your domain.")
-    rep.info("  3. Optionally install your standing rules: copy "
-             f"{REPO_ROOT / 'starter-prompts' / 'standing-rules.md.template'} to "
-             "~/.claude/CLAUDE.md (or set COUNCIL_STANDING_RULES_PATH). Read it "
-             "before copying.")
+    rep.info("  3. Install the BASE rules layer: copy "
+             f"{REPO_ROOT / 'starter-prompts' / 'ground-rules.md.template'} to "
+             f"{council_root / 'council_ground_rules.md'}. Read it before copying. "
+             "Without it, seats receive no ground rules.")
+    rep.info("  4. Optionally turn on the standing-rules channel for the rules the "
+             "REVIEWED party works under: set COUNCIL_STANDING_RULES_PATH to a file of "
+             f"your own instructions ({REPO_ROOT / 'starter-prompts' / 'standing-rules.md.template'} "
+             "is a starter). It is OFF unless that variable is set.")
     rep.info("")
     if rep.warnings:
         rep.info(f"{len(rep.warnings)} warning(s) emitted; review above.")
