@@ -51,8 +51,13 @@ notes the macOS swaps).
    (`--dry-run` to preview, `--council-root` to relocate). It verifies prerequisites,
    probes codex + OpenRouter, copies the scripts, merges the hook block into
    `~/.claude/settings.json`, and installs the `/council` command.
-5. **Standing rules** (optional) -- copy `starter-prompts/standing-rules.md.template` to
-   `~/.claude/CLAUDE.md` (or set `COUNCIL_STANDING_RULES_PATH`); read it before copying.
+5. **Ground rules** -- copy `starter-prompts/ground-rules.md.template` to
+   `<council_root>/council_ground_rules.md`; read it before copying. This is the base
+   layer every seat is judged against, and without it that layer is empty.
+   Optionally also set `COUNCIL_STANDING_RULES_PATH` to a file of YOUR OWN standing
+   instructions (`starter-prompts/standing-rules.md.template` is a starting point) --
+   that is a separate channel and is off unless you set the variable. See
+   [The rules layer](#the-rules-layer).
 6. **It's live -- no restart.** Claude Code's settings file-watcher picks up the hooks,
    so the gate and council fire on your next `Write`/`Edit`. Only the SessionStart
    environment probe waits for a session boundary: if Claude Code was already running,
@@ -404,21 +409,55 @@ warnings:
   over-flagging is exactly the question `council_outcome.py` exists to answer.
   Measure it on your own work rather than trusting this README.
 
-## Your own standing rules
+## The rules layer
 
-The council injects your standing rules in front of every member, so a member can cite
-the exact rule of YOURS that a proposal broke rather than inferring one. It reads them
-from `~/.claude/CLAUDE.md` by default (the path Claude Code also auto-loads, if that is
-your access method); set `COUNCIL_STANDING_RULES_PATH` to point it at any other file
-instead. Without a standing-rules file the council still enforces the directives you
-type during a session; what it lacks is the STANDING half.
+Every seat is told what it is bound by. Those rules arrive in up to three layers, and
+which layer a rule belongs in is a real decision, not filing:
 
-`starter-prompts/standing-rules.md.template` is an agent-agnostic starting point. **Read
-it before you copy it.** Its failure-mode list was observed across thousands of
-council-reviewed edits on a single machine's logs. Whether the same failures show up for
-your agent, on your codebase, is not something we measured. The list is a floor, not a
-ceiling. The piece we would expect to outlast the specific rules is the loop at the end
--- when a failure repeats, amend the file.
+    <council_root>/council_ground_rules.md            BASE
+    <council_root>/overlays/models/<exact-slug>.md    MODEL overlay
+    <council_root>/overlays/roles/<tier>.md           ROLE overlay
+
+**BASE** goes to every seat and leads the prompt, ahead of the evidence. Two
+consequences follow, and both are load-bearing. It is byte-identical for every seat on
+every fire, so it sits in the cacheable leading prefix. And because it is read BEFORE
+the evidence it must not frame the reader -- so it may contain no agent's name, no
+dates, and no incident narration. That is a constraint on its CONTENT, not a style
+preference. Copy `starter-prompts/ground-rules.md.template` to
+`<council_root>/council_ground_rules.md` to get one. Without that file the base layer is
+simply empty and everything else still runs.
+
+**MODEL overlays** carry what BASE may not: one model's accrued failure history. They
+are keyed on the EXACT model slug, never a seat name and never a vendor family. A seat
+is a mutable pointer -- repoint it and a seat-keyed overlay would hand one model
+another's record -- and whether failure modes generalise within a family is not
+something we measured, so a sibling gets nothing rather than a borrowed history. If a
+seat declares a fallback model whose overlay differs from its primary's, that seat's
+model layer is withheld entirely, because either slug may end up answering. Overlays are
+delivered AFTER the evidence, for the same reason BASE may lead: an agent's account of
+its own defects, met before a single fact, frames the reader.
+
+**ROLE overlays** bind whoever holds a role -- what may be mutated, how a reviewer is
+answered, who may weigh cost against verification. They are meaningless to a seat that
+cannot act, so a voting member never receives the lead worker's role rules. The leader
+gets its own stack resolved from the same files through the same guard.
+
+### Your own standing rules (optional, separate)
+
+The three layers above describe what binds the READER. A different question is what
+binds the party UNDER REVIEW -- your own instructions to your agent, which a member can
+then cite by name instead of inferring. That is a separate, optional channel: set
+`COUNCIL_STANDING_RULES_PATH` to a file and it is injected after the evidence alongside
+the overlays. **It is off unless you set that variable.** Earlier versions read
+`~/.claude/CLAUDE.md` by default; that made one agent's incident log the council's rules
+layer, which is exactly what the base/overlay split exists to undo.
+
+`starter-prompts/standing-rules.md.template` is an agent-agnostic starting point for
+that file. **Read it before you copy it.** Its failure-mode list was observed across
+thousands of council-reviewed edits on a single machine's logs. Whether the same
+failures show up for your agent, on your codebase, is not something we measured. The
+list is a floor, not a ceiling. The piece we would expect to outlast the specific rules
+is the loop at the end -- when a failure repeats, amend the file.
 
 The installer will tell you if the file is missing. It deliberately will NOT write it
 for you -- those are your instructions to your agent, and an installer that silently
@@ -470,6 +509,9 @@ agentic-council/
     council_system_prompt.md          # THE QUALITY BAR
     council_dialogue_prompt.md
     council_layer2_prompt.md          # the layer-2 inspector prompt
+    council_ground_rules.md           # BASE rules layer -- you create this (step 5)
+    overlays/models/<exact-slug>.md   # per-model accrued history (optional)
+    overlays/roles/<tier>.md          # per-role authority bounds (optional)
   vscode-extension/                   # thin GUI panel for the engine (see its README)
   claude-code/
     settings.hooks.template.json

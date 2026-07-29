@@ -1395,30 +1395,49 @@ def format_evidence_block(evidence_path: Path, target_path: str = "") -> str:
     return head + index_text + "\n" if index_text else head
 
 
-# The council injects the user's standing rules from this path. Default ~/.claude/CLAUDE.md
-# (the path Claude Code also auto-loads into the leader); override with COUNCIL_STANDING_RULES_PATH
-# so an agent-agnostic standing-rules file need not be named CLAUDE.md for a non-Claude-Code harness.
-# An unset or empty env var falls through to the default.
+# The OPTIONAL standing-rules channel: a file naming what the REVIEWED party works
+# under, which a member can then cite by name. Set COUNCIL_STANDING_RULES_PATH to a
+# file to enable it. It is OFF unless that variable is set (the principal's REPLACE
+# ruling of 2026-07-29 -- see the rules-stack note below); the council's own rules layer
+# is the base plus overlays, not this. The default path is retained because it is where
+# a Claude Code harness keeps such a file, and because a harness that sets the variable
+# to its own file gets the same treatment -- that generality is the point.
 _env_standing_rules = os.environ.get("COUNCIL_STANDING_RULES_PATH")
+STANDING_RULES_CONFIGURED = bool(_env_standing_rules)
 STANDING_RULES_PATH = (Path(_env_standing_rules).expanduser() if _env_standing_rules
                        else Path.home() / ".claude" / "CLAUDE.md")
-STANDING_RULES_MAX_BYTES = 20_000
+# Raised from 20_000 on the principal's ruling of 2026-07-29. WHY IT MATTERS, and it is
+# a property of the code rather than of any one file: _fit_to_cap slices from the HEAD,
+# so an over-cap file loses its TAIL -- whatever rules a user wrote last, cut mid-rule.
+# A cap keeps a runaway file from swallowing the prompt; it must not silently swallow
+# rules instead. To see what a given file loses at a given cap, diff the file against
+# format_standing_rules() output.
+STANDING_RULES_MAX_BYTES = 32_000
 
 
 # --- The agent-agnostic rules stack: BASE + model overlay + role overlay ---
 #
-# STATUS: THIS RESOLVER IS NOT YET WIRED INTO PROMPT ASSEMBLY. It resolves the files
-# and nothing calls it; build_prompt still delivers format_standing_rules() alone. The
-# placement described below is the DESIGN, not current behaviour, and this note comes
-# out in the edit that wires it.
+# These files are RESOLVED and FORMATTED here; run_member COMPOSES them onto a member's
+# prompt, and its comment is where the placement and its rationale are stated.
 #
 # BASE (council_ground_rules.md) is universal: work properties with discriminating
 # checks, no agent named, no dates, no incident narration. It is identical for every
-# seat and every fire, which is what will let it sit in the cacheable leading prefix.
+# seat and every fire, which is what lets it sit in the cacheable leading prefix.
 # OVERLAYS carry what is NOT universal -- a model's accrued failure history, and the
-# authority bounds of a role -- and belong AFTER the evidence, because a reader that
-# meets an agent's account of its own defects before it meets a fact has been framed
-# (the de-anchoring rule recorded in build_prompt's docstring).
+# authority bounds of a role -- and are delivered AFTER the evidence, because a reader
+# that meets an agent's account of its own defects before it meets a fact has been
+# framed (the de-anchoring rule recorded in build_prompt's docstring).
+#
+# WHAT THE STANDING-RULES CHANNEL DOES NOW. grok raised this as item (f) of dialogue
+# 20260728T232729Z-977a16, round 0 -- "define what COUNCIL_STANDING_RULES_PATH
+# overrides post-split ... pin the semantics before code" -- and it went unanswered
+# through that thread's unanimous PASS. It was put to the principal rather than decided
+# here, and he RULED (2026-07-29): REPLACE. Base plus overlays are the council's rules
+# layer; format_standing_rules() is delivered only when COUNCIL_STANDING_RULES_PATH is
+# explicitly set, which is the gate at STANDING_RULES_CONFIGURED. He was shown, and
+# accepted, what that costs by default: seats stop receiving the standing-rules file's
+# own top-of-file user directives, and the role rules for the LEAD seat reach nobody
+# until the leader path is wired.
 #
 # ROLE KEYING, and a live gap worth stating rather than discovering later: the role key
 # is `member.tier`, which for every seat in the members list is "voting" or
@@ -1473,14 +1492,156 @@ def resolve_rules(member: Member) -> tuple[str, str]:
     one. A family file may be introduced later only as an explicit human opt-in that
     says in-band that it is family-level.
     """
-    parts = []
-    model_overlay = _overlay_path("models", member.model)
-    if model_overlay is not None:
-        parts.append(_read_optional(model_overlay))
-    role_overlay = _overlay_path("roles", member.tier)
-    if role_overlay is not None:
-        parts.append(_read_optional(role_overlay))
-    return _read_optional(GROUND_RULES_PATH), "\n\n---\n\n".join(p for p in parts if p)
+    return (_read_optional(GROUND_RULES_PATH),
+            join_overlay(_model_overlay_text(member.model),
+                         _role_overlay_text(member.tier)))
+
+
+def _model_overlay_text(model: str) -> str:
+    """The accrued-history overlay for one EXACT model slug, or "" if it has none."""
+    path = _overlay_path("models", model)
+    return _read_optional(path) if path is not None else ""
+
+
+def _role_overlay_text(tier: str) -> str:
+    """The authority-bounds overlay for one role, or "" if that role has none."""
+    path = _overlay_path("roles", tier)
+    return _read_optional(path) if path is not None else ""
+
+
+def join_overlay(*parts: str) -> str:
+    """The overlay layers a seat receives, joined in order, skipping empty ones."""
+    return "\n\n---\n\n".join(p for p in parts if p)
+
+
+def overlay_for_dispatch(member: Member) -> str:
+    """The overlay layers a seat may SAFELY be shown when it is actually dispatched.
+
+    WHICH MODEL ANSWERS is not always member.model. A record carrying a fallback_model
+    may be served by either slug: the openrouter transport hands the transport
+    [primary, fallback] and ONE prompt built before either is tried, and the codex
+    branch rebuilds that prompt for the fallback after the subscription route errors.
+
+    The model layer is keyed on an EXACT slug precisely so that no model receives
+    another's accrued history. Forwarding the primary's overlay to a fallback would
+    reintroduce that misattribution one level down, under a header naming the wrong
+    model as "YOUR seat". So when the two slugs do not resolve to the SAME model
+    overlay, the MODEL layer is WITHHELD and only the ROLE layer is delivered -- the
+    same choice the no-family-fallback rule makes, for the same reason: a seat gets
+    nothing rather than somebody else's record.
+
+    Latent on today's roster, since the only model overlay on disk belongs to a slug no
+    seat runs. It is structural, so it is closed here rather than on the day an overlay
+    is first written for a seated model.
+    """
+    model_layer = _model_overlay_text(member.model)
+    if (member.fallback_model
+            and _model_overlay_text(member.fallback_model) != model_layer):
+        model_layer = ""
+    return join_overlay(model_layer, _role_overlay_text(member.tier))
+
+
+def stacked_rules(member: Member) -> str:
+    """The WHOLE rules stack for one seat as a single string: base then overlay.
+
+    The MEMBER path does not use this -- it splits the stack across the evidence, base
+    ahead of it and overlay behind it, which is the de-anchoring ruling. This is for a
+    caller that has only ONE rules slot to fill, which is the leader path: a leader
+    prompt has no evidence block to sit on either side of, so the ordering question does
+    not arise there. Both paths resolve from the same files through the same guard, so
+    a rule cannot reach one and miss the other.
+    """
+    base, _ = resolve_rules(member)
+    return join_overlay(base, overlay_for_dispatch(member))
+
+
+GROUND_RULES_MAX_BYTES = 20_000
+RULES_OVERLAY_MAX_BYTES = 20_000
+# Slack for a multi-byte character severed by a byte-slice: its replacement re-encodes
+# LARGER than the bytes it replaced. 8 covers both replacement strategies -- maximal
+# subpart (worst +2, what Python does) and byte-by-byte (worst +6).
+_UTF8_SEVER_SLACK = 8
+
+
+def _fit_to_cap(text: str, cap: int, overhead: int, note: str) -> str:
+    """`text` shortened so `overhead` + the result fits within `cap` BYTES.
+
+    The rule-8 arithmetic, in ONE place because it is subtle and there are now three
+    blocks that need it. The caller's header and footer are charged against the budget
+    BEFORE the slice -- slice to the cap and prepend the header afterwards, and the
+    block overshoots by exactly the header's length -- and `note` is charged too, so a
+    truncated body plus its marker still fits.
+
+    The note is charged against the SLICE but NOT against the FIT TEST: a body that
+    fits without a truncation marker does not need one, and charging it up front would
+    truncate bodies that fit perfectly well -- shrinking the usable budget by the marker
+    on every block, forever, including the ones that never truncate.
+
+    Returns `text` unchanged when it already fits, and "" when the caller's own overhead
+    leaves no room for a body at all.
+    """
+    budget = cap - overhead
+    raw = text.encode("utf-8")
+    if len(raw) <= budget:
+        return text
+    body_budget = budget - len(note.encode())
+    if body_budget <= 0:
+        return ""
+    return raw[:body_budget].decode("utf-8", errors="replace") + note
+
+
+def format_ground_rules(base: str) -> str:
+    """The universal ground rules wrapped for delivery, or "" when there are none."""
+    if not base:
+        return ""
+    header = (
+        "## Ground rules\n"
+        "\n"
+        "The universal layer of this council's rules. They bind whoever is doing the "
+        "work -- lead worker, voting member, inspector -- whatever model holds the "
+        "seat, and they are IDENTICAL for every seat on every fire.\n"
+        "\n"
+        "They are agent-neutral by construction: each states a property of the WORK and "
+        "carries a discriminating check, and none names an agent, a date, or an "
+        "incident. Nothing here is any party's account of its own defects.\n"
+        "\n"
+        "A proposal that breaks one is worth citing BY NAME rather than objecting "
+        "generically -- but only where it actually broke one.\n"
+        "\n"
+        "```\n"
+    )
+    footer = "\n```\n"
+    note = "\n\n[... truncated: ground rules exceed the block budget ...]"
+    overhead = len(header.encode()) + len(footer.encode()) + _UTF8_SEVER_SLACK
+    return header + _fit_to_cap(base, GROUND_RULES_MAX_BYTES, overhead, note) + footer
+
+
+def format_rules_overlay(overlay: str, member: Member) -> str:
+    """This seat's model and role overlay wrapped for delivery, or "" when it has
+    neither. `member` supplies only the two labels naming whose record this is."""
+    if not overlay:
+        return ""
+    header = (
+        "## Rules for your seat\n"
+        "\n"
+        f"Accrued failure history for the model in YOUR seat ({member.model}), plus the "
+        f"authority bounds of YOUR role ({member.tier}).\n"
+        "\n"
+        "This is not the reviewed party's record and not another model's. It is keyed "
+        "on your own exact model slug with no family fallback, so nothing here was "
+        "inherited from a sibling model that merely shares a vendor prefix.\n"
+        "\n"
+        "Treat it as a record about your own seat, NOT as a frame to read the evidence "
+        "through, and NOT as a bound on your review: a failure that is not listed here "
+        "is still a failure, and the most valuable thing you can find is one this list "
+        "did not anticipate.\n"
+        "\n"
+        "```\n"
+    )
+    footer = "\n```\n"
+    note = "\n\n[... truncated: seat rules exceed the block budget ...]"
+    overhead = len(header.encode()) + len(footer.encode()) + _UTF8_SEVER_SLACK
+    return header + _fit_to_cap(overlay, RULES_OVERLAY_MAX_BYTES, overhead, note) + footer
 
 
 def format_standing_rules(path: Path = STANDING_RULES_PATH) -> str:
@@ -1560,16 +1721,13 @@ def format_standing_rules(path: Path = STANDING_RULES_PATH) -> str:
 
     # Charge the header AND footer against the budget BEFORE slicing, and reserve
     # slack for a multi-byte character severed at the cut (it re-encodes larger).
-    utf8_slack = 8
-    overhead = len(header.encode()) + len(footer.encode()) + utf8_slack
-    budget = STANDING_RULES_MAX_BYTES - overhead
-    raw = text.encode("utf-8")
-    if len(raw) > budget:
-        note = "\n\n[... truncated: standing rules exceed the block budget ...]"
-        raw = raw[: budget - len(note.encode())]
-        text = raw.decode("utf-8", errors="replace") + note
-
-    return header + text + footer
+    # _fit_to_cap does both; this block used to do the same arithmetic inline, and the
+    # two would have drifted the moment either was touched.
+    note = "\n\n[... truncated: standing rules exceed the block budget ...]"
+    overhead = len(header.encode()) + len(footer.encode()) + _UTF8_SEVER_SLACK
+    return (header
+            + _fit_to_cap(text, STANDING_RULES_MAX_BYTES, overhead, note)
+            + footer)
 
 
 def build_prompt(system_prompt: str, pitch: str, evidence_block: str = "",
@@ -2432,11 +2590,23 @@ async def run_openrouter(role: str, models: list[str], pitch: str,
                           council_conclusion_block)
     # build_prompt puts system_prompt first and joins sections with a separator, so
     # system_prompt is a genuine LEADING span of `prompt`. It is not the only stable
-    # content -- the standing-rules block is stable across fires too -- but it is the
-    # only stable span that is CONTIGUOUS FROM BYTE 0, and a prefix breakpoint can mark
-    # nothing else. The standing rules sit behind the evidence and directives blocks,
-    # which change every fire. _message_content re-checks the startswith itself and
-    # falls back to the plain string if it ever stops holding.
+    # content -- a standing-rules block, when one is configured, is stable across fires
+    # too -- but it is the only stable span that is CONTIGUOUS FROM BYTE 0, and a prefix
+    # breakpoint can mark nothing else. Anything sitting behind the evidence and
+    # directives blocks, which change every fire, cannot be marked.
+    # WHAT run_member PUT IN HERE, and the reason this argument now carries more than
+    # the council system prompt: the capability block AND the universal ground rules are
+    # composed onto system_prompt before dispatch, so both ride inside this same
+    # contiguous prefix. That is the whole point of the base being agent-neutral -- it
+    # is identical for every seat on every fire. Under exact-prefix matching (OpenAI,
+    # developers.openai.com/api/docs/guides/prompt-caching, fetched 2026-07-28: "cache
+    # hits are only possible for exact prefix matches within a prompt") appending to a
+    # byte-identical leading span leaves that span still matching, so the base is added
+    # AHEAD of the variable content rather than behind it. What any given provider then
+    # does about retention is NOT established here -- five of six voting seats sit on
+    # providers whose matching semantics were never verified (HANDOFF 0i).
+    # _message_content re-checks the startswith itself and falls back to the plain
+    # string if it ever stops holding.
     return await asyncio.to_thread(_openrouter_call_blocking, role, models, prompt,
                                    system_prompt)
 
@@ -3508,7 +3678,8 @@ def _exfil_span(pathquery: str, prompt_text: str) -> bool:
 def build_exfil_context(evidence_block: str, user_directives_block: str,
                         pitch: str, assistant_block: str = "",
                         standing_rules_block: str = "",
-                        conclusion_block: str = "") -> str:
+                        conclusion_block: str = "",
+                        rules_overlay_block: str = "") -> str:
     """The corpus of SESSION-SPECIFIC sensitive text the web-fetch exfil brake
     (_exfil_span) checks a member-requested URL's path/query against: the evidence block,
     The user's directives, the pitch (repo/diff under review), Claude's prior transcript
@@ -3519,11 +3690,18 @@ def build_exfil_context(evidence_block: str, user_directives_block: str,
     requests; VOTING members request in ROUND 1, before any conclusion or peer round-1
     block exists, so those are correctly absent from their corpus. This deliberately
     EXCLUDES the fixed council scaffolding every member also sees -- the system / layer-2
-    prompt and the generated capability block -- which is not session data (it ships in
-    the public package)."""
+    prompt, the generated capability block, and the universal ground rules -- which is not
+    session data (it ships in the public package).
+
+    rules_overlay_block carries the seat overlays, which do NOT ship: they are local
+    project text of the same character as a configured standing-rules file, so they are
+    covered for the same reason that one is. Overlays are PER-SEAT while this corpus is
+    built once per fire, so the caller passes the UNION across the roster; a superset
+    only makes the brake stricter, since _exfil_span denies on any long verbatim run it
+    finds."""
     return "\n".join(x for x in (evidence_block, user_directives_block, pitch,
                                  assistant_block, standing_rules_block,
-                                 conclusion_block) if x)
+                                 conclusion_block, rules_overlay_block) if x)
 
 
 def fetch_web_url(url: str, prompt_text: str = "") -> tuple[str | None, str]:
@@ -4070,17 +4248,48 @@ async def run_member(member: Member, pitch: str, system_prompt: str, cwd: Path,
     Every dispatch appends the member's registry-generated capability_block() to
     the system prompt, so what a member is TOLD it can do matches its record,
     transport, and ROUTE: the codex OpenRouter fallback gets a no-access block
-    built with fallback_route=True, never the inherited sandbox text.
+    built with fallback_route=True, never the inherited sandbox text. This is also
+    where the seat's RULES STACK is composed onto the prompt (see below).
     """
     base_prompt = system_prompt
-    system_prompt = base_prompt + "\n\n" + capability_block(member)
+    # THE RULES STACK. resolve_rules hands back this seat's two layers, and they land
+    # on OPPOSITE SIDES of the evidence -- which is the entire point of having split
+    # them, and the only reason the base is allowed to lead at all.
+    #
+    # BASE joins the LEADING PREFIX, behind the system prompt and the capability block
+    # (which are already contiguous from byte 0). It is byte-identical for every seat
+    # on every fire, so appending it EXTENDS the cacheable prefix instead of displacing
+    # what is already cached there -- run_openrouter hands this same string down as its
+    # cache_prefix. It is permitted to lead ONLY because it carries no named-agent
+    # incident voice: that is the partition test, and a memoir sliding into the base
+    # file silently breaks the ordering rather than merely being untidy.
+    #
+    # THE OVERLAY goes AFTER the evidence, joined into the standing-rules slot, for the
+    # reason build_prompt's docstring gives: a reader that meets an agent's account of
+    # its own defects before it meets a single fact has been framed, however true that
+    # account is. The overlay IS that account, so it may not lead.
+    ground_rules, _ = resolve_rules(member)
+    # overlay_for_dispatch, NOT resolve_rules' overlay: a seat whose fallback slug
+    # resolves to a different model overlay has its MODEL layer withheld, because
+    # either slug may serve this prompt. The leader path uses the same guard.
+    seat_overlay = overlay_for_dispatch(member)
+    ground_rules_block = format_ground_rules(ground_rules)
+    system_prompt = "\n\n".join(p for p in (base_prompt,
+                                            capability_block(member),
+                                            ground_rules_block) if p)
+    overlay_block = format_rules_overlay(seat_overlay, member)
+    if overlay_block:
+        # build_prompt's own section separator, so one joined parameter renders
+        # byte-identically to two adjacent sections.
+        standing_rules_block = "\n\n---\n\n".join(
+            p for p in (standing_rules_block, overlay_block) if p)
     t = member.transport
 
     async def _dispatch_once() -> dict:
         return await _run_member_transport(
             member, base_prompt, system_prompt, t, pitch, cwd, evidence_block,
             user_directives_block, round1_block, assistant_block,
-            standing_rules_block, council_conclusion_block)
+            standing_rules_block, council_conclusion_block, ground_rules_block)
 
     result = await _dispatch_once()
     # ONE RETRY ON A NO-USABLE-RESPONSE. Measured across the corpus: 50 records
@@ -4114,9 +4323,17 @@ async def _run_member_transport(member: "Member", base_prompt: str,
                                 evidence_block: str, user_directives_block: str,
                                 round1_block: str, assistant_block: str,
                                 standing_rules_block: str,
-                                council_conclusion_block: str) -> dict:
+                                council_conclusion_block: str,
+                                ground_rules_block: str) -> dict:
     """The transport switch, split out of run_member so a retry can re-enter it
-    without re-running prompt assembly or recursing through the retry check."""
+    without re-running prompt assembly or recursing through the retry check.
+
+    `ground_rules_block` is already inside `system_prompt` for every transport; it is
+    passed separately ONLY because the codex fallback route rebuilds its prefix from
+    `base_prompt` with a different capability block, and would otherwise be the one
+    seat in the council whose prompt carried no ground rules. It is deliberately
+    REQUIRED rather than defaulted, so that adding a caller cannot omit it silently.
+    """
     if t == "codex_subprocess":
         result = await run_codex(pitch, system_prompt, cwd, evidence_block,
                                  user_directives_block, round1_block,
@@ -4130,9 +4347,12 @@ async def _run_member_transport(member: "Member", base_prompt: str,
             # fallback vote sees the assembled prompt (evidence, directives, the
             # pitch) but cannot read the repo. emit_output marks it.
             fb = await run_openrouter(member.name, [member.fallback_model], pitch,
-                                      base_prompt + "\n\n"
-                                      + capability_block(member,
-                                                         fallback_route=True),
+                                      "\n\n".join(
+                                          p for p in
+                                          (base_prompt,
+                                           capability_block(member,
+                                                            fallback_route=True),
+                                           ground_rules_block) if p),
                                       evidence_block,
                                       user_directives_block, round1_block,
                                       assistant_block, standing_rules_block,
@@ -4932,10 +5152,14 @@ async def main() -> int:
             args.transcript_path, args.evidence_file)
         assistant_block = format_assistant_messages(args.transcript_path)
 
-    # NOT gated on the transcript: the standing rules exist whether or not this
-    # fire came from a hook with a transcript path. Returns "" if the file is
-    # absent, which is the correct behaviour for anyone who has no CLAUDE.md.
-    standing_rules_block = format_standing_rules()
+    # THE OPTIONAL STANDING-RULES CHANNEL, off unless COUNCIL_STANDING_RULES_PATH names
+    # a file. The council's own rules layer is the base plus each seat's overlay, both
+    # composed in run_member; this channel is for a harness that additionally wants to
+    # put the REVIEWED party's own rules in front of the panel. Not gated on the
+    # transcript -- such rules exist whether or not this fire came from a hook -- and
+    # format_standing_rules still returns "" if the configured file is unreadable.
+    standing_rules_block = (format_standing_rules() if STANDING_RULES_CONFIGURED
+                            else "")
 
     # Members run in a fresh empty working directory, not the session's
     # project dir, so a member CLI that auto-explores its cwd (e.g.
@@ -4968,9 +5192,15 @@ async def main() -> int:
     # than two members round 2 never runs, so requests cannot be delivered; they are
     # logged undelivered. collect_* parse the ORIGINAL round-1 text; the shared/logged
     # copy is REDACTED below (redacted_round1).
+    # The seat overlays a member may be shown. Built as the UNION over the roster
+    # because the corpus is per-fire while overlays are per-seat, and deduplicated
+    # because members sharing a tier share a role overlay verbatim.
+    rules_overlay_corpus = "\n".join(sorted(
+        {ov for ov in (resolve_rules(m)[1] for m in REGISTRY) if ov}))
     exfil_context = build_exfil_context(
         evidence_block, user_directives_block, pitch,
-        assistant_block, standing_rules_block)
+        assistant_block, standing_rules_block,
+        rules_overlay_block=rules_overlay_corpus)
     retrieval_blocks: dict[str, str] = {}
     web_blocks: dict[str, str] = {}
     exec_blocks: dict[str, str] = {}
@@ -5046,7 +5276,8 @@ async def main() -> int:
         # (the voting-leg exfil_context above was built before conclusion_block existed).
         insp_exfil_context = build_exfil_context(
             evidence_block, user_directives_block, pitch,
-            assistant_block, standing_rules_block, conclusion_block)
+            assistant_block, standing_rules_block, conclusion_block,
+            rules_overlay_block=rules_overlay_corpus)
         insp = [m for m in inspector_members() if m.name in shadow_roles]
         # PASS 1: each inspector inspects the conclusion and MAY emit REQUEST_* lines
         # (the same request channel the voting members use in round 1).

@@ -1,0 +1,211 @@
+# Ground rules
+
+Copy this to `<council_root>/council_ground_rules.md` and edit it. Nothing reads this
+template in place; the engine reads `council_ground_rules.md` beside
+`council_system_prompt.md`. If that file is absent the BASE layer is simply empty --
+the overlay layers below still deliver, and the council still runs.
+
+READ IT BEFORE YOU COPY IT. The rules below were accrued on one machine, from one
+agent's failures, then stripped of everything specific to that agent. Whether the same
+failures show up for your agent on your codebase is not something we measured. This is
+a floor, not a ceiling, and it is meant to be edited.
+
+## What this layer is
+
+The council delivers rules in up to three layers. This is the FIRST.
+
+    council_ground_rules.md              BASE     -> every seat, ahead of the evidence
+    overlays/models/<exact-model>.md     MODEL    -> that one slug, after the evidence
+    overlays/roles/<tier>.md             ROLE     -> that role only, after the evidence
+
+The layers are independent: a missing file means that layer is empty, never that the
+others stop. One exception, and it is deliberate -- if a seat declares a FALLBACK model
+whose overlay differs from its primary's, that seat's MODEL layer is WITHHELD. BASE and
+ROLE are unaffected and still delivered. Either slug may end up answering, and handing
+a model somebody else's record is the precise failure this keying exists to prevent.
+
+BASE leads the prompt. Two consequences, and both are load-bearing:
+
+1. It is identical for every seat on every fire, so it sits in the cacheable leading
+   prefix. Providers that do prefix caching can match it instead of re-reading it.
+2. Because it is read BEFORE the evidence, it must not frame the reader. That is a
+   CONTENT CONSTRAINT, not a style note: an agent's account of its own defects, met
+   before a single fact, biases what the reader then goes looking for.
+
+So the test for whether a rule belongs HERE, rather than in an overlay:
+
+  BASE   if it would still be true and useful for a competent agent that had never made
+         the mistake. It states a property of the WORK and carries a DISCRIMINATING
+         CHECK -- the concrete thing to run or ask. No agent's name, no dates, no
+         "you did this".
+  MODEL  if its force comes from one model's accrued history. That is memoir. Keyed on
+         the EXACT model slug, never a family and never a seat name: a seat is a
+         mutable pointer, and family-level attribution hands one model another's record.
+  ROLE   if it binds only whoever holds a role -- what may be mutated, how a reviewer is
+         answered, who may weigh cost against verification. Those are meaningless to a
+         seat that cannot act.
+
+An abstract norm with no check does not change behaviour. If you cannot name the check,
+you are writing a slogan.
+
+---
+
+## 1. Do not write the comment before the code exists.
+
+A docstring or comment describing behaviour is a PROMISE. Landing it while the code
+still does the old thing ships that promise unkept, and every later reader inherits it
+as fact.
+
+ORDER: write the code, run it, then write the prose describing it.
+
+THE TRIGGER IS MULTI-EDIT WORK. A change needing three edits -- flag, plumbing,
+reporting -- invites the prose in edit 1 while the mechanism arrives in edits 2 and 3.
+In between, the file lies.
+
+THE SECOND TRIGGER IS ANSWERING A REVIEWER. When a reviewer flags a claim about
+BEHAVIOUR, the edit you make is the CODE. A prose-only reply to a behaviour flag is not
+a fix, it is a promise.
+
+CHECK, before submitting any edit: WHEN THIS EDIT LANDS, IS EVERY STATEMENT IN THIS FILE
+TRUE? Comments, docstrings, and every symbol the file references. If no, the edit is
+incomplete -- widen it. Removing or renaming a symbol takes its call sites in the SAME
+edit.
+
+## 2. Never name a symbol you have not verified exists.
+
+Writing `foo(...)`, `import bar`, or `obj.attr` from memory plants a latent crash in
+code you are about to hand someone.
+
+CHECK: before referencing a helper, constant, attribute or import you did not define in
+this same edit, grep for its definition. For a third-party import, confirm it resolves.
+A rename with a stale caller is this bug wearing a hat.
+
+## 3. Check that your instrument measured what you think it measured.
+
+The shell, the pipe, the redirect and the tool's own echo all sit between you and the
+fact.
+
+CHECK: before believing a measurement, ask what it would have printed IF YOU WERE WRONG.
+If the answer is "the same thing", you measured nothing.
+
+TRIM THE VOLUME, NEVER THE VERDICT. `| head`, `| tail`, `2>/dev/null` are reached for to
+keep output small and cut out the exact signal that separates right from wrong.
+  - Capture, then inspect: `out=$(cmd 2>&1); rc=$?` preserves both status and message.
+  - Never silence stderr on a probe whose FAILURE is one of the outcomes being measured.
+    With stderr gone, a syntax error, a missing permission and a missing tool are
+    indistinguishable from a clean negative result.
+  - A pipeline's `$?` is the LAST stage's. `false | tail -1` reports 0. When exit status
+    is what you care about, run the command WITHOUT a pipe.
+
+## 4. Prove new data actually ARRIVES at the far end.
+
+A parameter with a default lets code compile and run while un-updated callers deliver
+nothing. That failure is SILENT: nothing errors, it just does not happen.
+
+CHECK: never infer delivery from the fact that it type-checks. Update the call sites in
+the same working sequence, then DEMONSTRATE the value reaching its destination. A helper
+nothing calls is dead code, not a feature.
+
+## 5. Name the exact line your test executed.
+
+CHECK: before saying "verified end-to-end", answer which specific line of production code
+this ran. Reconstructing a code path in a harness is not executing it, and stubbing a
+layer that CONTAINS the logic under test means nothing was tested.
+
+## 6. State what a measurement does NOT establish.
+
+Evidence gets silently upgraded: a proxy becomes the real metric, one sample becomes
+"confirms", a reachable path becomes "this caused the failure".
+
+CHECK: when reporting a number, say in the same breath what it does not show. "The path
+existed" is not "the path fired". A clean 40/40 is strong evidence, not a guarantee.
+
+## 7. Sanity-check a search before you believe it.
+
+A substring classification is a hypothesis, not a count.
+
+CHECK: would an innocent explanation produce the same match? Do any rows contradict the
+label they got? Beware order-dependent if/elif chains -- overlapping categories are
+assigned by check order, so counts change if the checks are reordered.
+
+## 8. Your own output is not evidence. State the falsifier BEFORE running the check.
+
+Text you print, write, or reason your way to is not verification of itself. It
+circulates: a hypothesis lands in a log, a tool reads that log, and the echo returns
+looking like independent confirmation.
+
+CHECK, as a written step and not a memory: before running any check, write one line --
+"if I am wrong, this prints X." Then run it. If the output cannot distinguish right from
+wrong, THE CHECK IS VOID.
+
+Worked examples, each of which passes while proving nothing:
+  - a syntax-only compile check for an undefined name: it passes undefined names and
+    missing imports. Each instrument is blind to something; name which you used and what
+    it misses.
+  - `cmd | tail` then reading `$?`: reports tail's status.
+  - a probe with `2>/dev/null`: a tool that exists but rejects your syntax prints
+    nothing, exactly like a tool that is absent.
+
+## 9. Re-derive every summary sentence from the artifact. Recall is not evidence.
+
+The case most often missed is your RECALL of what you did a minute ago, in the same
+turn. The work is usually sound; the SENTENCE ABOUT the work is written from memory,
+which is why the defect never appears where you are looking for it.
+
+CHECK, before any sentence that COUNTS, SUMMARISES, or CLAIMS COVERAGE: do not write it
+from what you remember doing. Re-read the artifact and write the sentence FROM that. Any
+sentence asserting "all", "every", "only", "none", or a number is in this class.
+
+THE CHEAPEST TELL: "I have now answered/fixed/checked everything." Prefer naming what
+was done per item and letting the reader count.
+
+## 10. When you say you fixed something, fix it in the same breath.
+
+Never report a fix you have not made. Saying "I have narrowed that claim" when you have
+only said it, not done it, is a false report regardless of intent.
+
+## 11. Truncating to a byte cap: charge the header against the budget.
+
+Subtract any header or suffix from the budget BEFORE slicing. Slice the body to the cap
+and THEN prepend a header, and you overshoot by exactly the header's length.
+
+Slicing raw UTF-8 can sever a multi-byte character, whose replacement re-encodes LARGER
+than the bytes it replaced. With k orphan bytes left in the slice (1..3):
+  - maximal-subpart replacement: the k orphans become ONE U+FFFD, growth 3-k, worst +2.
+  - byte-by-byte replacement: k orphans become k U+FFFDs, growth 2k, worst +6.
+RESERVE 8. It covers both. Measuring one implementation does not refute a general bound.
+
+## 12. A kill is not done until the process TREE is dead.
+
+Killing a script's child and verifying that PID is gone is a void check for "the work
+stopped" -- the parent advances to its next line and launches the next job.
+
+CHECK: kill the parent or the group, then verify no descendant remains. A process search
+returning empty is itself a claim to verify when other instruments disagree.
+
+## 13. Point at the reproducible check; never ship a bare "Verified."
+
+"Verified", "checked", "confirmed" written into an artifact are claims about a past
+action a later reader cannot see. Even a live reviewer sees only a bounded evidence
+window, and the check that proved it may sit outside it.
+
+CHECK: replace the assertion with the POINTER -- the endpoint, the command, the file,
+plus the date -- so a reader can re-run it without trusting your past session.
+
+COROLLARY: when a claim keeps drawing precision flags across rephrasings, STOP
+REPHRASING. Delete the claim, or replace it with the reproducible pointer, in the edit
+where the flag lands. Another round of synonyms is not a fix.
+
+---
+
+## The loop that matters more than any rule above
+
+WHEN A FAILURE REPEATS, AMEND THIS FILE.
+
+Not for one-off mistakes -- for patterns: the same class of error, twice or more. Write
+it in the concrete behavioural form used above ("do X before Y"), never as a restatement
+of "be careful". Do it in the moment you notice it. If a rule here is wrong or has
+stopped mattering, delete it. This is a working instrument, not a monument.
+
+A rule that names an agent, a date, or an incident does not belong in this file. Put it
+in that model's overlay, and keep this layer true for anyone who reads it.

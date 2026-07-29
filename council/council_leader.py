@@ -692,7 +692,7 @@ def _assemble_leader_prompt(ground_rules: str, prior_handoff: str, task: str,
 
 
 async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
-                          ground_rules: str = "", prior_handoff: str = "",
+                          ground_rules: str | None = None, prior_handoff: str = "",
                           session_id: str = "", transcript_path: str = "",
                           max_rounds: int = LEADER_MAX_ROUNDS_PER_TURN,
                           call_leader=None, nonce_fn=None, review=_council_review,
@@ -712,7 +712,21 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
     response) is REFUSED whole -- none run -- and the problem is fed back. The loop is bounded
     by max_rounds. call_leader / nonce_fn / review / read / fetch / run_exec / apply_write are
     injectable test seams.
+
+    ground_rules is TRI-STATE, and the distinction is load-bearing because this is the one
+    seat that can mutate: None (the default) resolves this leader's own rules stack from the
+    registry via cc.stacked_rules -- the same files and the same fallback-misattribution
+    guard the member path uses -- while "" means DELIBERATELY none, and any other string is
+    used verbatim. The old default was "", so a caller that merely forgot the argument
+    seated a leader with no rules and nothing said so.
     """
+    # PARITY WITH THE MEMBER PATH. The old default was "" -- a caller that simply did
+    # not pass ground_rules seated a leader with NO rules at all, silently, and the
+    # leader is the one seat that can MUTATE. None now means "resolve them for this
+    # leader from the registry", the same files and the same fallback guard the member
+    # path uses; "" remains available and still means "deliberately none".
+    if ground_rules is None:
+        ground_rules = cc.stacked_rules(leader)
     call_leader = call_leader or cc._call_leader
     nonce_fn = nonce_fn or (lambda: secrets.token_hex(8))
     rounds: list = []
