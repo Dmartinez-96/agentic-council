@@ -1405,6 +1405,84 @@ STANDING_RULES_PATH = (Path(_env_standing_rules).expanduser() if _env_standing_r
 STANDING_RULES_MAX_BYTES = 20_000
 
 
+# --- The agent-agnostic rules stack: BASE + model overlay + role overlay ---
+#
+# STATUS: THIS RESOLVER IS NOT YET WIRED INTO PROMPT ASSEMBLY. It resolves the files
+# and nothing calls it; build_prompt still delivers format_standing_rules() alone. The
+# placement described below is the DESIGN, not current behaviour, and this note comes
+# out in the edit that wires it.
+#
+# BASE (council_ground_rules.md) is universal: work properties with discriminating
+# checks, no agent named, no dates, no incident narration. It is identical for every
+# seat and every fire, which is what will let it sit in the cacheable leading prefix.
+# OVERLAYS carry what is NOT universal -- a model's accrued failure history, and the
+# authority bounds of a role -- and belong AFTER the evidence, because a reader that
+# meets an agent's account of its own defects before it meets a fact has been framed
+# (the de-anchoring rule recorded in build_prompt's docstring).
+#
+# ROLE KEYING, and a live gap worth stating rather than discovering later: the role key
+# is `member.tier`, which for every seat in the members list is "voting" or
+# "inspector" -- VALID_TIERS admits nothing else. A LEADER record carries tier=LEADER
+# and lives in roster.json's own top-level `leader` key, so overlays/roles/leader.md is
+# reachable ONLY through a leader Member, which no caller constructs here yet. Until
+# the leader path is wired, that file resolves for nobody.
+GROUND_RULES_PATH = COUNCIL_ROOT / "council_ground_rules.md"
+OVERLAY_ROOT = COUNCIL_ROOT / "overlays"
+
+
+def _read_optional(path: Path) -> str:
+    """File text, or "" if it is absent or unreadable. Absence is the normal case:
+    most models have no accrued overlay and most tiers have no role rules."""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _overlay_path(kind: str, key: str) -> Path | None:
+    """OVERLAY_ROOT/<kind>/<key>.md, or None if <key> escapes the overlay root.
+
+    The key is a MODEL SLUG or TIER that can come from roster.json, so containment is
+    checked rather than assumed: a slug like "../../.ssh/id_rsa" would otherwise read
+    outside the tree and paste it into twelve prompts. Slugs legitimately contain a
+    "/" (z-ai/glm-5.2), so they nest, and the check must therefore allow depth while
+    forbidding escape. `is_relative_to` on the RESOLVED path is used rather than a
+    string prefix test, because a sibling whose name merely extends the root defeats a
+    prefix test -- a real defect measured in this project's brain validator on
+    2026-07-26, where it returned PASS for a file outside the vault.
+    """
+    if not key:
+        return None
+    root = (OVERLAY_ROOT / kind).resolve()
+    candidate = (root / f"{key}.md").resolve()
+    return candidate if candidate.is_relative_to(root) else None
+
+
+def resolve_rules(member: Member) -> tuple[str, str]:
+    """(base, overlay) for one member.
+
+    base    -> the universal ground rules, for the cacheable prefix.
+    overlay -> this MODEL's accrued history plus this ROLE's authority bounds, joined,
+               for delivery after the evidence. "" when the seat has neither.
+
+    KEYED ON THE EXACT MODEL SLUG, never the seat name and never the family. A seat is
+    a mutable pointer: re-point it at another slug and a seat-keyed overlay would hand
+    one model another's history, which is the misattribution this split exists to
+    remove. Family fallback is deliberately ABSENT -- whether failure modes generalise
+    within a family is UNMEASURED, so a sibling gets no overlay rather than a borrowed
+    one. A family file may be introduced later only as an explicit human opt-in that
+    says in-band that it is family-level.
+    """
+    parts = []
+    model_overlay = _overlay_path("models", member.model)
+    if model_overlay is not None:
+        parts.append(_read_optional(model_overlay))
+    role_overlay = _overlay_path("roles", member.tier)
+    if role_overlay is not None:
+        parts.append(_read_optional(role_overlay))
+    return _read_optional(GROUND_RULES_PATH), "\n\n---\n\n".join(p for p in parts if p)
+
+
 def format_standing_rules(path: Path = STANDING_RULES_PATH) -> str:
     """The standing-rules file, for members to check compliance against.
 
