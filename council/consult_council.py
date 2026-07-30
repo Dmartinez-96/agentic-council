@@ -2432,9 +2432,10 @@ def _cache_accounting(data: dict) -> dict:
 
 # Model-slug prefixes that send an explicit cache breakpoint. Each is here for a
 # stated reason, because the source does NOT support one blanket rule:
-#  - anthropic/, qwen/ : openrouter.ai/docs/features/prompt-caching (fetched
-#    2026-07-28) lists Anthropic and Alibaba Qwen under providers requiring explicit
-#    cache_control, and says both allow up to four breakpoints per request.
+#  - anthropic/ : openrouter.ai/docs/features/prompt-caching (fetched 2026-07-28)
+#    lists Anthropic under providers requiring explicit cache_control, and says it
+#    allows up to four breakpoints per request. No seat on the default roster runs an
+#    anthropic/ slug today, so this entry is currently unexercised.
 # google/ WAS HERE AND WAS REMOVED THE SAME DAY, BY MEASUREMENT. It was added because
 # gemini logged cached_tokens 0 on the first fires sampled; a wider sample refuted that.
 # The full multiset over 13 pre-change fires was [0 x7, 8187 x2, 57313, 57314, 57315,
@@ -2451,10 +2452,67 @@ def _cache_accounting(data: dict) -> dict:
 # breakpoints, and glm and deepseek already cache 86.5% and 54.2% of their prompt
 # tokens under the plain-string shape (measured 2026-07-28), which is not worth
 # risking on a shape change the page never documents as neutral for them.
-# qwen/ IS RETAINED ON THE DOC, NOT ON A RESULT: OpenRouter lists Alibaba as requiring
-# explicit cache_control, and the breakpoint is delivered (test_cache_control.py), but
-# qwen logged cached_tokens 0 on all 19 fires sampled 2026-07-28 -- 13 without the
-# breakpoint and 6 with it. It has bought nothing measurable so far.
+# qwen/ WAS REMOVED 2026-07-29 AND RESTORED 2026-07-30, BOTH TIMES ON MEASUREMENT. The
+# removal history below is kept because it is the reason the entry is trustworthy now:
+# it went in on the doc, cost 22.8% per call for nothing, came out, and only came back
+# once a probe showed the fixed shape actually reads a cache back. What changed is NOT
+# this tuple -- it is the MESSAGE SHAPE. _messages_for now gives an explicit-breakpoint
+# seat its stable prefix as a SYSTEM message with the marker at that message's end, which
+# is the boundary Alibaba's message-level granularity can act on. Measured on the real
+# API (_nogit/probe_qwen_cache.py --test-c, 2026-07-30): a cold call wrote 7,803 tokens
+# (55.7% of the prompt -- bounded at the message boundary, not the prompt end) and the
+# next call, WITH A DIFFERENT TAIL, read all 7,803 back; cost 0.02721 -> 0.01330.
+# A read with a changed tail is the production condition that never once worked before.
+# NOTE AGAINST THE DOC, deliberately: OpenRouter's caching page lists qwen3-max /
+# qwen-plus / qwen3.6-plus as the Alibaba slugs supporting explicit caching and does not
+# mention qwen3.7 at all. This entry rests on the measurement above, not on that page.
+# THE ORIGINAL REMOVAL, retained:
+# It went in on the doc alone (OpenRouter lists Alibaba as requiring explicit
+# cache_control) and the breakpoint was genuinely delivered -- test_cache_control.py
+# proves it on the wire. What the doc did not say is what it would COST here.
+# MEASURED over every log carrying the field. RE-DERIVE by walking the `shadow` and
+# `members` lists of logs/*/*.json in python and selecting records whose model_used is
+# "qwen/qwen3.7-max" -- a plain grep will NOT reproduce these numbers, because the
+# figures come from parsed per-member usage dicts rather than from matching lines.
+# 229 records carry cache_write_tokens, NONZERO on 211,
+# median 57,356 written -- and cached_tokens > 0 on ZERO of them. It paid the write
+# premium and never collected. A controlled probe then priced it, three fires per
+# condition with non-repeating evidence so nothing could ever hit, prompt_tokens
+# identical at 15,601 in both:
+#     breakpoint ON  -> median cost 0.03010 credits, 15,595 tokens written
+#     breakpoint OFF -> median cost 0.02452 credits, 0 tokens written
+# +22.8% per call for nothing; the bands do not overlap (ON 0.0295-0.0301, OFF
+# 0.0242-0.0248). n=3 per condition, one model, one session.
+# WHY, and this is documented rather than inferred. `prompt_tokens - cache_write_tokens`
+# is EXACTLY 6 on all 211 fires -- a single-valued set, not a spread. Alibaba's context-
+# cache FAQ (alibabacloud.com/help/en/model-studio/context-cache, fetched 2026-07-29)
+# says the backend appends a few tokens that "are placed AFTER the cache_control marker",
+# so a constant 6-token tail means the marker took effect at the END of the prompt, not
+# at the end of content part 0 where this code puts it. Their explicit-cache guide gives
+# the reason: "Qwen3.5 and later models only support MESSAGE-LEVEL cache breakpoints.
+# Placing multiple cache_control markers within a single message's content array does not
+# create separate breakpoints -- the system only stores cache at the last marker position
+# within that message." This harness sends ONE user message, so the whole message -- the
+# per-fire evidence included -- became the cache block, and a block containing per-fire
+# content can never match a later fire.
+# THE COST MECHANISM is the CREATION PREMIUM ALONE: Alibaba bills explicit cache creation
+# at 125% of input against implicit's 100%, so a block that is written every fire and read
+# on none costs 25% extra for nothing. That is the +22.8%.
+# WHAT IT IS NOT, checked rather than assumed because the tempting story is wrong: this is
+# NOT "the breakpoint displaced a working automatic cache". The docs do say explicit and
+# implicit are "mutually exclusive" and that implicit "cannot be disabled" otherwise, which
+# invites that reading -- but the measurement refutes it. Of the 20 logged qwen fires that
+# sent NO breakpoint, exactly ONE ever reported cached_tokens > 0. There was no working
+# automatic cache here to displace.
+# ALSO NOTED: OpenRouter's own caching page lists qwen3-max / qwen-plus / qwen3.6-plus as
+# the Alibaba slugs supporting explicit caching; the string "qwen3.7" does not appear on
+# it at all. The seat's slug was never on their list.
+# TO RE-ENABLE IT PROPERLY one day: the fix is not this tuple, it is the MESSAGE SHAPE --
+# the stable prefix would have to be its own message with the marker at that message's
+# end. That is a build_prompt change and it is unbuilt.
+# THE LESSON, and it is google/'s lesson repeated: a provider listed as needing explicit
+# cache_control is a reason to TRY it, never a result. Both entries added on the doc were
+# later removed on measurement.
 CACHE_CONTROL_MODEL_PREFIXES = ("anthropic/", "qwen/")
 
 
@@ -2499,6 +2557,61 @@ def _message_content(prompt: str, cache_prefix: str):
     ]
 
 
+def _messages_for(prompt: str, cache_prefix: str, explicit: bool) -> list[dict]:
+    """The full `messages` array for one OpenRouter call.
+
+    Two shapes, and which one is used is decided by the PROVIDER, not by taste:
+
+      AUTOMATIC providers      -> one user message carrying the whole prompt as a string.
+                                  Unchanged, and deliberately so: measured over 825 fires
+                                  (_nogit/ab_prompt_cache.py, 2026-07-29), EIGHT of the
+                                  eleven seats cache 8,186-8,944 tokens of the leading
+                                  span under this shape. The other three do not: grok and
+                                  minimax cached 128 in that arm and qwen cached 0. So
+                                  this is not a universal "it already works", it is "it
+                                  works for most, and changing it for them is
+                                  unmeasured".
+      EXPLICIT-BREAKPOINT      -> the stable prefix becomes its OWN system message with
+      providers                   the marker at that message's end, and the varying tail
+                                  becomes the user message.
+
+    WHY THE SECOND SHAPE EXISTS, measured rather than assumed. Alibaba documents that
+    Qwen3.5+ resolve cache breakpoints at MESSAGE granularity: a marker inside a single
+    message's content array does not bound a block before that message ends. With
+    everything in one user message the only boundary available is the end of the whole
+    prompt, so the block written always contained that fire's varying tail and could
+    never match a later request. In production this cost real money and returned nothing:
+    211 cache writes, zero reads.
+    THREE PROBES SETTLED IT (`_nogit/probe_qwen_cache.py`, 2026-07-30):
+      A  OpenRouter forwards the marker exactly where we put it -- message 0, part 0 --
+         which is CONSISTENT with the promotion happening Alibaba-side and inconsistent
+         with OpenRouter relocating it. Not proof: that output is OpenRouter's own
+         self-report of its transformed body at an unspecified pipeline stage, not a
+         packet capture of what Alibaba received.
+      B  A byte-identical repeat DOES read back (7,910 tokens, cost 0.01657 -> 0.00363),
+         so nothing upstream prevents reads on this route.
+      C  This shape, fired twice with a DIFFERENT tail, wrote 7,803 tokens (55.7% of the
+         prompt -- bounded at the message boundary, not the prompt end) and READ THEM
+         BACK on the second call: cost 0.02721 -> 0.01330.
+    C is the one that matters: a read with a CHANGED tail is the production condition
+    that never once worked before.
+
+    THE INVARIANT IS UNCHANGED AND STILL LOAD-BEARING: concatenating the text of every
+    message reproduces `prompt` byte for byte. The split is delegated to
+    _message_content, so its safety fallbacks come along -- an empty prefix, a prompt
+    that does not start with it, or an empty remainder all fall back to the single plain
+    user message. The failure mode stays "no breakpoint", never "altered prompt".
+    """
+    if not explicit:
+        return [{"role": "user", "content": prompt}]
+    parts = _message_content(prompt, cache_prefix)
+    if not isinstance(parts, list):
+        return [{"role": "user", "content": prompt}]
+    head, tail = parts[0], parts[1]
+    return [{"role": "system", "content": [head]},
+            {"role": "user", "content": [tail]}]
+
+
 def _openrouter_call_blocking(role: str, models: list[str], prompt: str,
                               cache_prefix: str = "") -> dict:
     """Blocking OpenAI-compatible POST to OpenRouter. Same result shape as
@@ -2523,11 +2636,10 @@ def _openrouter_call_blocking(role: str, models: list[str], prompt: str,
     if not api_key:
         return fail(f"{OPENROUTER_KEY_ENV} not set in environment")
 
-    content = (_message_content(prompt, cache_prefix)
-               if _needs_explicit_cache_control(models) else prompt)
     body = json.dumps({
         "models": models,          # [primary, fallback] -> automatic model failover
-        "messages": [{"role": "user", "content": content}],
+        "messages": _messages_for(prompt, cache_prefix,
+                                  _needs_explicit_cache_control(models)),
         "stream": False,
         "reasoning": {"effort": openrouter_effort()},
     }).encode("utf-8")
