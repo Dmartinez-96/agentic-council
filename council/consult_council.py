@@ -2516,6 +2516,34 @@ def _cache_accounting(data: dict) -> dict:
 CACHE_CONTROL_MODEL_PREFIXES = ("anthropic/", "qwen/")
 
 
+# Of the explicit-breakpoint slugs above, the ones that ALSO need the stable prefix moved
+# into its own MESSAGE. This is a strictly narrower set, and the distinction is the whole
+# reason the two constants exist rather than one.
+#   ALIBABA/QWEN needs it: their explicit-cache guide says Qwen3.5+ resolve breakpoints at
+#     MESSAGE granularity, so a marker inside one message cannot bound a block before that
+#     message ends. Measured: pre-split, 211 writes of essentially the whole prompt and
+#     zero reads; post-split, a block bounded at 55.7% of the prompt and read back on a
+#     call with a different tail (_nogit/probe_qwen_cache.py --test-c, 2026-07-30).
+#   ANTHROPIC does NOT: its cache_control is documented as acting on content BLOCKS within
+#     a message, so the single-user-message shape already marks the boundary correctly.
+# An earlier version of this change applied the split to every explicit seat and therefore
+# altered Anthropic's wire shape on the strength of qwen-only probes. Six voting members
+# flagged it. No anthropic slug sits on the default roster, so nothing was measured either
+# way -- which is the reason to leave that path alone, not evidence that changing it was
+# safe. If an anthropic seat is ever added, probe it before assuming either shape.
+MESSAGE_SPLIT_MODEL_PREFIXES = ("qwen/",)
+
+
+def _needs_message_split(models: list[str]) -> bool:
+    """True when ANY candidate slug needs the prefix in its own message.
+
+    ANY rather than the primary alone, matching _needs_explicit_cache_control: `models`
+    is [primary, fallback] and OpenRouter may answer with either.
+    """
+    return any(isinstance(m, str) and m.startswith(MESSAGE_SPLIT_MODEL_PREFIXES)
+               for m in models)
+
+
 def _needs_explicit_cache_control(models: list[str]) -> bool:
     """True when ANY candidate slug belongs to an explicit-breakpoint provider.
 
@@ -2557,7 +2585,8 @@ def _message_content(prompt: str, cache_prefix: str):
     ]
 
 
-def _messages_for(prompt: str, cache_prefix: str, explicit: bool) -> list[dict]:
+def _messages_for(prompt: str, cache_prefix: str, explicit: bool,
+                  split: bool) -> list[dict]:
     """The full `messages` array for one OpenRouter call.
 
     Two shapes, and which one is used is decided by the PROVIDER, not by taste:
@@ -2607,6 +2636,17 @@ def _messages_for(prompt: str, cache_prefix: str, explicit: bool) -> list[dict]:
     parts = _message_content(prompt, cache_prefix)
     if not isinstance(parts, list):
         return [{"role": "user", "content": prompt}]
+    if not split:
+        # CONTENT-BLOCK granularity is enough here, so do NOT reshape the messages.
+        # This is the Anthropic case: its cache_control is documented as operating on
+        # content blocks WITHIN a message, so the single-user-message shape already
+        # marks the boundary correctly and the split would be an unmeasured change to a
+        # path that was not broken. An earlier version of this function applied the
+        # split to every explicit seat, which silently altered Anthropic's wire shape on
+        # the strength of qwen-only probes -- the council caught it. No anthropic slug
+        # is on the default roster, so nothing was measured either way; that is the
+        # reason to leave it alone, not a reason it was safe.
+        return [{"role": "user", "content": parts}]
     head, tail = parts[0], parts[1]
     return [{"role": "system", "content": [head]},
             {"role": "user", "content": [tail]}]
@@ -2639,7 +2679,8 @@ def _openrouter_call_blocking(role: str, models: list[str], prompt: str,
     body = json.dumps({
         "models": models,          # [primary, fallback] -> automatic model failover
         "messages": _messages_for(prompt, cache_prefix,
-                                  _needs_explicit_cache_control(models)),
+                                  _needs_explicit_cache_control(models),
+                                  _needs_message_split(models)),
         "stream": False,
         "reasoning": {"effort": openrouter_effort()},
     }).encode("utf-8")
