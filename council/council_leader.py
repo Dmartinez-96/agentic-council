@@ -409,23 +409,42 @@ def _first_line_verdict(stdout: str) -> str | None:
 
 def review_and_write(leader: "cc.Member", rel_path: str, content: str,
                      workdir: Path, *, session_id: str = "",
-                     transcript_path: str = "", review=_council_review) -> dict:
+                     transcript_path: str = "", review=_council_review,
+                     approve=None) -> dict:
     """The applier-wall: the mutation path a leader driver routes writes through.
 
     Order (pre-emptive wall): enforce the caller is a mutate-capable LEADER -> bound
     content size -> jail the path -> review the PROPOSED content with the council ->
-    write ONLY on a PASS or WARN first-line verdict consistent with the rc. A BLOCK
-    never touches the target; a jail denial never touches the target; a review with no
-    parseable/consistent verdict (crash, timeout, launch failure) FAILS CLOSED and
-    never touches the target.
+    OPTIONALLY ask `approve` -> write ONLY on a PASS or WARN first-line verdict
+    consistent with the rc. A BLOCK never touches the target; a jail denial never
+    touches the target; a review with no parseable/consistent verdict (crash, timeout,
+    launch failure) FAILS CLOSED and never touches the target.
 
     `review` is an INJECTABLE TEST SEAM so the applier logic can be exercised without
     live model calls; it defaults to the real consult_council subprocess. A caller that
     injects a permissive `review` is bypassing the council -- but such a caller is
     in-process trusted code that could bypass this module entirely, so this seam widens
     no boundary a real leader driver relies on. Returns a result dict with `applied`
-    (bool), `verdict` (PASS|WARN|BLOCK|DENIED|ERROR), a `reason`/`review`, and the
-    resolved `target`.
+    (bool), `verdict` (PASS|WARN|BLOCK|DENIED|DECLINED|ERROR), a `reason`/`review`, and
+    the resolved `target`.
+
+    `approve` EXISTS BECAUSE THERE WAS NO SEAM BETWEEN VERDICT AND WRITE. `_atomic_write`
+    fires inside this call immediately after the verdict check, so by the time any caller
+    regained control the write had already landed -- an "approve each write" permission
+    mode (issue #8) was therefore not implementable as a UI feature on top of this
+    function, only as a change to it. codex identified this during the issue-#3 design
+    thread, before any GUI code existed.
+
+    WHAT IT IS, precisely: `approve(target, content, verdict, review_text) -> bool`, an
+    ADDITIONAL gate, never a substitute. It is consulted ONLY on the PASS/WARN path, i.e.
+    only after the council has ALREADY allowed the write, so it can only ever REFUSE a
+    write the council permitted -- every DENIED/BLOCK/ERROR branch returns before it and
+    cannot be reached, let alone overridden. Declining yields verdict "DECLINED", which is
+    deliberately NOT "BLOCK": a human choosing not to apply a permitted write and the
+    council refusing one are different events, and any log or metric grouping by verdict
+    must be able to tell them apart. `approve=None` (the default) reproduces the previous
+    behaviour exactly. If `approve` RAISES, the write is refused -- the gate fails closed
+    like every other branch here, because an approver that crashed did not approve.
     """
     if (not isinstance(leader, cc.Member) or leader.tier != cc.LEADER
             or cc.MUTATE not in leader.capabilities):
@@ -454,6 +473,21 @@ def review_and_write(leader: "cc.Member", rel_path: str, content: str,
     if verdict == "BLOCK":
         return {"applied": False, "verdict": "BLOCK", "target": str(target),
                 "review": out}
+    # THE OPERATOR GATE. Reached only on PASS/WARN -- every refusal branch above has
+    # already returned -- so this can subtract permission, never add it. An approver that
+    # RAISES is treated as a refusal: it did not approve, and guessing otherwise would
+    # turn a crashed UI into an automatic yes.
+    if approve is not None:
+        try:
+            ok = approve(target, content, verdict, out)
+        except Exception as e:                        # noqa: BLE001 -- fail closed
+            return {"applied": False, "verdict": "DECLINED", "target": str(target),
+                    "reason": f"approver raised ({type(e).__name__}: {e}); fail-closed",
+                    "review": out}
+        if not ok:
+            return {"applied": False, "verdict": "DECLINED", "target": str(target),
+                    "reason": "operator declined a write the council permitted",
+                    "review": out}
     _atomic_write(target, content)
     return {"applied": True, "verdict": verdict, "target": str(target),
             "review": out}

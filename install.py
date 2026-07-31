@@ -64,6 +64,18 @@ STATE_DIR = CLAUDE_HOME / "state"
 
 COUNCIL_FILES = [
     "consult_council.py",
+    # consult_council imports this at module scope, so an install that omits it raises
+    # ModuleNotFoundError on every fire -- it is a hard dependency, not an optional extra.
+    "council_events.py",
+    # Terminal renderer for the progress stream. Standalone (nothing imports it), so an
+    # install without it loses the live view but still fires normally.
+    "council_watch.py",
+    # The standalone GUI. council_gui.py is the only file importing PySide6, and nothing
+    # imports IT, so a user who never opens the GUI needs no extra dependency and the
+    # engine's zero-PyPI-dependency install is preserved.
+    "council_gui.py",
+    "council_gui_engine.py",
+    "council_leader_run.py",
     "council_leader.py",
     "council_advisor.py",
     "council_dialogue.py",

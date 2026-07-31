@@ -47,6 +47,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Sibling module, installed alongside this one (see the council-root note below). Carries
+# the optional --events-fd progress stream; inert when no fd is supplied.
+import council_events
+
 # All council scripts are installed side by side in one directory, so a
 # script's own directory is the council root. Deriving it here (rather
 # than hardcoding an absolute path) is what lets the package install
@@ -5289,6 +5293,13 @@ async def main() -> int:
                              "consulting anyone. Lets an external tool read the "
                              "engine's own verdict on roster.json instead of "
                              "duplicating the validation logic.")
+    parser.add_argument("--events-fd", type=int, default=None, metavar="N",
+                        help="Write NDJSON progress records to already-open file "
+                             "descriptor N as each seat lands, instead of only at "
+                             "exit. STDOUT IS UNCHANGED -- the hook, the VS Code "
+                             "extension and council_leader all parse it, so events "
+                             "never go there. Omit for the historic behaviour: no "
+                             "events at all. See council_events.py.")
     args = parser.parse_args()
 
     if args.print_roster:
@@ -5403,14 +5414,51 @@ async def main() -> int:
     shadow_enabled = bool(os.environ.get(OPENROUTER_KEY_ENV)) and not NO_SHADOW_PATH.exists()
     shadow_roles = list(SHADOW_MEMBERS) if shadow_enabled else []
 
+    # LIVE PROGRESS. Inert unless --events-fd was given, so the historic behaviour (one
+    # burst of output at exit) is byte-for-byte unchanged for every existing caller. The
+    # emitter takes THIS module's redactor, so a member's REQUEST_* argument is stripped
+    # on the way out exactly as it is for the peer broadcast and logs/ -- the stream is a
+    # third sink for the same text, not an exemption from the rule.
+    events = council_events.emitter_from_fd(args.events_fd, _redact_request_lines)
+    if args.events_fd is not None and not events.active:
+        print(f"council: --events-fd {args.events_fd} unusable "
+              f"({events.disabled_reason}); continuing without progress events",
+              file=sys.stderr)
+    events.emit("run_started", layer=args.layer, tool_name=args.tool_name,
+                target_path=args.target_path, voting=list(members),
+                inspectors=list(shadow_roles), fast_mode=FAST_PATH.exists())
+
+    async def _seat(name: str, tier: str, rnd: int, coro):
+        """Report a seat as it starts and as it lands, without changing what it returns.
+
+        asyncio.gather preserves INPUT order regardless of completion order, and this
+        wrapper returns the awaited value untouched, so aggregation downstream is
+        unaffected. Only the reporting is new -- the round barriers still hold, because
+        round 2 genuinely needs every peer's round 1.
+        """
+        events.emit("member_started", member=name, tier=tier, round=rnd)
+        res = await coro
+        if isinstance(res, dict):
+            events.emit("member_finished", member=name, tier=tier, round=rnd,
+                        verdict=res.get("verdict"), duration_s=res.get("duration_s"),
+                        model_used=res.get("model_used"), cost=res.get("cost"),
+                        prompt_tokens=res.get("prompt_tokens"),
+                        completion_tokens=res.get("completion_tokens"))
+        return res
+
     # Round 1: each member sees the proposal independently and emits
     # an initial verdict.
+    events.emit("round_started", round=1)
     round1_results = await asyncio.gather(*[
-        MEMBER_RUNNERS[m](pitch, system_prompt, member_cwd,
-                          evidence_block, user_directives_block,
-                          "", assistant_block, standing_rules_block)
+        _seat(m, "voting", 1,
+              MEMBER_RUNNERS[m](pitch, system_prompt, member_cwd,
+                                evidence_block, user_directives_block,
+                                "", assistant_block, standing_rules_block))
         for m in members
     ]) if members else []
+    events.emit("round_finished", round=1,
+                verdicts={r.get("role"): r.get("verdict") for r in round1_results
+                          if isinstance(r, dict)})
 
     # MEDIATED VERIFICATION TOOLING, phase 1 (round 1 -> round 2): parse round-1
     # REQUEST_FILE / REQUEST_URL / REQUEST_EXEC lines from capability-holding members;
@@ -5461,15 +5509,28 @@ async def main() -> int:
     # block. Final aggregation uses round-2. Skip the round below two members.
     if len(round1_results) >= 2:
         round1_block = format_round1_block(redacted_round1)
+        events.emit("round_started", round=2)
         builtin_results = await asyncio.gather(*[
-            MEMBER_RUNNERS[m](pitch, system_prompt, member_cwd,
-                              evidence_block, user_directives_block,
-                              round1_block + _delivery_for(m),
-                              assistant_block, standing_rules_block)
+            _seat(m, "voting", 2,
+                  MEMBER_RUNNERS[m](pitch, system_prompt, member_cwd,
+                                    evidence_block, user_directives_block,
+                                    round1_block + _delivery_for(m),
+                                    assistant_block, standing_rules_block))
             for m in members
         ])
+        events.emit("round_finished", round=2,
+                    verdicts={r.get("role"): r.get("verdict") for r in builtin_results
+                              if isinstance(r, dict)})
     else:
         builtin_results = round1_results
+
+    # Tool grants, reported WITHOUT the argument. The GUI shows that a seat reached for a
+    # file/url/command and whether the harness allowed it; the argument itself stays in
+    # the requester's private delivery block, exactly as it does for peers and logs/.
+    for _kind, _log in (("file", retrieval_log), ("url", web_log), ("exec", exec_log)):
+        for _req in (_log or {}).get("requests", []) or []:
+            events.emit("tool_request", member=_req.get("member"), kind=_kind,
+                        granted=bool(_req.get("granted")))
 
     # One formatting-only retry for any member whose verdict line did not
     # parse, so a member that HAD a position does not lose its vote to a stray
@@ -5477,8 +5538,24 @@ async def main() -> int:
     # removed -- the retry spawns a member in that directory, and gemini caught
     # that the rmtree used to sit above this point and would have deleted the
     # cwd out from under it.
+    _pre_retry = {r.get("role"): r.get("verdict") for r in builtin_results
+                  if isinstance(r, dict)}
     builtin_results = await reformat_unparseable(list(builtin_results),
                                                  member_cwd)
+
+    # A SEAT'S VERDICT CAN CHANGE AFTER IT WAS ALREADY REPORTED LIVE. `member_finished`
+    # fires inside the gather, but the formatting retry above runs afterwards, so a seat
+    # streamed as UNPARSEABLE may end up counted as PASS. Without this the GUI would
+    # display a verdict the council did not aggregate -- a display that disagrees with the
+    # record is worse than a slow one. Only genuine changes are emitted.
+    for _r in builtin_results:
+        if not isinstance(_r, dict):
+            continue
+        _role, _now = _r.get("role"), _r.get("verdict")
+        if _role in _pre_retry and _pre_retry[_role] != _now:
+            events.emit("member_corrected", member=_role, tier="voting",
+                        was=_pre_retry[_role], verdict=_now,
+                        why="formatting retry re-parsed the verdict line")
 
     all_results = list(builtin_results) + external
     final_verdict = determine_final_verdict(all_results)
@@ -5508,12 +5585,17 @@ async def main() -> int:
         insp = [m for m in inspector_members() if m.name in shadow_roles]
         # PASS 1: each inspector inspects the conclusion and MAY emit REQUEST_* lines
         # (the same request channel the voting members use in round 1).
+        events.emit("round_started", round=3)
         pass1 = list(await asyncio.gather(*[
-            run_member(m, pitch, layer2_prompt, member_cwd, evidence_block,
-                       user_directives_block, "", assistant_block,
-                       standing_rules_block, conclusion_block)
+            _seat(m.name, "inspector", 3,
+                  run_member(m, pitch, layer2_prompt, member_cwd, evidence_block,
+                             user_directives_block, "", assistant_block,
+                             standing_rules_block, conclusion_block))
             for m in insp
         ]))
+        events.emit("round_finished", round=3,
+                    verdicts={r.get("role"): r.get("verdict") for r in pass1
+                              if isinstance(r, dict)})
         # The harness executes any requests and delivers to that inspector ALONE in a
         # PASS-2 re-inspection -- the inspector analogue of the voting members' round-1 ->
         # round-2 leg. collect_* are generic (keyed on the registry record's capabilities),
@@ -5528,14 +5610,23 @@ async def main() -> int:
 
         requesters = {m.name: _idel(m.name) for m in insp if _idel(m.name)}
         if requesters:
+            # PASS 2 is round 4 in the stream: only the inspectors that actually requested
+            # something re-run, so a consumer sees a SUBSET of seats report again rather
+            # than the whole tier. That asymmetry is the leg's real shape, not a gap.
+            events.emit("round_started", round=4)
             pass2 = list(await asyncio.gather(*[
-                run_member(m, pitch, layer2_prompt, member_cwd, evidence_block,
-                           user_directives_block, requesters[m.name], assistant_block,
-                           standing_rules_block, conclusion_block)
+                _seat(m.name, "inspector", 4,
+                      run_member(m, pitch, layer2_prompt, member_cwd, evidence_block,
+                                 user_directives_block, requesters[m.name],
+                                 assistant_block, standing_rules_block,
+                                 conclusion_block))
                 for m in insp if m.name in requesters
             ]))
             final = {r.get("role"): r for r in pass2}
             shadow_results = [final.get(r.get("role"), r) for r in pass1]
+            events.emit("round_finished", round=4,
+                        verdicts={r.get("role"): r.get("verdict") for r in pass2
+                                  if isinstance(r, dict)})
         else:
             shadow_results = pass1
         # THE SAME FORMATTING RETRY THE VOTING LEG GETS. Without this an inspector
@@ -5554,7 +5645,20 @@ async def main() -> int:
         # matters for any measurement OF THE INSPECTOR TIER -- its flag rates, its
         # agreement with the voting leg, its apparent reliability -- and not for the
         # voting-leg figures quoted above, which were produced without this path.
+        _insp_pre = {r.get("role"): r.get("verdict") for r in shadow_results
+                     if isinstance(r, dict)}
         shadow_results = await reformat_unparseable(list(shadow_results), member_cwd)
+        # The inspector leg needs the SAME correction notice the voting leg got: this
+        # retry runs after member_finished was already streamed, so without it a consumer
+        # would keep displaying an UNPARSEABLE that the record no longer says.
+        for _r in shadow_results:
+            if not isinstance(_r, dict):
+                continue
+            _role, _now = _r.get("role"), _r.get("verdict")
+            if _role in _insp_pre and _insp_pre[_role] != _now:
+                events.emit("member_corrected", member=_role, tier="inspector",
+                            was=_insp_pre[_role], verdict=_now,
+                            why="formatting retry re-parsed the verdict line")
     # member_cwd is the layer-1 subprocess workdir; it is cleaned up here, AFTER
     # both layers have run, so a non-HTTP inspector (were one configured on a
     # subprocess transport) could still use it.
@@ -5567,6 +5671,17 @@ async def main() -> int:
                                          for r in shadow_results],
                          retrieval=retrieval_log, web=web_log, exec_=exec_log,
                          shadow_tooling=shadow_tooling_log)
+    # The closing record, emitted before emit_output so a consumer watching the stream
+    # gets the outcome without parsing stdout, plus the log path so it can open the full
+    # record rather than reconstruct it. BEST EFFORT, not a guarantee: the emitter is
+    # inert without --events-fd and drops records when a consumer falls far enough behind,
+    # so a consumer that sees no final_verdict must treat the run as UNKNOWN, not as
+    # still-running. `events_dropped` reads dropped_TOTAL, the lifetime figure -- the
+    # `dropped` field is arrears that reset once confessed and would report 0 after real
+    # loss. `events_emitted` is the count BEFORE this record, which is not itself counted.
+    events.emit("final_verdict", verdict=final_verdict, log_path=str(log_path),
+                events_emitted=events.count, events_dropped=events.dropped_total)
+
     emit_output(all_results, final_verdict, log_path, shadow_results)
 
     return {"PASS": 0, "WARN": 1, "BLOCK": 2}.get(final_verdict, 3)
