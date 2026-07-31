@@ -2519,16 +2519,39 @@ CACHE_CONTROL_MODEL_PREFIXES = ("anthropic/", "qwen/")
 # Of the explicit-breakpoint slugs above, the ones that ALSO need the stable prefix moved
 # into its own MESSAGE. This is a strictly narrower set, and the distinction is the whole
 # reason the two constants exist rather than one.
-#   ALIBABA/QWEN needs it: their explicit-cache guide says Qwen3.5+ resolve breakpoints at
-#     MESSAGE granularity, so a marker inside one message cannot bound a block before that
-#     message ends. Measured: pre-split, 211 writes of essentially the whole prompt and
-#     zero reads; post-split, a block bounded at 55.7% of the prompt and read back on a
-#     call with a different tail (_nogit/probe_qwen_cache.py --test-c, 2026-07-30).
-#   ANTHROPIC does NOT: its cache_control is documented as acting on content BLOCKS within
-#     a message, so the single-user-message shape already marks the boundary correctly.
+#   ALIBABA/QWEN needs it ON THE MEASUREMENT, and the mechanism is SOURCED above. Pre-split,
+#     the block written covered essentially the whole prompt and was never read back;
+#     post-split it stops at the message boundary and IS read back on a call with a
+#     DIFFERENT tail. RE-DERIVE rather than trusting these sentences:
+#     `python3 _nogit/qwen_cache_regimes.py` buckets qwen WRITES in logs/ as whole-prompt vs
+#     bounded (the two differ by ~4 orders of magnitude, so the split is unambiguous) and
+#     tallies READS per day, skipping records written before cache accounting existed;
+#     `python3 _nogit/probe_qwen_cache.py --test-c` fires the post-split shape twice with
+#     DIFFERENT tails and shows the second call reading the block back. NEITHER is a
+#     controlled before/after arm -- the "before" is the production log record, so this is
+#     an uncontrolled comparison across a change boundary. It is still the whole
+#     justification, because the effect is a regime change rather than a small delta.
+#     THE MECHANISM IS SOURCED AND ALREADY EXPLAINED ABOVE -- see the CACHE_CONTROL block,
+#     which quotes Alibaba's explicit-cache guide verbatim ("Qwen3.5 and later models only
+#     support MESSAGE-LEVEL cache breakpoints...") and derives the whole-message consequence
+#     from it. Do not restate it here; read it there.
+#     A CAUTIONARY NOTE, kept because the failure is instructive. A 2026-07-30 edit DELETED
+#     that sourced claim as "unsupported" after fetching the general `context-cache` page,
+#     which describes block-level matching and carries no Qwen3.5 rule. Two errors in one:
+#     absence on ONE page was read as absence, and the verbatim quote refuting it was sitting
+#     in THIS FILE about forty lines above. The council caught the deletion; a grep would
+#     have. Re-verified 2026-07-31 against
+#     alibabacloud.com/help/en/model-studio/explicit-cache-best-practice.
+#   ANTHROPIC does NOT: its cache_control acts on content BLOCKS within a message, so the
+#     single-user-message shape already marks the boundary correctly. PRIMARY SOURCE, fetched
+#     2026-07-30: platform.claude.com/docs/en/build-with-claude/prompt-caching -- "Place
+#     cache_control directly on individual content blocks", and caching "references the
+#     entire prompt ... up to and including the block designated with cache_control".
 # An earlier version of this change applied the split to every explicit seat and therefore
-# altered Anthropic's wire shape on the strength of qwen-only probes. Six voting members
-# flagged it. No anthropic slug sits on the default roster, so nothing was measured either
+# altered Anthropic's wire shape on the strength of qwen-only probes. The council flagged it
+# (see HANDOFF 0k; an earlier wording of this line gave a vote count that is not sourced from
+# any record reachable here, so the count is dropped rather than repeated). No anthropic slug
+# sits on the default roster, so nothing was measured either
 # way -- which is the reason to leave that path alone, not evidence that changing it was
 # safe. If an anthropic seat is ever added, probe it before assuming either shape.
 MESSAGE_SPLIT_MODEL_PREFIXES = ("qwen/",)
@@ -2604,13 +2627,23 @@ def _messages_for(prompt: str, cache_prefix: str, explicit: bool,
       providers                   the marker at that message's end, and the varying tail
                                   becomes the user message.
 
-    WHY THE SECOND SHAPE EXISTS, measured rather than assumed. Alibaba documents that
-    Qwen3.5+ resolve cache breakpoints at MESSAGE granularity: a marker inside a single
-    message's content array does not bound a block before that message ends. With
-    everything in one user message the only boundary available is the end of the whole
-    prompt, so the block written always contained that fire's varying tail and could
-    never match a later request. In production this cost real money and returned nothing:
-    211 cache writes, zero reads.
+    WHY THE SECOND SHAPE EXISTS: THE MEASUREMENT, not a mechanism story. In production the
+    single-message shape cost real money on this seat: every write covered essentially the
+    whole prompt, including that fire's varying tail. After the split, a block bounded
+    partway through the prompt WAS read back on a call with a different tail.
+    RUN `python3 _nogit/qwen_cache_regimes.py` FOR THE PRODUCTION FIGURES rather than quoting
+    them from here -- it buckets writes into the two regimes and prints reads per DAY.
+    READ ITS LIMIT HONESTLY: it does not link an individual read back to the regime of the
+    write that produced it, so "the pre-split regime never read back" is NOT re-derivable
+    from its output alone. What IS: the last fully pre-split day shows zero reads across its
+    records, and the day-by-day read rate climbs after the change. The day the split landed
+    contains both regimes and cannot be read either way.
+    THE MECHANISM IS SOURCED: Alibaba's explicit-cache guide states that Qwen3.5+ support
+    MESSAGE-LEVEL breakpoints only, so a marker inside a single message's content array does
+    not bound a block before that message ends. The CACHE_CONTROL_MODEL_PREFIXES comment
+    quotes it verbatim and derives the whole-message consequence; read it there rather than
+    trusting a paraphrase here. A 2026-07-30 edit briefly deleted that claim as "unsupported"
+    after checking a DIFFERENT Alibaba page; the deletion was wrong and the council caught it.
     THREE PROBES SETTLED IT (`_nogit/probe_qwen_cache.py`, 2026-07-30):
       A  OpenRouter forwards the marker exactly where we put it -- message 0, part 0 --
          which is CONSISTENT with the promotion happening Alibaba-side and inconsistent
@@ -2622,8 +2655,10 @@ def _messages_for(prompt: str, cache_prefix: str, explicit: bool,
       C  This shape, fired twice with a DIFFERENT tail, wrote 7,803 tokens (55.7% of the
          prompt -- bounded at the message boundary, not the prompt end) and READ THEM
          BACK on the second call: cost 0.02721 -> 0.01330.
-    C is the one that matters: a read with a CHANGED tail is the production condition
-    that never once worked before.
+    C is the one that matters: a read with a CHANGED tail is the production condition, and
+    it is the one the single-message shape did not deliver -- zero reads across EVERY record
+    on the last fully pre-split day, which is the strongest form of that claim the logs
+    actually support (see the read-per-day limit noted above).
 
     THE INVARIANT IS UNCHANGED AND STILL LOAD-BEARING: concatenating the text of every
     message reproduces `prompt` byte for byte. The split is delegated to
@@ -3647,6 +3682,26 @@ WEB_ALLOWLIST = frozenset({   # EXACT hosts only. A subdomain wildcard (endswith
     "en.wikipedia.org",                # general-knowledge verification (articles + API)
     "www.wikidata.org",                # Wikimedia structured data (entities/claims)
     "commons.wikimedia.org",           # Wikimedia Commons (media + metadata)
+    # Added 2026-07-31 (the user-approved) -- PROVIDER PROMPT-CACHING DOCS. Both are cited
+    # as reproducible pointers by brain notes written during issue #1, and neither was
+    # reachable, so those citations could only ever be prose. Same guarded path as every
+    # host above; this widens WHAT is reachable, not the guard.
+    # THE HOSTS ARE THE ONES THAT ACTUALLY SERVED THE PAGE, not the ones the notes quote:
+    # the Anthropic docs were fetched at platform.claude.com AFTER docs.claude.com issued
+    # a cross-host 302, and the Alibaba page at www.alibabacloud.com. docs.claude.com is
+    # deliberately NOT added -- every 3xx Location is re-run through _validate_url, so a
+    # request STARTING there is denied at hop 0 and must name platform.claude.com directly.
+    "platform.claude.com",             # Anthropic prompt-caching / cache_control docs
+    "www.alibabacloud.com",            # Alibaba Model Studio context-cache docs
+    # WHAT A URL CHECK AGAINST THESE ACTUALLY BUYS, read at validate_brain.py:296-304.
+    # TWO failure arms, not one: NEEDS_ADJUDICATION when the fetch is DENIED OR FAILS (the
+    # page removed, moved off-allowlist, DNS/TLS failure), and NEEDS_ADJUDICATION when
+    # `expect` is no longer a SUBSTRING of the body. So it catches the source becoming
+    # unfetchable AND a quoted fragment disappearing.
+    # WHAT IT DOES NOT CATCH: the page changing MEANING around a fragment that survives.
+    # A vendor could reverse the surrounding paragraph and the check stays green. Do not
+    # call this change detection -- but do not undersell it as fragment-only either; both
+    # errors were made in the thread that approved these hosts.
 })
 WEB_MAX_REQUESTS_PER_MEMBER = 3
 WEB_PER_FETCH_CAP = 24_000      # bytes of page body delivered per grant (8 reserved)
@@ -4124,16 +4179,28 @@ def build_sandbox_copy(workdir: Path, dest: Path) -> dict:
     return {"copied": copied, "skipped": skipped, "bytes": total_bytes}
 
 
-def run_exec_sandbox(command: str, workdir: Path) -> tuple[str | None, str]:
+def run_exec_sandbox(command: str, workdir: Path) -> tuple[str | None, str, dict | None]:
     """Run `command` via `sh -c` in a bubblewrap sandbox (network OFF, env cleared,
     rlimits, wall timeout, process-group kill) over a scrubbed ephemeral copy of
-    workdir. Returns (combined stdout+stderr, note) or (None, reason). Fail-closed if
-    bubblewrap/userns is unavailable."""
+    workdir. Fail-closed if bubblewrap/userns is unavailable.
+
+    Returns (combined stdout+stderr, note, info), or (None, reason, None) when the
+    sandbox refused to run at all.
+
+    `info` is the STRUCTURAL form of what `note` says in prose:
+        {"exit_status": int, "timed_out": bool, "truncated": bool, "bytes_read": int}
+    A caller that must COMPARE the exit status reads info["exit_status"] -- it exists
+    so that nobody has to parse it back out of `note`, which the brain validator used
+    to do and flagged as brittle in its own source.
+    READ `timed_out` BEFORE `exit_status`: on a wall-timeout the process group is
+    SIGKILLed, so exit_status is -9 (the signal), not the command's own status. It is
+    not a verdict about the command and must not be compared as one.
+    """
     if len(command) > EXEC_COMMAND_MAX_LEN:
-        return None, "command too long"
+        return None, "command too long", None
     ok, why = _bwrap_available()
     if not ok:
-        return None, f"sandbox unavailable: {why}"
+        return None, f"sandbox unavailable: {why}", None
     tmp = Path(tempfile.mkdtemp(prefix="council_exec_"))
     copyroot = tmp / "work"
     try:
@@ -4199,7 +4266,11 @@ def run_exec_sandbox(command: str, workdir: Path) -> tuple[str | None, str]:
                 + (" (WALL-TIMEOUT, group killed)" if timedout else "")
                 + (", output truncated" if capped else "")
                 + f"; sandbox copy {copylog['copied']} files/{copylog['skipped']} skipped")
-        return text, note
+        # `note` stays byte-for-byte what it was: it is delivered to members and quoted
+        # in logs. `info` is the same facts in a form a caller can compare.
+        info = {"exit_status": p.returncode, "timed_out": timedout,
+                "truncated": capped, "bytes_read": len(raw)}
+        return text, note, info
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -4249,7 +4320,10 @@ def collect_exec_requests(round1_results: list[dict],
             entry: dict = {"member": name, "cmd_sha256": chash, "granted": False}
             if cmd not in cache:
                 cache[cmd] = run_exec_sandbox(cmd, workdir)
-            output, note = cache[cmd]
+            # [:2]: run_exec_sandbox returns (text, note, info); the delivery leg needs
+            # only the text and the human-readable note. info carries the structural
+            # exit status for callers that must compare it (the brain validator).
+            output, note = cache[cmd][:2]
             if output is None:
                 reason = note
             else:

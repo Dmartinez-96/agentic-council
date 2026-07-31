@@ -65,7 +65,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import shlex
 import sys
 import time
@@ -77,8 +76,9 @@ LIST_FIELDS = ("supersedes", "tags")
 # THERE IS NO `stream` FIELD, and the reason matters. The design review accepted
 # "named stream + exit status" as a mitigation for checks that match error text
 # instead of a real result. On implementation the first half turned out to be
-# impossible: `run_exec_sandbox` returns "(combined stdout+stderr, note)" -- the
-# streams are MERGED inside the sandbox and no caller can separate them. A `stream`
+# impossible: `run_exec_sandbox` MERGES stdout and stderr inside the sandbox
+# (stderr=subprocess.STDOUT) and hands back ONE combined stream, so no caller can
+# separate them -- this is a property of the capture, not of the return shape. A `stream`
 # field would therefore be a guarantee the code cannot keep, so it is rejected
 # rather than accepted-and-ignored. What survives of that mitigation is the REQUIRED
 # exit status. Write command checks to be unambiguous in COMBINED output.
@@ -265,9 +265,6 @@ def spec_hash(f):
 # running checks
 # --------------------------------------------------------------------------
 
-_EXIT_RE = re.compile(r"\bexit\s+(-?\d+)\b")
-
-
 def run_check(f, root, engine, allow_commands):
     """Execute one check. Returns (status, detail).
 
@@ -311,25 +308,40 @@ def run_check(f, root, engine, allow_commands):
     if engine is None:
         return NOT_RUN, "engine unavailable; command checks need run_exec_sandbox"
     argv = json.loads(f["check_argv"])
-    out, note = engine.run_exec_sandbox(shlex.join(argv), root)
+    res = engine.run_exec_sandbox(shlex.join(argv), root)
+    # ARITY-TOLERANT ON PURPOSE, not sloppiness. _engine() dynamically imports whichever
+    # consult_council.py sits beside this file: an engine predating the structural-info
+    # change returns (text, note); a current one returns (text, note, info). Indexing
+    # reads both. A strict 3-unpack would raise ValueError on the older one, and this
+    # function's contract is that it NEVER raises -- an exception here would look like a
+    # missing result rather than a failed check.
+    out, note = res[0], res[1]
+    info = res[2] if len(res) > 2 else None
     if out is None:
         return NOT_RUN, f"sandbox refused: {note}"
+    # TIMEOUT IS TESTED FIRST, ahead of `expect`. A wall-timeout SIGKILLs the process
+    # group, so `out` holds only PARTIAL output and the exit status is -9 (the signal),
+    # not the command's own. Neither is a verdict about the fact. This is therefore
+    # NOT_RUN and deliberately NOT NEEDS_ADJUDICATION: the latter tells a human the fact
+    # may have changed, when all that actually happened is the check ran out of wall
+    # clock. Testing `expect` first would have reported "expect ABSENT" for output that
+    # was merely cut off mid-run.
+    if info is not None and info.get("timed_out"):
+        return NOT_RUN, f"check did not complete: {note}"
     if expect not in out:
         return NEEDS_ADJ, f"expect ABSENT ({note})"
     want = f.get("exit_status")
     if want is None:
         return OK, note
-    # BRITTLE COUPLING, stated rather than hidden: run_exec_sandbox returns
-    # (text, note) and puts the exit code in the human-readable note as "exit N".
-    # There is no structural return for it, so this parses that string. If the note
-    # format changes this stops matching -- and it then FAILS CLOSED rather than
-    # silently treating an unknown status as a pass. A structural return is a
-    # recorded engine follow-up.
-    m = _EXIT_RE.search(note or "")
-    if not m:
-        return NEEDS_ADJ, f"exit status required but unreadable from note: {note!r}"
-    if int(m.group(1)) != int(want):
-        return NEEDS_ADJ, f"exit status {m.group(1)}, wanted {want}"
+    if info is None:
+        # Engine too old to report a status structurally. FAIL CLOSED: an exit status was
+        # REQUIRED by the schema and this cannot establish it, so it is not a PASS.
+        return NEEDS_ADJ, f"exit status required but engine returned no info: {note!r}"
+    got = info.get("exit_status")
+    if got is None:
+        return NEEDS_ADJ, f"exit status required but absent from engine info: {info!r}"
+    if int(got) != int(want):
+        return NEEDS_ADJ, f"exit status {got}, wanted {want}"
     return OK, note
 
 

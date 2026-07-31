@@ -569,7 +569,11 @@ def run_leader_actions(actions, workdir: Path, leader: "cc.Member", *,
         elif k == "fetch":
             content, note = fetch(a.arg, exfil_context)
         else:  # exec
-            content, note = run_exec(a.arg, workdir)
+            # [:2] not a 2-tuple unpack: run_exec is an INJECTABLE SEAM. The production
+            # cc.run_exec_sandbox returns (text, note, info) with a structural exit
+            # status; test stubs return (text, note). This leg needs only the first two,
+            # so slicing accepts either arity instead of breaking on one of them.
+            content, note = run_exec(a.arg, workdir)[:2]
         if content is None:
             results.append(ActionResult(k, a.arg, False, "", f"{label}: DENIED {note}"))
             continue

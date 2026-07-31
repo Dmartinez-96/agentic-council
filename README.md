@@ -501,6 +501,7 @@ agentic-council/
     council_outcome.py                # labelling, adjudication, statistics
     council_shadow_audit.py           # vets the layer-2 inspectors
     council_audit_writes.py           # audits writes that bypassed review
+    forward_refs.py                   # advisory: prose naming symbols a file does not bind
     laziness_gate.py                  # PreToolUse hook -> the only layer that can DENY
     stop_audit.py                     # Stop hook
     evidence_logger.py                # PostToolUse hook -> the evidence file
