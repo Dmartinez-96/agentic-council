@@ -2171,43 +2171,51 @@ CLAUDE_OPENROUTER_FALLBACK = "anthropic/claude-opus-5"
 CLAUDE_DROP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 
-# THE TOOL BOUNDARY, AND IT IS NOT OPTIONAL. Unlike `codex exec --sandbox read-only`,
-# the claude CLI runs a FULL agent with tools and reports permissionMode "acceptEdits".
-# MEASURED 2026-07-31, in an empty temp dir, prompt "Create a file named PROOF.txt
-# containing WROTE":
-#     claude -p --model claude-opus-5                       -> rc=0, PROOF.txt EXISTS
-#     claude -p ... --tools ""                              -> rc=0, no file
-#     claude -p ... --disallowedTools Write Edit Bash NotebookEdit
-#                                                           -> rc=0, no file, and the
-#        model answered coherently: "Write is disabled in this context"
-#     claude -p ... --permission-mode plan                  -> NO RESULT, and nothing is
-#        established. An earlier version of this comment said "never returned, alive ~20
-#        min"; that was FALSE -- launch 21:13:56, alive 21:16:15, i.e. ~139s inside its own
-#        `timeout 150` window. What ended it is NOT established -- the timeout, my later
-#        kill, or its own exit are all consistent with what was observed. Re-probe with a
-#        longer bound before treating plan mode as anything at all.
-# An UNCONSTRAINED claude seat therefore reproduces the agy incident -- an agentic CLI
-# used as a read-only critic that mutates state.
-# THE INVARIANT, stated correctly after the user corrected me on 2026-07-31: it is NOT
-# "never give a member tools". Members DO hold tools -- VALID_CAPABILITIES is
-# {file_retrieval, web, exec_sandbox} and every seat holds all three. The rule is that a
-# member verifies only through channels the HARNESS mediates and bounds, and that MUTATION
-# is never one of them. What made the agy incident bad was an UNMEDIATED agentic CLI with
-# ambient filesystem access, not the possession of tools. The guard below is therefore a
-# stopgap that buys the seat safety by removing its tools; the DESIGNED answer is a second
-# sandbox profile that lets an agentic member keep tools inside a discarded copy (recorded
-# in HANDOFF, put to the bench before building).
+# THE TOOL BOUNDARY, AND IT IS NOT OPTIONAL. Left alone, the claude CLI runs a FULL agent
+# with write tools and reports permissionMode "acceptEdits": measured in an empty temp dir
+# with the prompt "Create a file named PROOF.txt containing WROTE", bare
+# `claude -p --model claude-opus-5` returned rc=0 and PROOF.txt EXISTED. An unconstrained
+# claude seat therefore reproduces the agy incident -- an agentic CLI used as a read-only
+# critic that mutates state.
 #
-# WHY `--tools ""` AND NOT THE DENYLIST, given the denylist produced nicer output: a
-# denylist admits every tool added to the CLI in FUTURE by default, so it fails OPEN on
-# exactly the change nobody will notice. The allowlist fails closed. The cost is real and
-# is recorded rather than hidden: with tools absent, an adversarial prompt made the model
-# emit `<invoke name="Write">...` as PLAIN TEXT. Nothing executes it, but that text would
-# land in the member's verdict, the log, and format_round1_block, where every peer reads
-# it. The capability block tells this seat truthfully that it holds no tools and must use
-# the REQUEST_* channels, which is what should keep a real review from reaching for one --
-# but the PROMPT is not the boundary. `--tools ""` is.
-CLAUDE_TOOL_GUARD = ("--tools", "")
+# THE INVARIANT, stated correctly after the user corrected me: it is NOT "never give a
+# member tools". Members DO hold tools -- VALID_CAPABILITIES is {file_retrieval, web,
+# exec_sandbox} and every seat holds all three. The rule is that a member verifies only
+# through channels the HARNESS mediates and bounds, and that MUTATION is never one of them.
+# What made the agy incident bad was an UNMEDIATED agentic CLI with ambient filesystem
+# access, not the possession of tools.
+#
+# THE FOUR CANDIDATES, ALL MEASURED 2026-08-01. `--tools` is an ALLOWLIST over the built-in
+# set (`--help`: 'Use "" to disable all tools ... or specify tool names'), which is why the
+# chosen option is a --tools list rather than a denylist:
+#   --tools ""                    DISQUALIFYING. rc=0 and no file, but asked to create and
+#       verify a file the model FABRICATED THE WHOLE VERIFICATION: it reported the file
+#       "contains WROTE (6 bytes)" and quoted a wc -c, an od -c dump and a grep -c that it
+#       never ran. Checked afterwards: the file never existed. A seat whose job is
+#       verification must not invent command output, so this cannot ship.
+#   --disallowedTools Write Edit Bash NotebookEdit
+#                                 Honest but FAILS OPEN, and the model proved it unasked:
+#       it refused ("I'd rather ask than fake it"), then pointed out that the Monitor tool
+#       executes shell commands, so `printf > PROOF.txt` would work and would be "unhooked
+#       by the review gate". A denylist admits every tool the CLI gains later; here it
+#       already admitted one.
+#   --permission-mode plan        NOT VIABLE HEADLESS, now settled. An earlier note claimed
+#       "never returned, ~20 min"; that was false (~139s inside its own `timeout 150`).
+#       Re-probed with a 420s bound: rc=124 at 440s elapsed, output "Execution error", no
+#       file. It hangs under -p, presumably waiting on an approval no headless run supplies.
+#   --tools "Read,Glob,Grep"      CHOSEN. rc=0 in 21s. It READ the target file and reported
+#       its real contents correctly (a function returning 42, cited by file:line), and on
+#       being asked to write returned "Error: No such tool available: Write. Write exists
+#       but is not enabled in this context" -- an honest refusal, no fabrication, no file.
+#       It also noted it had "no shell fallback to reach around it".
+#
+# WHY THIS ONE IS RIGHT AND NOT MERELY SAFEST: it makes the claude seat the direct analogue
+# of `codex exec --sandbox read-only` -- ambient READ for verifying against ground truth,
+# no mutation path at all. That satisfies the invariant rather than dodging it, and it
+# fails CLOSED, since a tool added to the CLI later is absent from this list by default.
+# The capability block still describes the seat truthfully, but the PROMPT is not the
+# boundary; this list is.
+CLAUDE_TOOL_GUARD = ("--tools", "Read,Glob,Grep")
 
 
 def claude_cmd() -> list[str]:
@@ -4485,6 +4493,19 @@ def capability_block(member: Member, *, fallback_route: bool = False) -> str:
         lines += ["You run as a `codex exec` subprocess in a READ-ONLY sandbox over the "
                   "real repository: you can read files, list directories, and grep. You "
                   "cannot write or modify state.", ""]
+    if member.transport == "claude_subprocess" and not fallback_route:
+        granted = True
+        # Names the three tools EXACTLY as CLAUDE_TOOL_GUARD grants them, because a seat
+        # told it holds a tool it does not hold will reason wrongly about its own reach --
+        # and here the error runs BOTH ways: this seat really can read the live tree, so
+        # describing it as tool-less would be just as false as overstating it.
+        lines += ["You run as a `claude -p` subprocess over the real repository with a "
+                  "READ-ONLY toolset: Read, Glob and Grep, and nothing else. You can open "
+                  "files, match paths, and search contents directly. You have no Write, "
+                  "Edit, Bash or other execution tool, so you cannot modify state or run "
+                  "commands -- attempting one returns 'No such tool available'. Do not "
+                  "describe an action you did not take: if you could not check something, "
+                  "say so plainly rather than reporting a result you did not obtain.", ""]
     if "file_retrieval" in caps:
         granted = True
         lines += [
@@ -4691,6 +4712,33 @@ async def _run_member_transport(member: "Member", base_prompt: str,
             # fails, the vote stays lost). This route has NO live file access, so the
             # fallback vote sees the assembled prompt (evidence, directives, the
             # pitch) but cannot read the repo. emit_output marks it.
+            fb = await run_openrouter(member.name, [member.fallback_model], pitch,
+                                      "\n\n".join(
+                                          p for p in
+                                          (base_prompt,
+                                           capability_block(member,
+                                                            fallback_route=True),
+                                           ground_rules_block) if p),
+                                      evidence_block,
+                                      user_directives_block, round1_block,
+                                      assistant_block, standing_rules_block,
+                                      council_conclusion_block)
+            fb["route"] = "openrouter_fallback"
+            fb["primary_error"] = (result.get("stderr") or "").strip()[-200:]
+            return fb
+        return result
+    if t == "claude_subprocess":
+        result = await run_claude(pitch, system_prompt, cwd, evidence_block,
+                                  user_directives_block, round1_block,
+                                  assistant_block, standing_rules_block,
+                                  council_conclusion_block)
+        if result.get("verdict") == "ERROR" and member.fallback_model:
+            # Same shape and same reason as the codex branch above: the subscription
+            # route can lose a vote to a usage cap, an auth failure or a timeout, and a
+            # cap must not silently drop a member. The fallback capability block is built
+            # with fallback_route=True because the OpenRouter route has NO file access --
+            # this seat's Read/Glob/Grep exist only in the CLI, so inheriting the
+            # subprocess text there would tell the fallback it can read a tree it cannot.
             fb = await run_openrouter(member.name, [member.fallback_model], pitch,
                                       "\n\n".join(
                                           p for p in
