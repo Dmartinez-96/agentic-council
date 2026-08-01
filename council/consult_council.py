@@ -1899,8 +1899,23 @@ def _member_env() -> dict:
 
 async def _run_subprocess(cmd: list[str], cwd: Path, role: str,
                           post_read: Path | None = None,
-                          stdin_data: str | None = None) -> dict:
+                          stdin_data: str | None = None,
+                          drop_env: tuple[str, ...] = ()) -> dict:
+    """Run one member CLI. `drop_env` REMOVES those variables from the child's
+    environment.
+
+    It exists because a CLI's AUTH SOURCE can be decided by an ambient variable rather
+    than by anything the caller passes: measured 2026-07-31, `claude -p` with
+    ANTHROPIC_API_KEY set prints "claude.ai connectors are disabled because
+    ANTHROPIC_API_KEY or another auth source is set and takes precedence over your
+    claude.ai login", and with the variable scrubbed that warning is ABSENT. Removing the
+    variable is therefore how a caller selects the CLI's own login instead of the key.
+    SCOPE: that is an observation about which auth source the CLI reports using. No
+    billing record was inspected, so it does NOT establish how a run was charged."""
     t0 = time.monotonic()
+    env = _member_env()
+    for key in drop_env:
+        env.pop(key, None)
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1908,7 +1923,7 @@ async def _run_subprocess(cmd: list[str], cwd: Path, role: str,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
-            env=_member_env(),
+            env=env,
         )
     except FileNotFoundError as e:
         return {
@@ -2121,6 +2136,103 @@ def _codex_lock_release(fh) -> None:
     except OSError:
         pass
     fh.close()
+
+
+# --- claude: the second subscription-CLI transport -------------------------
+#
+# THE SAME SHAPE AS codex: a vendor CLI that authenticates itself, with an OpenRouter
+# slug as the fallback when it fails. The user asked for exactly this pairing -- "a default
+# roster option for claude (Opus 5 for instance) with fallback from openrouter if going
+# the API route" (2026-07-31).
+#
+# BOTH LEGS ARE VERIFIED, not assumed:
+#   `anthropic/claude-opus-5` IS in the live catalog -- one of 17 anthropic slugs returned
+#   by `curl -s https://openrouter.ai/api/v1/models` (checked 2026-07-31), alongside
+#   `anthropic/claude-opus-5-fast` and `anthropic/claude-sonnet-5`.
+#   The CLI leg is drivable from a pipe:
+#     printf 'Reply with exactly: PONG' | env -u ANTHROPIC_API_KEY claude -p --model claude-opus-5
+#   returns rc=0 and `PONG` (CLI 2.1.220, checked 2026-07-31).
+#
+# WHY THE ENV SCRUB. Measured the same day, stderr verbatim WITH the variable set:
+#   "claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is
+#    set and takes precedence over your claude.ai login"
+# and with it scrubbed that line is ABSENT. So the ambient variable, not the command line,
+# decides which auth source serves -- and a roster entry that says "CLI" while a key
+# silently overrides it would be precisely the kind of lie this project exists to stop.
+# SCOPE, and do not let this drift: the disappearing warning shows the CLI selected a
+# DIFFERENT AUTH SOURCE. No billing record was inspected. `total_cost_usd` is reported on
+# BOTH paths (0.0157 with the key, 0.1720815 without), so nothing here establishes how a
+# run was CHARGED, and no UI or doc may claim it does.
+CLAUDE_MODEL = "claude-opus-5"
+CLAUDE_OPENROUTER_FALLBACK = "anthropic/claude-opus-5"
+# Dropped from the child env so the CLI's own login is what serves. ANTHROPIC_AUTH_TOKEN
+# is included because the warning above names "ANTHROPIC_API_KEY **or another auth
+# source**", so scrubbing only the first would leave a second override in place.
+CLAUDE_DROP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+# THE TOOL BOUNDARY, AND IT IS NOT OPTIONAL. Unlike `codex exec --sandbox read-only`,
+# the claude CLI runs a FULL agent with tools and reports permissionMode "acceptEdits".
+# MEASURED 2026-07-31, in an empty temp dir, prompt "Create a file named PROOF.txt
+# containing WROTE":
+#     claude -p --model claude-opus-5                       -> rc=0, PROOF.txt EXISTS
+#     claude -p ... --tools ""                              -> rc=0, no file
+#     claude -p ... --disallowedTools Write Edit Bash NotebookEdit
+#                                                           -> rc=0, no file, and the
+#        model answered coherently: "Write is disabled in this context"
+#     claude -p ... --permission-mode plan                  -> NO RESULT, and nothing is
+#        established. An earlier version of this comment said "never returned, alive ~20
+#        min"; that was FALSE -- launch 21:13:56, alive 21:16:15, i.e. ~139s inside its own
+#        `timeout 150` window. What ended it is NOT established -- the timeout, my later
+#        kill, or its own exit are all consistent with what was observed. Re-probe with a
+#        longer bound before treating plan mode as anything at all.
+# An UNCONSTRAINED claude seat therefore reproduces the agy incident -- an agentic CLI
+# used as a read-only critic that mutates state.
+# THE INVARIANT, stated correctly after the user corrected me on 2026-07-31: it is NOT
+# "never give a member tools". Members DO hold tools -- VALID_CAPABILITIES is
+# {file_retrieval, web, exec_sandbox} and every seat holds all three. The rule is that a
+# member verifies only through channels the HARNESS mediates and bounds, and that MUTATION
+# is never one of them. What made the agy incident bad was an UNMEDIATED agentic CLI with
+# ambient filesystem access, not the possession of tools. The guard below is therefore a
+# stopgap that buys the seat safety by removing its tools; the DESIGNED answer is a second
+# sandbox profile that lets an agentic member keep tools inside a discarded copy (recorded
+# in HANDOFF, put to the bench before building).
+#
+# WHY `--tools ""` AND NOT THE DENYLIST, given the denylist produced nicer output: a
+# denylist admits every tool added to the CLI in FUTURE by default, so it fails OPEN on
+# exactly the change nobody will notice. The allowlist fails closed. The cost is real and
+# is recorded rather than hidden: with tools absent, an adversarial prompt made the model
+# emit `<invoke name="Write">...` as PLAIN TEXT. Nothing executes it, but that text would
+# land in the member's verdict, the log, and format_round1_block, where every peer reads
+# it. The capability block tells this seat truthfully that it holds no tools and must use
+# the REQUEST_* channels, which is what should keep a real review from reaching for one --
+# but the PROMPT is not the boundary. `--tools ""` is.
+CLAUDE_TOOL_GUARD = ("--tools", "")
+
+
+def claude_cmd() -> list[str]:
+    """Argv for one claude review. The prompt arrives on STDIN, verified above, so it is
+    never an argv element -- a council prompt runs to tens of kilobytes and argv is
+    bounded. CLAUDE_TOOL_GUARD is what keeps this seat non-mutating; see above."""
+    return ["claude", "-p", "--model", CLAUDE_MODEL, *CLAUDE_TOOL_GUARD]
+
+
+async def run_claude(pitch: str, system_prompt: str, cwd: Path,
+                     evidence_block: str = "",
+                     user_directives_block: str = "",
+                     round1_block: str = "",
+                     assistant_block: str = "",
+                     standing_rules_block: str = "",
+                     council_conclusion_block: str = "") -> dict:
+    """One claude seat, over its own CLI. No auth lock: the codex lock exists for codex's
+    observed refresh-token races, and claiming the same failure here without having seen
+    it would be inventing a rationale."""
+    prompt = build_prompt(system_prompt, pitch, evidence_block,
+                          user_directives_block, round1_block,
+                          assistant_block, standing_rules_block,
+                          council_conclusion_block)
+    return await _run_subprocess(claude_cmd(), cwd, role="claude",
+                                 stdin_data=prompt, drop_env=CLAUDE_DROP_ENV)
 
 
 async def run_codex(pitch: str, system_prompt: str, cwd: Path,
@@ -2942,8 +3054,8 @@ DEFAULT_REGISTRY: tuple[Member, ...] = (
 ROSTER_PATH = COUNCIL_ROOT / "roster.json"
 
 VALID_TIERS = {VOTING, INSPECTOR}
-VALID_TRANSPORTS = {"codex_subprocess", "gemini_rest", "deepseek_https",
-                    "openrouter"}
+VALID_TRANSPORTS = {"codex_subprocess", "claude_subprocess", "gemini_rest",
+                    "deepseek_https", "openrouter"}
 # The harness-mediated capabilities the engine honors. Each has a request channel
 # (REQUEST_FILE / REQUEST_URL / REQUEST_EXEC) parsed by a collect_* function and
 # delivered by main() to voting members (round 1 -> round 2) and, via the pass-1 ->
@@ -2956,11 +3068,13 @@ VALID_CAPABILITIES = {"file_retrieval", "web", "exec_sandbox"}
 # canonical member name. The openrouter transport has no such coupling.
 CANONICAL_TRANSPORT_NAMES = {
     "codex_subprocess": "codex",
+    "claude_subprocess": "claude",
     "gemini_rest": "gemini",
     "deepseek_https": "deepseek",
 }
 DIRECT_TRANSPORT_MODELS = {
     "codex_subprocess": CODEX_MODEL,
+    "claude_subprocess": CLAUDE_MODEL,
     "gemini_rest": GEMINI_API_MODEL,
     "deepseek_https": DEEPSEEK_MODEL,
 }

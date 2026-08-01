@@ -314,6 +314,19 @@
     vscode.postMessage({ type: 'consult', pitch: pitch });
   });
 
+  // The GUI is a separate window owned by the host, so there is no reply to render here.
+  // The host notifies on failures it can SEE: a spawn error, or a non-zero exit within
+  // its grace window (missing PySide6, wrong interpreter). It does NOT notify on a clean
+  // exit, nor on a crash after that window -- those are silent by design, since by then
+  // the window is the user's to watch. Guarded because the button lives in host-rendered
+  // HTML: if a stale build ships without it, a null here would kill the whole script.
+  const launchGuiBtn = document.getElementById('launch-gui');
+  if (launchGuiBtn) {
+    launchGuiBtn.addEventListener('click', function () {
+      vscode.postMessage({ type: 'launchGui' });
+    });
+  }
+
   window.addEventListener('message', function (event) {
     const msg = event.data;
     if (msg.type === 'roster') {

@@ -40,6 +40,26 @@ function councilRoot(): string | undefined {
   return undefined;
 }
 
+// Reports WHY the root was not found, matching what councilRoot() actually did. When
+// council.rootPath is set, councilRoot() checks ONLY that path and returns -- it never
+// falls back to the workspace scan -- so claiming a workspace search there would send the
+// user looking in the wrong place.
+function reportRootNotFound(): void {
+  const configured = vscode.workspace
+    .getConfiguration('council')
+    .get<string>('rootPath', '');
+  vscode.window.showErrorMessage(
+    configured
+      ? "Workers' Council: council.rootPath is set to " +
+          `"${configured}", but no consult_council.py was found there. ` +
+          'Fix or clear that setting (clearing it enables the workspace search).'
+      : "Workers' Council: consult_council.py not found in any workspace " +
+          'folder (searched each folder, its council/ and Council/ ' +
+          'subdirectories, and its parent directory). Set council.rootPath ' +
+          'to point at it directly.',
+  );
+}
+
 function runEngine(
   root: string,
   args: string[],
@@ -69,6 +89,133 @@ function runEngine(
     );
     child.stdin?.write(stdin ?? '');
     child.stdin?.end();
+  });
+}
+
+// How long to wait before treating a launched GUI as "up". The GUI is a long-lived
+// window, so there is no success exit code to wait for -- the only observable failure is
+// the process dying immediately (a missing PySide6, no display, a syntax error). So we
+// watch for an early exit and report it; surviving the window is EVIDENCE the process
+// started, not proof the window rendered.
+const GUI_LAUNCH_GRACE_MS = 3000;
+
+// The GUI's interpreter, which is NOT always the engine's. Resolution order:
+//   1. council.pythonPath when the user actually set it (inspect() distinguishes an
+//      explicit value from the packaged default, so an explicit choice always wins);
+//   2. <root>/.venv-gui/bin/python3 when that venv exists -- a GUI venv living inside
+//      the council root is unambiguously meant for this, and preferring it means the
+//      GUI works with no configuration even though the extension host's `python3`
+//      usually cannot import PySide6;
+//   3. the configured default (`python3`).
+function guiPython(root: string): string {
+  const cfg = vscode.workspace.getConfiguration('council');
+  const inspected = cfg.inspect<string>('pythonPath');
+  const explicit =
+    inspected?.workspaceFolderValue ??
+    inspected?.workspaceValue ??
+    inspected?.globalValue;
+  if (explicit) {
+    return explicit;
+  }
+  const venvPython = path.join(root, '.venv-gui', 'bin', 'python3');
+  if (fs.existsSync(venvPython)) {
+    return venvPython;
+  }
+  return cfg.get<string>('pythonPath', 'python3');
+}
+
+function launchGui(root: string): void {
+  const python = guiPython(root);
+  const script = path.join(root, 'council_gui.py');
+  if (!fs.existsSync(script)) {
+    vscode.window.showErrorMessage(
+      `Workers' Council: council_gui.py not found in ${root}.`,
+    );
+    return;
+  }
+  let child: cp.ChildProcess;
+  try {
+    // detached + ignored stdin so the GUI outlives this extension host; stderr is kept
+    // so an immediate failure has something to report.
+    child = cp.spawn(python, [script], {
+      cwd: root,
+      detached: true,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+  } catch (e) {
+    vscode.window.showErrorMessage(
+      `Workers' Council: could not start ${python}: ${String(e)}`,
+    );
+    return;
+  }
+
+  let stderr = '';
+  child.stderr?.on('data', (d: Buffer) => {
+    stderr += d.toString();
+  });
+  child.on('error', (e) => {
+    vscode.window.showErrorMessage(
+      `Workers' Council: could not start ${python}: ${e.message}`,
+    );
+  });
+
+  const settled = setTimeout(() => {
+    child.removeAllListeners('exit');
+    child.unref();
+    vscode.window.setStatusBarMessage("Workers' Council: GUI launched", 4000);
+  }, GUI_LAUNCH_GRACE_MS);
+
+  child.on('exit', (code) => {
+    clearTimeout(settled);
+    if (code === 0) {
+      return; // the user closed it, or it chose to exit cleanly
+    }
+    // The one failure worth naming precisely, because it is the expected one on a fresh
+    // install: the GUI's only third-party dependency is absent.
+    if (/ModuleNotFoundError.*PySide6|No module named ['"]?PySide6/.test(stderr)) {
+      // Two genuinely different fixes, and which one is right depends on the user's
+      // setup: the interpreter VS Code inherits is often NOT the shell's. If PySide6
+      // lives in a virtualenv, pointing council.pythonPath at that venv's python is
+      // correct and installing into the inherited interpreter is wasted effort.
+      vscode.window
+        .showErrorMessage(
+          `Workers' Council: the GUI needs PySide6, which ${python} cannot import. ` +
+            'Note the extension host may not use the same interpreter as your shell.',
+          'Install into this interpreter',
+          'Set council.pythonPath',
+        )
+        .then((choice) => {
+          if (choice === 'Install into this interpreter') {
+            const term = vscode.window.createTerminal("Workers' Council");
+            term.show();
+            // pythonPath is user-configurable and may contain spaces, so it is
+            // single-quoted with embedded quotes escaped POSIX-style ('\'').
+            const q = `'${python.replace(/'/g, `'\\''`)}'`;
+            term.sendText(`${q} -m pip install PySide6`);
+          } else if (choice === 'Set council.pythonPath') {
+            // The command id is not verified in this session, so failure is handled
+            // rather than assumed away: if it does not resolve, name the setting so
+            // the user can still act.
+            void Promise.resolve(
+              vscode.commands.executeCommand(
+                'workbench.action.openSettings',
+                'council.pythonPath',
+              ),
+            ).then(undefined, () => {
+              vscode.window.showInformationMessage(
+                "Workers' Council: set the setting `council.pythonPath` to an " +
+                  'interpreter that can import PySide6.',
+              );
+            });
+          }
+        });
+      return;
+    }
+    const detail = stderr.trim().split('\n').slice(-4).join('\n');
+    vscode.window.showErrorMessage(
+      `Workers' Council: the GUI exited immediately (code ${code}).` +
+        (detail ? ` Last output:\n${detail}` : ''),
+    );
   });
 }
 
@@ -117,6 +264,15 @@ function panelHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 </head>
 <body>
 <h1>Workers' Council</h1>
+<section id="gui-section">
+  <h2>Standalone GUI</h2>
+  <p class="hint">Opens the full operator cockpit (Config, Run, Leader, Brain, Metrics) in
+    its own window. It needs PySide6 on the interpreter set by <code>council.pythonPath</code>,
+    which is NOT necessarily the one your shell uses.</p>
+  <div class="row">
+    <button id="launch-gui">Launch GUI</button>
+  </div>
+</section>
 <section id="roster-section">
   <h2>Roster</h2>
   <p id="roster-status"></p>
@@ -171,14 +327,20 @@ function panelHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
+    vscode.commands.registerCommand('council.launchGui', () => {
+      const root = councilRoot();
+      if (!root) {
+        reportRootNotFound();
+        return;
+      }
+      launchGui(root);
+    }),
+  );
+  context.subscriptions.push(
     vscode.commands.registerCommand('council.openPanel', () => {
       const root = councilRoot();
       if (!root) {
-        vscode.window.showErrorMessage(
-          "Workers' Council: consult_council.py not found via council.rootPath " +
-            'or any workspace folder (searched each folder, its council/ and ' +
-            'Council/ subdirectories, and its parent directory).',
-        );
+        reportRootNotFound();
         return;
       }
       const panel = vscode.window.createWebviewPanel(
@@ -286,6 +448,10 @@ export function activate(context: vscode.ExtensionContext): void {
                 stdout: res.stdout,
                 stderr: res.stderr,
               });
+              break;
+            }
+            case 'launchGui': {
+              launchGui(root);
               break;
             }
             case 'loadMarkers': {

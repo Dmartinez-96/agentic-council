@@ -18,6 +18,10 @@
       {
         "command": "council.openPanel",
         "title": "Council: Open Panel"
+      },
+      {
+        "command": "council.launchGui",
+        "title": "Council: Launch GUI"
       }
     ],
     "configuration": {
@@ -31,7 +35,7 @@
         "council.pythonPath": {
           "type": "string",
           "default": "python3",
-          "description": "Python interpreter used to run the council engine."
+          "description": "Python interpreter used to run the council engine and the standalone GUI. The GUI additionally needs PySide6 importable by THIS interpreter. VS Code does not necessarily inherit your shell's PATH, so if PySide6 lives in a virtualenv, set this to that venv's python (e.g. /path/to/venv/bin/python3) rather than installing into the default."
         }
       }
     }

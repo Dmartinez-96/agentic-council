@@ -45,8 +45,11 @@ notes the macOS swaps).
    Authenticate: run `codex` and choose *Sign in with ChatGPT*, or
    `printenv OPENAI_API_KEY | codex login --with-api-key`. (`codex doctor` diagnoses the
    install/auth.)
-3. **bubblewrap** (Linux, optional) -- `bwrap` on `PATH` enables the exec-sandbox tool;
-   without it `REQUEST_EXEC` is denied and everything else still works.
+3. **Optional extras, neither needed for the council itself.** **bubblewrap** (Linux) --
+   `bwrap` on `PATH` enables the exec-sandbox tool; without it `REQUEST_EXEC` is denied
+   and everything else still works. **PySide6** -- only for the standalone GUI
+   (`council_gui.py`); the engine, hooks and CLI never import it. See
+   [The standalone GUI](#the-standalone-gui) for the recommended `.venv-gui` setup.
 4. **Install** -- `git clone <this-repo> && cd agentic-council && python3 install.py`
    (`--dry-run` to preview, `--council-root` to relocate). It verifies prerequisites,
    probes codex + OpenRouter, copies the scripts, merges the hook block into
@@ -323,6 +326,58 @@ tiers, transports), pick the leader, flip the FAST/DISABLED switches, and run a
 consult against `--layer reasoning`. It never handles API keys (the engine reads
 them from the environment) and it validates through `--print-roster`, so the UI
 cannot drift from the engine. See `vscode-extension/README.md` for how to run it.
+It can also launch the standalone GUI below (`Council: Launch GUI`, or the button
+at the top of the panel).
+
+## The standalone GUI
+
+`council_gui.py` is a Qt operator cockpit with five tabs -- **Config**, **Run**,
+**Leader**, **Brain**, **Metrics**. Run it directly:
+
+```
+python3 council_gui.py
+```
+
+It is the one part of the council with a third-party Python dependency:
+**PySide6**. Everything else -- engine, hooks, CLI -- is standard library, so if
+you never open the GUI you never need it.
+
+The convention the tooling expects is a dedicated virtualenv in the council root:
+
+```
+python3 -m venv .venv-gui
+.venv-gui/bin/pip install PySide6
+.venv-gui/bin/python3 council_gui.py
+```
+
+`install.py` reports on that venv if it exists and otherwise tells you how to
+create it -- it does **not** create it for you. So unless PySide6 already happens
+to be importable by whichever interpreter you launch with, a fresh clone needs
+the two commands above first.
+
+Once the venv exists the VS Code extension finds it automatically. Its full
+resolution order is: an explicitly set `council.pythonPath` (which always wins,
+so pointing it at an interpreter *without* PySide6 will still fail), then
+`.venv-gui`, then plain `python3`. That preference exists because `python3` is not
+one fixed thing: measured on the development machine, an interactive shell
+resolved it to a venv carrying PySide6 while a non-interactive one resolved it to
+a different interpreter without PySide6, since `~/.bashrc` returns early when not
+interactive. Which interpreter a given editor inherits was not measured -- hence
+preferring a venv that sits inside the project, where the intent is unambiguous.
+
+Results stream **as each member finishes** rather than appearing all at once at
+the end (`council_events.py` emits a `member_finished` record per seat). The same
+stream drives the terminal renderer, `council_watch.py`, which spawns the engine
+with `--events-fd` and renders each seat as it lands.
+
+Linux is the target, and what has actually been exercised is **WSL2 with WSLg**
+(kernel `microsoft-standard-WSL2`): running `council_gui.py` there produced a
+mapped X window titled *Workers' Council* at 1100x800, confirmed with
+`xwininfo -root -tree`, which disappeared when the process exited. Note Qt logs
+`Failed to create wl_display` and declines the Wayland plugin under WSLg before
+falling back to X11 -- noisy on stderr, but the window still appears. Native
+Linux is the primary target and is expected to work, but is not something these
+notes tested.
 
 ## Install
 

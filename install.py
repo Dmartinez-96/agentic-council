@@ -262,6 +262,58 @@ def check_bubblewrap(rep: Reporter) -> None:
             rep.warn("bubblewrap (bwrap) not on PATH.")
 
 
+def check_pyside6(rep: Reporter, council_root: Path) -> None:
+    """Report whether the standalone GUI can run. OPTIONAL: among the council files that
+    get installed, council_gui.py is the only one importing PySide6 -- the engine, hooks
+    and CLI never do -- so a missing GUI dependency must never fail an install. (This
+    installer imports it too, in the probe below, but install.py is not a council runtime
+    file and its import is guarded.)
+
+    Which interpreter to check is a CHOICE, not a sweep: if
+    `<council root>/.venv-gui/bin/python3` exists it is the one that matters and the
+    ambient interpreter is irrelevant, so this reports on the venv and stops. Only when
+    there is no venv does it fall back to the interpreter running install.py.
+    KNOWN DIVERGENCE, stated because a reader would otherwise assume symmetry: the VS
+    Code extension's resolution is `council.pythonPath` (when explicitly set) -> the venv
+    -> `python3`. This check has no access to that setting, so it starts at the venv. If
+    a user sets `council.pythonPath` to a THIRD interpreter, the extension will launch
+    with that one while this check reports on the venv, and they can disagree.
+    """
+    venv_python = council_root / ".venv-gui" / "bin" / "python3"
+    if venv_python.is_file():
+        try:
+            probe = subprocess.run([str(venv_python), "-c", "import PySide6"],
+                                   capture_output=True, text=True)
+        except OSError as e:
+            rep.warn(f"GUI: could not run {venv_python} ({e}).")
+            return
+        if probe.returncode == 0:
+            rep.ok(f"GUI: PySide6 available in {venv_python}")
+            return
+        last = probe.stderr.strip().splitlines()[-1:] or ["no output"]
+        rep.warn(f"GUI: {venv_python} exists but cannot import PySide6 "
+                 f"({last[0]}). Recreate it or install PySide6 into it.")
+        return
+    try:
+        # __import__ rather than a plain `import PySide6`: it genuinely imports (so an
+        # installed-but-broken package is caught, which importlib.util.find_spec would
+        # miss) while binding no unused name for linters to flag.
+        __import__("PySide6")
+    # Deliberately broad: this check is advisory, and a third-party package that raises
+    # something other than ImportError at import time must not abort an install.
+    except Exception:  # noqa: BLE001
+        rep.warn(
+            "GUI: PySide6 not importable, so `council_gui.py` will not start. "
+            "This is OPTIONAL -- the engine, hooks and CLI do not need it. "
+            "To enable the GUI, either create a dedicated venv "
+            f"(python3 -m venv {council_root / '.venv-gui'} && "
+            f"{council_root / '.venv-gui' / 'bin' / 'pip'} install PySide6), "
+            "which the VS Code extension then finds automatically, or install "
+            "PySide6 into the interpreter you will launch the GUI with.")
+        return
+    rep.ok("GUI: PySide6 available in the current interpreter")
+
+
 def probe_codex_model(rep: Reporter) -> bool:
     """Probe codex on the SAME model the council will actually use.
 
@@ -674,6 +726,7 @@ def main() -> int:
     check_ground_rules(rep, council_root)
     check_standing_rules(rep)
     check_bubblewrap(rep)
+    check_pyside6(rep, council_root)
 
     if not ok:
         rep.err("prerequisite checks failed. Address the errors above "
