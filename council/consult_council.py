@@ -1947,6 +1947,12 @@ async def _run_subprocess(cmd: list[str], cwd: Path, role: str,
         }
     duration = round(time.monotonic() - t0, 2)
     stderr = stderr_b.decode("utf-8", errors="replace")
+    # On the stdout fallback: `codex exec` puts its banner and prompt ECHO on stderr, not
+    # stdout, so falling back here returns the final message rather than a transcript.
+    # Measured with separated streams -- a sentinel in the prompt appeared in stderr
+    # (468 bytes) and not in stdout, which held exactly the 5-byte final message
+    # (codex-cli 0.144.5, 2026-08-01). SCOPE: the file WAS written on that run, so this
+    # else-branch did not execute; what was measured is stdout's content, not the fallback.
     if post_read and post_read.exists():
         text = post_read.read_text(errors="replace")
         try:
@@ -4863,7 +4869,20 @@ async def _call_leader(leader: "Member", prompt: str, cwd: Path) -> dict:
         return {"ok": False, "text": "", "transport": t,
                 "error": f"unknown leader transport {t!r}", "model_used": ""}
     text = res.get("text") or ""
-    ok = res.get("returncode") == 0 and bool(text.strip())
+    rc = res.get("returncode")
+    # SUCCESS IS A NON-EMPTY RESPONSE, not a zero exit status.
+    # WHAT WAS OBSERVED 2026-08-01, stated without the cause I cannot evidence: a codex
+    # leader turn reported "leader call failed" even though codex had produced a complete,
+    # valid actions block and logged "tokens used 7,634". Its stderr also carried a stale
+    # models-cache ERROR. The exit status of THAT run was never captured, so whether it
+    # failed on rc or on an empty --output-last-message file is UNKNOWN; a later probe of
+    # the same invocation returned rc=0 with the file written. Both failure modes are
+    # closed by keying on the response itself.
+    # This is safe across transports because `text` is not scraped from chatter: for codex
+    # it is the --output-last-message FILE, written only when the agent produces a final
+    # message, and for the HTTP transports it is the parsed response body. No text means
+    # no answer, whatever the exit status says.
+    ok = bool(text.strip())
     if t == "openrouter":
         # OpenRouter reports which of [primary, fallback] actually answered.
         model_used = res.get("model_used") or leader.model
@@ -4872,10 +4891,23 @@ async def _call_leader(leader: "Member", prompt: str, cwd: Path) -> dict:
         # hardcodes the reviewed module constant, so model_used is read from that
         # constant and is truthful even if an unvalidated Member.model disagrees.
         model_used = DIRECT_TRANSPORT_MODELS[t]
+    # HEAD **AND** TAIL, never the whole thing. MEASURED: `codex exec` writes its banner
+    # and echoes the ENTIRE prompt to stderr (a sentinel placed in the prompt appeared in
+    # stderr, not stdout), so an un-truncated error reproduced the full ground rules back
+    # at the operator. Both ends are kept because the cause can sit at either: the stale
+    # models-cache ERROR that started this appeared on the FIRST line, while a CLI's reason
+    # for stopping is usually the last. Tailing alone would have hidden the very message
+    # that prompted this fix.
+    err_lines = (res.get("stderr") or "").strip().splitlines()
+    if len(err_lines) > 20:
+        err_slice = err_lines[:8] + [f"... [{len(err_lines) - 20} lines omitted] ..."] + err_lines[-12:]
+    else:
+        err_slice = err_lines
     return {
         "ok": ok,
         "text": text,
-        "error": "" if ok else (res.get("stderr") or "leader call failed"),
+        "error": "" if ok else ("\n".join(err_slice)
+                                or f"leader call failed (rc={rc}, no output)"),
         "transport": t,
         "model_used": model_used,
     }
