@@ -4775,6 +4775,24 @@ async def _run_member_transport(member: "Member", base_prompt: str,
     raise ValueError(f"unknown transport {t!r} for member {member.name!r}")
 
 
+# The transports a LEADER may use: a STRICT SUBSET of VALID_TRANSPORTS, because
+# _call_leader's if/elif chain below simply has no `claude_subprocess` branch. That chain
+# predates the claude transport, and nothing has extended it. THAT is the whole reason,
+# and it is a gap rather than a policy.
+# A REJECTED RATIONALE, recorded so it is not reinvented: an earlier version of this
+# comment said claude_subprocess cannot lead because it is guarded read-only while
+# "leaders write files". The bench refuted it in one line -- codex_subprocess runs
+# `--sandbox read-only` too, and leads. Read-only-ness does not discriminate, and the
+# reason it does not is worth knowing: a leader NEVER writes directly. It PROPOSES a
+# write and council_leader.review_and_write performs it after the council wall passes,
+# so the actor's own tool set is irrelevant to whether it can lead.
+# This tuple exists so a UI can offer exactly what the chain accepts instead of keeping
+# its own copy far from the code it must match. KEEP THE TWO IN STEP -- adding a branch
+# below without adding it here makes the transport unofferable; the reverse offers a
+# leader that fails closed at dispatch with ok=False.
+LEADER_TRANSPORTS = ("openrouter", "codex_subprocess", "gemini_rest", "deepseek_https")
+
+
 async def _call_leader(leader: "Member", prompt: str, cwd: Path) -> dict:
     """Dispatch ONE leader-model call by transport and return its RAW text.
 

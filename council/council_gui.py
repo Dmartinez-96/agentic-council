@@ -60,6 +60,23 @@ VERDICT_COLOURS = {"PASS": "#2e7d32", "WARN": "#ef6c00", "BLOCK": "#c62828",
                    "DECLINED": "#6a1b9a", "UNPARSEABLE": "#6d4c41", "ERROR": "#c62828"}
 
 
+def leader_transports() -> list[str]:
+    """The transports a LEADER may use, read from the engine's LEADER_TRANSPORTS.
+
+    NOT VALID_TRANSPORTS: that is the MEMBER set and is strictly larger. Offering the
+    member set here would put `claude_subprocess` in the dropdown, which _call_leader has
+    no branch for and rejects with ok=False -- a leader that fails at dispatch. I made
+    exactly that mistake and the bench caught it.
+
+    Falls back to a literal copy if the import fails, so the GUI still opens.
+    """
+    try:
+        import consult_council as cc
+        return list(cc.LEADER_TRANSPORTS)
+    except Exception:
+        return ["openrouter", "codex_subprocess", "gemini_rest", "deepseek_https"]
+
+
 def mono() -> QFont:
     f = QFont("monospace")
     f.setStyleHint(QFont.StyleHint.TypeWriter)
@@ -112,7 +129,7 @@ class ConfigTab(QWidget):
         lb = QHBoxLayout(leader_box)
         self.leader_transport = QComboBox()
         self.leader_transport.addItem("Claude Code harness (no council-native leader)", "")
-        for t in ("openrouter", "codex_subprocess", "gemini_rest", "deepseek_https"):
+        for t in leader_transports():
             self.leader_transport.addItem(t, t)
         self.leader_name = QLineEdit(); self.leader_name.setPlaceholderText("name")
         self.leader_model = QLineEdit(); self.leader_model.setPlaceholderText("model slug")
@@ -132,12 +149,40 @@ class ConfigTab(QWidget):
         lay.addWidget(sw)
 
         row = QHBoxLayout()
-        for label, slot in (("Reload from engine", self.reload),
+        # Add/Remove exist because R6 is "the exact SIZE and constitution of the council",
+        # and size cannot change if the table can only be re-typed. Add appends a row
+        # PRE-SEEDED with tier=voting / transport=openrouter. Save writes roster.json
+        # immediately without judging it; the engine's verdict appears on the NEXT read
+        # (reload / print_roster), which is where a bad seat surfaces as "ROSTER REJECTED"
+        # with the engine's own error list -- so the UI never re-implements validation.
+        for label, slot in (("Add member", self.add_member),
+                            ("Remove selected", self.remove_member),
+                            ("Reload from engine", self.reload),
                             ("Save roster.json", self.save),
                             ("Reset to built-in default", self.reset)):
             b = QPushButton(label); b.clicked.connect(slot); row.addWidget(b)
         lay.addLayout(row)
         self.reload()
+
+    def add_member(self) -> None:
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        # Seeded with the safe default rather than blanks: "voting"/"openrouter" is the
+        # shape most seats take, and an empty transport is guaranteed to fail validation.
+        for c, val in enumerate(("", "voting", "openrouter", "", "")):
+            self.table.setItem(r, c, QTableWidgetItem(val))
+        self.table.setCurrentCell(r, 0)
+        self.status.setText("row added -- fill in name and model, then Save roster.json")
+
+    def remove_member(self) -> None:
+        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        if not rows:
+            self.status.setText("select a row first (click any cell in it)")
+            return
+        for r in rows:
+            self.table.removeRow(r)
+        self.status.setText(f"removed {len(rows)} row(s) -- not saved until you "
+                            f"press Save roster.json")
 
     def reload(self) -> None:
         data = ge.print_roster()
