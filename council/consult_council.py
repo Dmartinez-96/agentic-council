@@ -1882,6 +1882,20 @@ def _ensure_nogit_stub() -> Path:
     return NOGIT_DIR
 
 
+# Credentials scrubbed from EVERY member subprocess's environment, whatever its transport.
+# CLAUDE_CODE_OAUTH_TOKEN is a long-lived Claude subscription token. Operators are told to
+# export it from a shell rc file, which puts it in the environment of every process started
+# from an interactive shell -- and _member_env() below is dict(os.environ), so without this
+# it reaches every member, including codex, an agentic CLI with network access. No member
+# needs it: the claude seat authenticates from ~/.claude/.credentials.json (measured -- a
+# read-only bind of that file alone returned a successful call), and every other transport
+# uses its own key or its own CLI login.
+# Scrubbed HERE rather than via a per-call drop_env because this is the single place every
+# member subprocess passes through; drop_env is threaded to exactly one call site, so a
+# credential filtered there would still reach all the others.
+MEMBER_SCRUB_ENV = ("CLAUDE_CODE_OAUTH_TOKEN",)
+
+
 def _member_env() -> dict:
     """Environment for member subprocesses: NOGIT_DIR prepended to PATH so
     a bare `git` is shadowed by the refusing stub. VS Code / editor
@@ -1892,7 +1906,8 @@ def _member_env() -> dict:
     env["PATH"] = str(_ensure_nogit_stub()) + os.pathsep + env.get("PATH", "")
     for key in list(env):
         if key.startswith("VSCODE_") or key in ("TERM_PROGRAM",
-                                                 "TERM_PROGRAM_VERSION"):
+                                                 "TERM_PROGRAM_VERSION",
+                                                 *MEMBER_SCRUB_ENV):
             del env[key]
     return env
 
