@@ -3086,6 +3086,17 @@ DIRECT_TRANSPORT_MODELS = {
     "gemini_rest": GEMINI_API_MODEL,
     "deepseek_https": DEEPSEEK_MODEL,
 }
+# The direct-vendor transports whose DISPATCH actually reads fallback_model and retries
+# through OpenRouter when the subscription route errors. _validate_transport_model rejects
+# a fallback on any transport NOT listed here, and the reason it does is worth keeping: a
+# fallback nothing reads looks load-bearing while being dead, so the roster would promise
+# a resilience it does not have.
+# THIS MUST TRACK _run_member_transport. It drifted once, immediately: the claude dispatch
+# branch was written WITH a fallback leg while this gate still named codex alone, so the
+# engine could route a claude fallback but the validator refused to let anyone configure
+# one -- the roster was rejected with "nothing reads it there" about a path that did read
+# it. Adding a fallback leg to a transport means adding it here in the same edit.
+FALLBACK_CAPABLE_TRANSPORTS = ("codex_subprocess", "claude_subprocess")
 
 
 def _validate_transport_model(rec: dict, name: str, where: str,
@@ -3129,7 +3140,7 @@ def _validate_transport_model(rec: dict, name: str, where: str,
                           f"use the openrouter transport")
             return None
         model = const
-        if transport != "codex_subprocess" and fallback is not None:
+        if transport not in FALLBACK_CAPABLE_TRANSPORTS and fallback is not None:
             errors.append(f"{where}: fallback_model is not supported on "
                           f"{transport} (nothing reads it there, so it "
                           f"would look load-bearing and be dead)")

@@ -77,6 +77,64 @@ def leader_transports() -> list[str]:
         return ["openrouter", "codex_subprocess", "gemini_rest", "deepseek_https"]
 
 
+def engine_rules() -> dict:
+    """Every constraint the roster editor needs, READ FROM THE ENGINE.
+
+    Zero literals is the whole point. The same rule expressed in two places has drifted
+    TWICE in this project: the leader dropdown (a GUI copy that a later "fix" made wrong by
+    deriving it from the MEMBER transport set) and the fallback gate (a dispatch leg added
+    without updating the validator that permits it). A third incident is often miscounted
+    as drift and is NOT: the canonical-name rejection came from the validator working
+    exactly as intended against a wrong instruction. A cascading editor multiplies the
+    places a rule can be expressed, so it takes all of them from here.
+
+    The fallback question is the subtle one and the bench caught me getting it backwards:
+    FALLBACK_CAPABLE_TRANSPORTS is the set of DIRECT-VENDOR transports that have an
+    OpenRouter retry leg. It is NOT the set of transports allowed to carry a fallback.
+    `openrouter` may always carry one -- the validator's openrouter branch never checks
+    it -- so gating on the tuple alone would have disabled fallback for the transport that
+    uses it most. See fallback_allowed().
+    """
+    try:
+        import consult_council as cc
+        return {
+            "tiers": sorted(cc.VALID_TIERS),
+            "transports": sorted(cc.VALID_TRANSPORTS),
+            "canonical": dict(cc.CANONICAL_TRANSPORT_NAMES),
+            "direct_models": dict(cc.DIRECT_TRANSPORT_MODELS),
+            "fallback_direct": tuple(cc.FALLBACK_CAPABLE_TRANSPORTS),
+        }
+    except Exception:
+        # The GUI still opens without the engine; the editor just cannot cascade.
+        return {"tiers": [], "transports": [], "canonical": {},
+                "direct_models": {}, "fallback_direct": ()}
+
+
+def fallback_allowed(transport: str, rules: dict) -> bool:
+    """Whether a fallback_model is legal on `transport`, matching the validator's shape:
+    unconditional for openrouter, and otherwise only for direct-vendor transports that
+    actually have a retry leg."""
+    return transport == "openrouter" or transport in rules["fallback_direct"]
+
+
+def cell_text(table, row: int, col: int) -> str:
+    """Read a cell whether it holds a widget or a plain item.
+
+    Tolerant on purpose: the roster editor uses cell WIDGETS (combo boxes, line edits) so
+    the columns can constrain each other, but a row can still hold plain items, and a
+    reader that understood only one shape would silently return "" for the other -- which
+    for the name column means the seat is dropped from the saved roster without a word.
+    """
+    w = table.cellWidget(row, col)
+    if w is not None:
+        if isinstance(w, QComboBox):
+            return w.currentText().strip()
+        if isinstance(w, QLineEdit):
+            return w.text().strip()
+    it = table.item(row, col)
+    return it.text().strip() if it else ""
+
+
 def mono() -> QFont:
     f = QFont("monospace")
     f.setStyleHint(QFont.StyleHint.TypeWriter)
@@ -114,6 +172,10 @@ class ConfigTab(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        # Read ONCE, before any widget is built: _build_row and _apply_cascade both need
+        # them, and reload() runs at the end of this constructor.
+        self.rules = engine_rules()
+        self.known_slugs: list[str] = []
         lay = QVBoxLayout(self)
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -136,6 +198,8 @@ class ConfigTab(QWidget):
         for w in (QLabel("transport"), self.leader_transport, QLabel("name"),
                   self.leader_name, QLabel("model"), self.leader_model):
             lb.addWidget(w)
+        self.leader_transport.currentIndexChanged.connect(
+            lambda _i: self._leader_cascade())
         lay.addWidget(leader_box)
 
         sw = QGroupBox("Switches (take effect on the next fire; GLOBAL to this install)")
@@ -164,15 +228,145 @@ class ConfigTab(QWidget):
         lay.addLayout(row)
         self.reload()
 
+    def _row_of(self, widget) -> int:
+        """Which row a cell widget sits in. Found by scanning rather than captured in the
+        signal connection, because Remove renumbers every row after it -- a captured index
+        would quietly edit the wrong seat."""
+        for r in range(self.table.rowCount()):
+            for c in range(self.table.columnCount()):
+                if self.table.cellWidget(r, c) is widget:
+                    return r
+        return -1
+
+    def _build_row(self, r: int, m: dict) -> None:
+        """Populate one row with the constrained editors. Column 0 name and columns 3/4
+        model+fallback are EDITABLE, so a slug newer than this UI is always typable; the
+        cascade only locks them where the engine forces one legal value."""
+        rules = self.rules
+        name = QLineEdit(str(m.get("name") or ""))
+        tier = QComboBox(); tier.addItems(rules["tiers"])
+        ti = tier.findText(str(m.get("tier") or ""))
+        tier.setCurrentIndex(ti if ti >= 0 else 0)
+        transport = QComboBox(); transport.addItems(rules["transports"])
+        pi = transport.findText(str(m.get("transport") or ""))
+        transport.setCurrentIndex(pi if pi >= 0 else 0)
+        model = QComboBox(); model.setEditable(True)
+        model.addItems(self.known_slugs)
+        model.setCurrentText(str(m.get("model") or ""))
+        fb = QComboBox(); fb.setEditable(True)
+        fb.addItems(self.known_slugs)
+        fb.setCurrentText(str(m.get("fallback_model") or ""))
+        for c, w in enumerate((name, tier, transport, model, fb)):
+            self.table.setCellWidget(r, c, w)
+        transport.currentTextChanged.connect(
+            lambda _t, w=transport: self._apply_cascade(self._row_of(w)))
+        self._apply_cascade(r)
+
+    def _apply_cascade(self, r: int) -> None:
+        """Make the row express what the engine will actually accept.
+
+        For the four direct-vendor transports the validator forces BOTH the record name
+        (CANONICAL_TRANSPORT_NAMES) and the model (DIRECT_TRANSPORT_MODELS) to one value
+        each, so those cells are filled in and locked rather than offered as a choice --
+        a one-option dropdown would imply a decision that does not exist. openrouter
+        leaves both free. Fallback follows fallback_allowed(), which is NOT the bare
+        FALLBACK_CAPABLE_TRANSPORTS tuple; see engine_rules().
+        """
+        if r < 0:
+            return
+        rules = self.rules
+        name = self.table.cellWidget(r, 0)
+        transport = self.table.cellWidget(r, 2)
+        model = self.table.cellWidget(r, 3)
+        fb = self.table.cellWidget(r, 4)
+        if not all((name, transport, model, fb)):
+            return
+        t = transport.currentText()
+        canonical = rules["canonical"].get(t)
+        forced_model = rules["direct_models"].get(t)
+        if canonical is not None:
+            name.setText(canonical)
+            name.setReadOnly(True)
+            name.setToolTip(f"forced by transport {t}")
+        else:
+            name.setReadOnly(False)
+            name.setToolTip("")
+        if forced_model is not None:
+            model.setCurrentText(forced_model)
+            model.setEnabled(False)
+            model.setToolTip(f"{t} reads its model from a module constant")
+        else:
+            model.setEnabled(True)
+            model.setToolTip("")
+        allowed = fallback_allowed(t, rules)
+        if not allowed:
+            fb.setCurrentText("")
+        fb.setEnabled(allowed)
+        fb.setToolTip("" if allowed else f"fallback_model is not read on {t}")
+        self._warn_duplicate_names()
+
+    def _leader_cascade(self) -> None:
+        """The same derive-and-lock rule for the Leader box.
+
+        This exists because the leader box is where the rule actually bit: a leader was
+        named `codex-leader` for transport codex_subprocess, and _validate_leader runs the
+        SAME _validate_transport_model path as a member, so the canonical name is forced
+        there too. Constraining only the members table would have left the exact path that
+        failed still able to fail.
+        """
+        rules = self.rules
+        t = self.leader_transport.currentData() or ""
+        canonical = rules["canonical"].get(t)
+        forced_model = rules["direct_models"].get(t)
+        if canonical is not None:
+            self.leader_name.setText(canonical)
+            self.leader_name.setReadOnly(True)
+            self.leader_name.setToolTip(f"forced by transport {t}")
+        else:
+            self.leader_name.setReadOnly(False)
+            self.leader_name.setToolTip("")
+        if forced_model is not None:
+            self.leader_model.setText(forced_model)
+            self.leader_model.setReadOnly(True)
+            self.leader_model.setToolTip(f"{t} reads its model from a module constant")
+        else:
+            self.leader_model.setReadOnly(False)
+            self.leader_model.setToolTip("")
+        # No transport selected means the Claude Code harness leads and neither field is
+        # written to roster.json at all, so leaving them editable would invite typing
+        # into fields that go nowhere.
+        harness = not t
+        self.leader_name.setEnabled(not harness)
+        self.leader_model.setEnabled(not harness)
+
+    def _warn_duplicate_names(self) -> None:
+        """Surface a canonical-name clash BEFORE Save. Auto-fill can produce two seats
+        both named `codex`, which the engine rejects as a duplicate -- better to see it
+        while editing than as a rejection afterwards. Advisory only: the engine remains
+        the authority and nothing here blocks a save."""
+        seen: dict[str, int] = {}
+        dupes = []
+        for r in range(self.table.rowCount()):
+            n = cell_text(self.table, r, 0)
+            if not n:
+                continue
+            if n in seen:
+                dupes.append(n)
+            seen[n] = r
+        if dupes:
+            self.status.setText(
+                f"duplicate member name(s): {', '.join(sorted(set(dupes)))} -- the engine "
+                f"will reject this roster. Two seats cannot share a name, and the direct-"
+                f"vendor transports each force one.")
+
     def add_member(self) -> None:
         r = self.table.rowCount()
         self.table.insertRow(r)
-        # Seeded with the safe default rather than blanks: "voting"/"openrouter" is the
-        # shape most seats take, and an empty transport is guaranteed to fail validation.
-        for c, val in enumerate(("", "voting", "openrouter", "", "")):
-            self.table.setItem(r, c, QTableWidgetItem(val))
+        # Seeded openrouter/voting: that is the shape 11 of 12 default seats take, and it
+        # is the only transport leaving both name and model free to fill in.
+        self._build_row(r, {"tier": "voting", "transport": "openrouter"})
         self.table.setCurrentCell(r, 0)
-        self.status.setText("row added -- fill in name and model, then Save roster.json")
+        self.status.setText("row added -- name and model, then Save roster.json")
 
     def remove_member(self) -> None:
         rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
@@ -190,15 +384,28 @@ class ConfigTab(QWidget):
             self.status.setText(f"could not read the roster: {data['error']}")
             return
         members = data.get("members", [])
+        # Suggestions, never a whitelist: every slug already in the roster plus the
+        # constants. The combo stays editable so a model newer than this UI is typable --
+        # a frozen list would be a third source of truth and would block new models.
+        self.known_slugs = sorted({str(m.get("model")) for m in members if m.get("model")}
+                                  | {str(m.get("fallback_model")) for m in members
+                                     if m.get("fallback_model")}
+                                  | set(self.rules["direct_models"].values()))
+        self.table.setRowCount(0)
         self.table.setRowCount(len(members))
         for r, m in enumerate(members):
-            for c, key in enumerate(("name", "tier", "transport", "model", "fallback_model")):
-                self.table.setItem(r, c, QTableWidgetItem(str(m.get(key) or "")))
+            self._build_row(r, m)
         leader = data.get("leader") or {}
         idx = self.leader_transport.findData(leader.get("transport") or "")
         self.leader_transport.setCurrentIndex(max(idx, 0))
         self.leader_name.setText(str(leader.get("name") or ""))
         self.leader_model.setText(str(leader.get("model") or ""))
+        # LAST, and unconditionally. Setting the index above fires the cascade, but the
+        # two setText calls then overwrite whatever it forced -- so the forced values have
+        # to be re-applied after them. Unconditional because selecting index 0 emits no
+        # change signal when it was already 0, and the harness case still has to disable
+        # the two fields.
+        self._leader_cascade()
         errs, warns = data.get("errors") or [], data.get("warnings") or []
         bits = [f"active source: {data.get('source')}", f"{len(members)} seats"]
         if errs:
@@ -227,9 +434,8 @@ class ConfigTab(QWidget):
     def save(self) -> None:
         members = []
         for r in range(self.table.rowCount()):
-            def cell(c):
-                it = self.table.item(r, c)
-                return it.text().strip() if it else ""
+            def cell(c, _r=r):
+                return cell_text(self.table, _r, c)
             if not cell(0):
                 continue
             rec = {"name": cell(0), "tier": cell(1), "transport": cell(2), "model": cell(3)}
