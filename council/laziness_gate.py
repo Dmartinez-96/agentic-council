@@ -255,9 +255,19 @@ def main() -> int:
     # name; blocking those would prevent the rules from being written
     # at all. The council source code likewise references the triggers
     # by name in its quality-bar implementation.
-    exempt_substrings = [
-        "/professional/council/",
-        "/professional/agentic-council/",
+    #
+    # THE COUNCIL'S OWN TREES ARE DERIVED, NOT NAMED. They used to be spelled
+    # "/professional/council/" and "/professional/agentic-council/", which silently stopped
+    # exempting anything the moment the tree moved -- observed 2026-08-02, when the WSL2 ->
+    # native-Ubuntu move landed the live tree under ~/Documents and every edit to a council
+    # file became gate-eligible. A substring naming a directory the installer never chose was
+    # never going to survive a move; this hook knows where it lives, so it asks.
+    # The package sits beside the live tree in both layouts seen so far; if that stops being
+    # true, the exemption quietly narrows rather than breaking, which is the safe direction.
+    here = Path(__file__).resolve().parent
+    derived = [f"{here.as_posix().lower()}/",
+               f"{(here.parent / 'agentic-council').as_posix().lower()}/"]
+    exempt_substrings = derived + [
         "/.claude/projects/",
         "/.claude/commands/",
         "/memory/feedback_",

@@ -46,6 +46,7 @@ import argparse
 import asyncio
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import consult_council as cc
@@ -70,6 +71,17 @@ def main() -> int:
                          "would EOF and silently decline every write.")
     ap.add_argument("--session-id", default="")
     ap.add_argument("--transcript-path", default="")
+    # ELEVATION IS OPT-IN, PER TURN, FROM THE OPERATOR. Not a roster key and not a default:
+    # members are fired unattended by a hook, the leader is driven by a person who is looking
+    # at the screen, and only that person can widen the sandbox. Absent these flags a leader
+    # turn's EXEC is byte-for-byte the member sandbox.
+    ap.add_argument("--gpu", action="store_true",
+                    help="let EXEC reach the host GPU. Refused at preflight if no GPU device "
+                         "is present or the memory bound cannot be imposed.")
+    ap.add_argument("--exec-wall", type=int, default=None, metavar="S",
+                    help="wall-clock seconds per EXEC when elevated (default "
+                         f"{cc.EXEC_ELEVATED_WALL_TIMEOUT}). Only meaningful with --gpu, "
+                         "which is what selects the elevated profile.")
     args = ap.parse_args()
 
     events = council_events.emitter_from_fd(args.events_fd, cc._redact_request_lines)
@@ -148,21 +160,75 @@ def main() -> int:
                     reason=res.get("reason") or "")
         return res
 
+    # THE ELEVATED PROFILE, built and PREFLIGHTED BEFORE the turn starts. Refusing here rather
+    # than at the first EXEC matters: an operator who ticked "use the GPU" should be told at
+    # once that this host cannot, not after the leader has spent several model calls building
+    # up to a command that then fails.
+    profile = None
+    if args.gpu:
+        kw = {"gpu": True}
+        if args.exec_wall is not None:
+            kw["wall_timeout"] = args.exec_wall
+        profile = cc.elevated_exec_profile(**kw)
+        ok, why = cc.exec_profile_preflight(profile)
+        if not ok:
+            print(f"--gpu was requested but this host cannot honour it: {why}",
+                  file=sys.stderr)
+            events.emit("note", text=f"elevated profile refused: {why}")
+            return 2
+        events.emit("note", text=f"elevated profile {profile.name}: GPU on, network OFF, "
+                                 f"memory {profile.mem_max}, wall {profile.wall_timeout}s")
+
+    def on_event(name: str, **fields) -> None:
+        """Bridge run_leader_turn's live callbacks onto the NDJSON stream.
+
+        WRITES ARE DROPPED HERE, and that is not a gap. This process has TWO live sources for
+        a write: the `apply_write` wrapper above, which fires at the moment of the write and
+        carries the council's verdict and the approve/decline outcome; and this callback,
+        which fires just after and carries only a note. Forwarding both put two records with
+        DIFFERENT SCHEMAS on the stream for one write -- `verdict`/`applied` from one,
+        `ok`/`note` from the other -- so a consumer would show every write twice and could
+        read the verdict from whichever arrived last. The richer source wins.
+
+        `leader_text` carries MODEL PROSE, which is why it goes through this channel at all:
+        council_events redacts every string it serialises with the engine's own redactor, so
+        a REQUEST_* argument quoted by the leader cannot ride out on it.
+        """
+        if name == "leader_action" and fields.get("action") == "write":
+            return
+        events.emit(name, **fields)
+
+    # ONE SCRATCH DIRECTORY FOR THE WHOLE TURN, which is the point of it: install in round 1,
+    # train in round 3, read the results in round 5. It is created OUTSIDE the workdir --
+    # run_exec_sandbox refuses a scratch aimed at the tree under review, and this is what
+    # makes that refusal satisfiable rather than a wall.
+    # NOT deleted on exit, deliberately: a training run's artifacts are the deliverable, and a
+    # turn that vanished its own outputs would be useless. The path is printed and recorded on
+    # the TurnRecord so the operator knows where they are.
+    scratch = Path(tempfile.mkdtemp(prefix="council_leader_scratch_"))
+    events.emit("note", text=f"per-turn scratch (read-write, persists after the turn): "
+                             f"{scratch}")
+
     record = asyncio.run(cl.run_leader_turn(
         leader, args.task, args.workdir, session_id=args.session_id,
         transcript_path=args.transcript_path, max_rounds=args.max_rounds,
-        apply_write=apply_write))
+        apply_write=apply_write, profile=profile, scratch=scratch, on_event=on_event))
 
-    for res in getattr(record, "results", []) or []:
-        if getattr(res, "kind", "") != "write":     # writes already reported above
-            events.emit("leader_action", action=getattr(res, "kind", "?"),
-                        target=getattr(res, "arg", ""), applied=bool(getattr(res, "ok", False)),
-                        verdict="", reason=getattr(res, "note", "") or "")
+    # The end-of-turn summary. Every non-write action ALREADY streamed live via on_event, so
+    # this is a recap, not the only report -- which is what it used to be, and it was empty:
+    # this loop read `getattr(record, "results", [])` while TurnRecord had no such field, so
+    # it emitted nothing on every turn ever run. TurnRecord.results now exists and is
+    # populated, and the getattr is gone with it.
+    for res in record.results:
+        if res.kind != "write":                 # writes already reported by apply_write
+            events.emit("leader_action_final", action=res.kind, target=res.arg,
+                        applied=bool(res.ok), verdict="", reason=res.note or "")
 
     stop = getattr(record, "stop_reason", "")
-    events.emit("final_verdict", verdict=f"turn ended: {stop}", log_path="",
+    events.emit("final_verdict", verdict=f"turn ended: {stop}", log_path=str(scratch),
                 events_emitted=events.count, events_dropped=events.dropped_total)
     print(cl.format_turn_record(record))
+    print(f"\nscratch directory (kept): {scratch}")
     return 0
 
 

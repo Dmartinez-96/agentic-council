@@ -5,7 +5,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "{{COUNCIL_ROOT}}/laziness_gate.py"
+          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/laziness_gate.py"
         }
       ]
     }
@@ -16,11 +16,11 @@
       "hooks": [
         {
           "type": "command",
-          "command": "{{COUNCIL_ROOT}}/council_advisor.py"
+          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/council_advisor.py"
         },
         {
           "type": "command",
-          "command": "{{COUNCIL_ROOT}}/evidence_logger.py"
+          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/evidence_logger.py"
         }
       ]
     },
@@ -29,7 +29,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "{{COUNCIL_ROOT}}/evidence_logger.py"
+          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/evidence_logger.py"
         }
       ]
     }
@@ -39,7 +39,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "{{COUNCIL_ROOT}}/stop_audit.py"
+          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/stop_audit.py"
         }
       ]
     }
@@ -49,11 +49,11 @@
       "hooks": [
         {
           "type": "command",
-          "command": "{{COUNCIL_ROOT}}/session_start_probe.py"
+          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/session_start_probe.py"
         },
         {
           "type": "command",
-          "command": "{{COUNCIL_ROOT}}/session_start_directive.py"
+          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/session_start_directive.py"
         }
       ]
     }

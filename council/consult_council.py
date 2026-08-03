@@ -3413,7 +3413,65 @@ def _redact_request_lines(text: str) -> str:
     return _REQUEST_LINE_RE.sub(lambda m: f"{m.group(1)}: <redacted>", text or "")
 
 
-def read_repo_file(workdir: Path, rel_path: str) -> tuple[str | None, str]:
+# SPAN REQUESTS. A member may suffix a requested path with an inclusive range so it can
+# reach a symbol that does not sit in the file's first RETRIEVAL_PER_FILE_CAP bytes:
+#     path#L120-240   lines 120..240, 1-based, both ends included
+#     path#L120-      line 120 to EOF (still byte-capped)
+#     path#B24000-    byte 24000 to EOF -- the CONTINUATION form, for picking up exactly
+#                     where a truncated delivery stopped
+# Both units are INCLUSIVE, i.e. HTTP Range semantics: #B0-99 is the first 100 bytes.
+# WHY THIS EXISTS, from a real fire rather than a guess: in
+# logs/2026-08-02/20260802T054717Z-98058e60.json both kimi and glm requested
+# consult_council.py, received `truncated to 23992 of 351321 bytes`, and could not reach the
+# function under discussion -- kimi's verdict was "I can neither confirm nor refute the
+# code-level claims". Head-only retrieval made a 351 KB file effectively unreviewable.
+SPAN_REQUEST_RE = re.compile(r"^(?P<path>.+)#(?P<unit>[LB])(?P<start>\d+)-(?P<end>\d*)$")
+# Bounds the bytes scanned to satisfy a LINE range. A line range cannot be served by seeking
+# -- the newlines have to be counted from the start -- so this is what stops a member turning
+# `#L999999-` into a full read of an arbitrarily large file.
+RETRIEVAL_LINE_SCAN_CAP = 2_000_000
+# Bytes read from the TOP of a file to decide whether a span request is aimed at a brain
+# note. MEASURED against this vault rather than guessed: across 35 notes the largest
+# frontmatter is 3,248 bytes (a note's frontmatter carries its whole check_argv, which is what
+# makes them large), so 64 KB is ~20x the observed worst case.
+# IT IS STILL A WINDOW, AND THE GUARD DOES NOT RELY ON IT BEING BIG ENOUGH. A note whose
+# frontmatter ran past the probe would be unrecognisable to looks_like_brain_note and its span
+# would be SERVED -- fail-open, and exactly the bypass the guard exists to stop. So the test
+# in read_repo_file denies on the OPENING delimiter too: a file that starts with frontmatter
+# is span-denied whether or not its closer is inside the window. The residual cost is that an
+# ordinary markdown file carrying YAML frontmatter cannot be span-read either.
+BRAIN_NOTE_PROBE_BYTES = 65_536
+
+
+def parse_file_request(token: str) -> tuple[str, tuple[str, int, int | None] | None, str]:
+    """Split a REQUEST_FILE argument into (path, span, error).
+
+    `span` is None for a plain path, else (unit, start, end) with unit in {"L","B"} and
+    end None meaning "to EOF". A non-empty `error` means the suffix PARSED as a span and was
+    invalid -- returned rather than raised so the member gets told what was wrong with its
+    request instead of a bare not-found.
+
+    A token whose suffix does not match the span grammar is returned as a path VERBATIM,
+    '#' and all. That is deliberate: '#' is legal in a filename, and guessing that a
+    malformed suffix "was meant to be" a span would deny a file that genuinely exists. The
+    cost is that a typo like `a.py#L-5` is reported as a missing path rather than a bad
+    range, and the reported path shows the '#' so the member can see why.
+    """
+    m = SPAN_REQUEST_RE.match(token or "")
+    if m is None:
+        return token, None, ""
+    path, unit = m.group("path"), m.group("unit")
+    start = int(m.group("start"))
+    end = int(m.group("end")) if m.group("end") else None
+    if unit == "L" and start < 1:
+        return path, None, "line numbers are 1-based; L0 is not a line"
+    if end is not None and end < start:
+        return path, None, f"range end {end} precedes start {start}"
+    return path, (unit, start, end), ""
+
+
+def read_repo_file(workdir: Path, rel_path: str,
+                   span: tuple[str, int, int | None] | None = None) -> tuple[str | None, str]:
     """Read one member-requested file from inside `workdir`, under containment.
 
     Threat model this defends against: path traversal ('..'), symlink escape
@@ -3427,6 +3485,19 @@ def read_repo_file(workdir: Path, rel_path: str) -> tuple[str | None, str]:
     from at most RETRIEVAL_PER_FILE_CAP - 8 bytes; the 8-byte reserve is
     standing rule 8's bound on replacement-decode growth, charged against the
     budget BEFORE slicing -- or (None, reason) on a denial.
+
+    `span` (see parse_file_request) selects an INCLUSIVE range instead of the head: ("B",
+    start, end) seeks to a byte offset, ("L", start, end) counts newlines from the start of
+    the file, bounded by RETRIEVAL_LINE_SCAN_CAP. The per-file byte cap applies to the
+    SELECTED region exactly as it does to the head, so a span widens WHERE a member can look,
+    never HOW MUCH it receives in one grant.
+
+    A SPAN ON A BRAIN NOTE IS DENIED, and this is a containment property rather than a
+    nicety. The vault gate decides whether a note's authored gloss may be shown at all, and
+    it identifies a note by frontmatter at the TOP of the file -- so `#L20-` would hand the
+    gate a fragment it does not recognise, and a refuted or superseded note would be
+    delivered raw, unbannered, by the one path built to stop exactly that. Notes are small,
+    so the whole-file request costs nothing. Ruled by the user, 2026-08-03.
 
     Containment is verified twice: on the RESOLVED path before opening, and
     again on the OPEN file descriptor. The fd check is FAIL-CLOSED: if the fd's
@@ -3475,22 +3546,128 @@ def read_repo_file(workdir: Path, rel_path: str) -> tuple[str | None, str]:
         if not true_path.is_relative_to(root):
             return None, "fd resolves outside the project workdir"
         budget = RETRIEVAL_PER_FILE_CAP - 8   # rule 8 replacement-growth reserve
-        chunks: list[bytes] = []
-        remaining = budget + 1
-        while remaining > 0:
-            chunk = os.read(fd, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
+
+        def _read_upto(limit: int) -> bytes:
+            out: list[bytes] = []
+            left = limit
+            while left > 0:
+                chunk = os.read(fd, left)
+                if not chunk:
+                    break
+                out.append(chunk)
+                left -= len(chunk)
+            return b"".join(out)
+
+        if span is not None:
+            # THE GATE PROBE, before any slicing. Identify a brain note from the file's own
+            # head -- never from the requested region, which is the whole point: a span that
+            # skips the frontmatter would present the gate with a fragment it cannot
+            # recognise. Cheap: one bounded read of the top of the file.
+            head = _read_upto(BRAIN_NOTE_PROBE_BYTES)
+            os.lseek(fd, 0, os.SEEK_SET)
+            head_text = head.decode("utf-8", errors="replace")
+            # TWO TESTS, and the second is why this is fail-closed. looks_like_brain_note
+            # needs BOTH frontmatter delimiters, so a note whose frontmatter ran past the
+            # probe would come back None and its span would be SERVED -- the exact bypass
+            # this guard exists to stop. The opening delimiter alone is therefore
+            # disqualifying: if a file starts with frontmatter, no span is served for it,
+            # window or no window.
+            if looks_like_brain_note(head_text) is not None:
+                return None, ("brain notes are delivered whole through the vault gate; "
+                              "re-request this path without the range suffix")
+            if _BRAIN_FM_OPEN.match(head_text):
+                # SAY WHAT THE RULE ACTUALLY IS. This arm also catches ordinary markdown
+                # carrying YAML frontmatter, which is NOT a brain note, and telling such a
+                # member "brain notes are delivered whole" would be a false premise it cannot
+                # act on. The rule it can act on is the one stated here.
+                return None, ("files beginning with '---' frontmatter are not served in "
+                              "ranges (the vault gate identifies notes by frontmatter, and a "
+                              "range could skip it); re-request without the range suffix")
+        unit, start, end = span if span is not None else ("HEAD", 0, None)
+        if unit == "B":
+            os.lseek(fd, start, os.SEEK_SET)
+            want = budget + 1 if end is None else min(budget + 1, end - start + 1)
+            data = _read_upto(max(want, 0))
+            truncated = len(data) > budget
+            data = data[:budget]
+            last = start + len(data) - 1 if data else start
+            if not data:
+                # A DENIAL, not an empty grant. collect_file_requests' own rule is that a
+                # denial is always delivered "so a denied file never masquerades as an empty
+                # one" -- and a granted empty fence is exactly that masquerade, with the
+                # added cost of spending delivery budget to say nothing.
+                return None, (f"empty range: byte {start} is at or past EOF "
+                              f"({st.st_size} bytes)")
+            note = (f"bytes {start}-{last} of {st.st_size}"
+                    + (f"; capped at {budget}" if truncated else ""))
+        elif unit == "L":
+            scanned = _read_upto(RETRIEVAL_LINE_SCAN_CAP)
+            partial_scan = len(scanned) >= RETRIEVAL_LINE_SCAN_CAP and st.st_size > len(scanned)
+            lines = scanned.decode("utf-8", errors="replace").splitlines(keepends=True)
+            picked = lines[start - 1: (None if end is None else end)]
+            # EMPTY SELECTION FIRST, because everything below indexes into `picked`. An
+            # earlier ordering put the budget handling ahead of this and reached picked[0]
+            # on an empty list -- an IndexError on exactly the input the denial below was
+            # written for, which also made that denial unreachable.
+            # An empty selection is a DENIAL, never a granted empty fence (the B branch
+            # above says why). Under a partial scan it is also not necessarily "past EOF":
+            # the file continues beyond what was scanned, so say which of the two it is.
+            if not picked:
+                return None, (f"empty range: line {start} is past the first {len(lines)} "
+                              f"lines, which is as far as the {RETRIEVAL_LINE_SCAN_CAP}-byte "
+                              f"line scan reached in this {st.st_size}-byte file"
+                              if partial_scan else
+                              f"empty range: line {start} is past EOF ({len(lines)} lines)")
+            # TRUNCATE ON A LINE BOUNDARY, and count what SURVIVED. Slicing the joined blob
+            # at `budget` and then reporting `start..start+len(picked)-1` names lines that
+            # were cut off -- a note asserting delivery of content the member never got.
+            kept: list[bytes] = []
+            size = 0
+            for ln in picked:
+                enc = ln.encode("utf-8")
+                if size + len(enc) > budget:
+                    break
+                kept.append(enc)
+                size += len(enc)
+            truncated = len(kept) < len(picked)
+            if not kept:
+                # One line alone exceeds the budget -- reachable only because `picked` is
+                # non-empty by the guard above. Deliver a byte-truncated prefix of that line
+                # rather than nothing, and say so: silence here would look identical to an
+                # empty range, which means something different.
+                data = picked[0].encode("utf-8")[:budget]
+                return data.decode("utf-8", errors="replace"), (
+                    f"line {start} alone exceeds the {budget}-byte cap; delivered its first "
+                    f"{len(data)} bytes only")
+            data = b"".join(kept)
+            last = start + len(kept) - 1
+            scope = (f"first {len(lines)} lines scanned" if partial_scan
+                     else f"{len(lines)} lines")
+            note = (f"lines {start}-{last} of {scope}"
+                    + (f"; capped at {budget} bytes" if truncated else ""))
+        else:
+            data = _read_upto(budget + 1)
+            truncated = len(data) > budget
+            data = data[:budget]
+            # THE CONTINUATION HINT. A truncated head used to end the conversation: a member
+            # was told the file was cut and given no way to see the rest, which is how a
+            # 351 KB file became unreviewable. Naming the exact next request turns a dead end
+            # into a follow-up the member can actually make.
+            # BUT ONLY WHERE THAT FOLLOW-UP WOULD BE SERVED. A file starting with frontmatter
+            # is span-denied by the guard above, so offering it a '#B' continuation would hand
+            # the member an instruction the harness then refuses -- a worse dead end than
+            # silence, because it costs a request to discover. Say the truth instead.
+            if not truncated:
+                note = f"{st.st_size} bytes"
+            elif _BRAIN_FM_OPEN.match(data.decode("utf-8", errors="replace")):
+                note = (f"truncated to {budget} of {st.st_size} bytes; this file begins with "
+                        f"'---' frontmatter, so ranges are not available for it")
+            else:
+                note = (f"truncated to {budget} of {st.st_size} bytes; request "
+                        f"'{rel_path}#B{budget}-' for the next span")
     finally:
         os.close(fd)
-    truncated = len(data) > budget
-    text = data[:budget].decode("utf-8", errors="replace")
-    note = (f"truncated to {budget} of {st.st_size} bytes"
-            if truncated else f"{st.st_size} bytes")
-    return text, note
+    return data.decode("utf-8", errors="replace"), note
 
 
 # --- The brain retrieval gate --------------------------------------------------
@@ -3756,10 +3933,24 @@ def collect_file_requests(round1_results: list[dict],
             # the full path still drives the read (which rejects >512 chars).
             disp = (p if len(p) <= REQUEST_PATH_DISPLAY_LEN
                     else p[:REQUEST_PATH_DISPLAY_LEN - 3] + "...")
-            entry: dict = {"member": name, "path": p, "granted": False}
-            if p not in cache:
-                cache[p] = read_repo_file(workdir, p)
-            content, note = cache[p]
+            # A request token may carry an inclusive range suffix (parse_file_request); the
+            # PATH is what the containment jail sees and the SPAN is what gets sliced.
+            req_path, span, span_err = parse_file_request(p)
+            entry: dict = {"member": name, "path": req_path, "request": p, "granted": False}
+            if span is not None:
+                entry["span"] = f"{span[0]}{span[1]}-" + ("" if span[2] is None else str(span[2]))
+            if span_err:
+                # A malformed range never reaches the filesystem: the member gets told what
+                # was wrong with its request rather than a not-found for a path it did type
+                # correctly.
+                content, note = None, span_err
+            else:
+                # CACHE ON THE WHOLE TOKEN, not the path. Two members asking for different
+                # ranges of one file are asking different questions, and keying on the path
+                # would serve the second one the first one's slice.
+                if p not in cache:
+                    cache[p] = read_repo_file(workdir, req_path, span)
+                content, note = cache[p]
             if content is None:
                 reason = note
             else:
@@ -4219,9 +4410,24 @@ EXEC_MAX_REQUESTS_PER_MEMBER = 2
 EXEC_CPU_SECONDS = 5            # RLIMIT_CPU per run (verified enforced this session)
 EXEC_MEM_MB = 512              # RLIMIT_AS
 EXEC_FSIZE_MB = 16             # RLIMIT_FSIZE
-EXEC_NPROC = 1024              # generous fork-bomb speed-bump (256 fails to boot bwrap
-#                                here, so this is NOT set aggressively -- the real
-#                                runaway guards are the wall timeout + tree kill + CPU/AS)
+# NO RLIMIT_NPROC. THERE IS DELIBERATELY NO CONSTANT HERE, and this is the user's ruling of
+# 2026-08-02, not an omission to be helpfully repaired.
+# WHY THE BOUND WAS DROPPED RATHER THAN RETUNED. `getrlimit(2)`, read on the host: RLIMIT_NPROC
+# limits threads "for the real user ID of the calling process", and fork fails EAGAIN once the
+# uid's count reaches it. It therefore counts what the WHOLE UID already runs, not what this
+# sandbox creates -- so it never bounded the job in the first place, it bounded the login
+# session, and how much it left for the job depended on whatever else the user had open.
+# IT FAILED CLOSED AND TOTALLY. The former `EXEC_NPROC = 1024` worked on a headless WSL2 host
+# that stayed under it. On a native Ubuntu desktop uid 1000 owned 1603 threads, so every exec
+# run died before starting with "bwrap: Creating new namespace failed: Resource temporarily
+# unavailable". Measured on this host: with no RLIMIT_NPROC set, the same bwrap argv returns
+# rc=0; with it set to 1024, rc=1 and that error.
+# AND IT WAS NEVER A CONTAINMENT GUARANTEE: the same man page records that RLIMIT_NPROC is not
+# enforced at all for a process holding CAP_SYS_ADMIN or CAP_SYS_RESOURCE, or running as uid 0.
+# THE GUARDS THAT ACTUALLY BOUND A RUNAWAY, and they are unchanged: the wall timeout, the
+# process-group kill (setsid + killpg), RLIMIT_CPU and RLIMIT_AS. A fork bomb inside the
+# sandbox is reaped by the process-group kill at the wall deadline; it is not admitted by a
+# per-uid thread ceiling that the host already imposes at 503293.
 EXEC_WALL_TIMEOUT = 15         # wall-clock seconds; on timeout the process GROUP is killed
 EXEC_OUTPUT_CAP = 16_000       # bytes of combined stdout+stderr delivered per run (8 reserved)
 EXEC_PER_FIRE_CAP = 40_000     # bytes of exec output delivered per fire (SHARED across members)
@@ -4337,64 +4543,467 @@ def build_sandbox_copy(workdir: Path, dest: Path) -> dict:
     return {"copied": copied, "skipped": skipped, "bytes": total_bytes}
 
 
-def run_exec_sandbox(command: str, workdir: Path) -> tuple[str | None, str, dict | None]:
-    """Run `command` via `sh -c` in a bubblewrap sandbox (network OFF, env cleared,
-    rlimits, wall timeout, process-group kill) over a scrubbed ephemeral copy of
-    workdir. Fail-closed if bubblewrap/userns is unavailable.
+# --- exec profiles: what one sandboxed run is allowed to reach -----------------------
+#
+# WHY A PROFILE OBJECT RATHER THAN MORE MODULE CONSTANTS. Every bound below used to be a
+# module constant, which meant there was exactly ONE sandbox and raising a limit for the
+# leader would have raised it for every member fire too. A profile makes the elevation an
+# ARGUMENT that a caller must pass deliberately: the member path (collect_exec_requests)
+# passes nothing and therefore cannot be elevated by any roster key. default_exec_profile()
+# carries the previous BOUNDS value-for-value; it does NOT mean the default path is unchanged,
+# because the output-cap fix in run_exec_sandbox changed what happens to a verbose command for
+# every caller. That fix is described where it lives, on run_exec_sandbox.
+#
+# THE TWO ELEVATIONS ARE ORTHOGONAL AND SEPARATELY GATED. `--dev /dev` withholding the GPU
+# and `--unshare-all` withholding the network are different absences; nothing about running
+# a CUDA job requires egress, so `gpu` and `net` are independent booleans and neither
+# implies the other.
 
-    Returns (combined stdout+stderr, note, info), or (None, reason, None) when the
-    sandbox refused to run at all.
+GPU_WSL_DEVICE = "/dev/dxg"          # WSL2's GPU character device (there is no /dev/nvidia*)
+GPU_WSL_LIB_DIR = "/usr/lib/wsl/lib"  # libcuda.so.1, libnvidia-ml.so.1, nvidia-smi
+GPU_CUDA_BIN = "/usr/local/cuda/bin"  # nvcc et al., already inside the existing /usr bind
+# The minimum /etc a resolver needs. MEASURED: with none of these, `--share-net` brings the
+# interfaces up and `getent hosts` still fails, because the sandbox has no /etc whatsoever.
+NET_ETC_BINDS = ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/ssl")
+EXEC_SCRATCH_MOUNT = "/scratch"      # where a per-turn scratch dir appears inside the sandbox
+
+# ELEVATED BOUNDS ARE INHERITED FROM THE HOST, NOT INVENTED HERE, and that is the user's
+# correction: "why have caps at all and not just use the system limit caps?". An earlier
+# version encoded CPU 6h / MemoryMax 16G / FSIZE 20GB / output 200000, five numbers with no
+# defensible basis, which codex held a WARN on across three rounds -- correctly, because
+# labelling a made-up number "provisional" does not make it measured.
+# So the four bounds that HAVE a system analogue now inherit it. Measured on this host
+# (`python3 -c "import resource; resource.getrlimit(...)"`, and /proc/meminfo):
+#   RLIMIT_CPU (-1, -1)   RLIMIT_AS (-1, -1)   RLIMIT_FSIZE (-1, -1)   MemTotal 115387984 kB
+# i.e. the system imposes no CPU, address-space or file-size limit on this user at all, so an
+# elevated profile imposes none either, and the memory ceiling comes from MemTotal.
+# TWO BOUNDS HAVE NO SYSTEM ANALOGUE and are therefore NOT inherited, which is worth being
+# explicit about rather than pretending everything is derived:
+#   wall_timeout -- a property of THIS harness's read loop, not of the host. It is a runaway
+#       backstop; the operator's Stop button is the real bound. It stays an argument.
+#   output_cap   -- a PROMPT budget: bytes delivered into a model's context. Nothing about
+#       the host constrains it. With spill-to-scratch the full log is on disk regardless, so
+#       this caps what is quoted inline, not what is captured.
+EXEC_ELEVATED_WALL_TIMEOUT = 3600     # runaway backstop only; see above
+EXEC_ELEVATED_OUTPUT_CAP = 200_000    # bytes quoted inline; the full log spills to scratch
+
+
+def system_memory_max() -> str | None:
+    """The host's own memory ceiling as a systemd size string, or None if unreadable.
+
+    MemTotal, not MemAvailable: MemAvailable moves between the moment a profile is built and
+    the moment the job peaks, so a bound derived from it would be a different number every
+    run and could refuse a job for a reason the operator cannot see. MemTotal is the system
+    limit in the sense the user asked for -- the machine's actual ceiling.
+    Returning None (rather than a fallback constant) matters: exec_profile_preflight then
+    REFUSES to elevate, instead of silently substituting an invented number, which is the
+    exact failure this function exists to remove.
+    """
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                kb = int(line.split()[1])
+                return f"{kb}K"
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+@dataclass(frozen=True)
+class ExecProfile:
+    """One sandbox configuration. Frozen, so a profile handed to a callee cannot be widened.
+
+    None ON A LIMIT FIELD MEANS "DO NOT SET IT" -- inherit whatever the host gives the
+    process. That is how an elevated profile expresses "use the system's own caps" rather
+    than a number someone chose.
+
+    as_bytes IS NOT A MEMORY LIMIT FOR GPU WORK, and this is the field most likely to be
+    "fixed" by someone raising it. RLIMIT_AS bounds VIRTUAL address space, and the NVIDIA
+    driver RESERVES about 136 GiB of it at cuInit while making ~26 MB resident (measured
+    2026-08-01: VmSize 142815876 kB against VmRSS 26332 kB, re-runnable via
+    `python3 _nogit/probe_gpu_cgroup_facts.py`). Under the default 512 MB RLIMIT_AS, ctypes
+    cuInit(0) returns 2 = CUDA_ERROR_OUT_OF_MEMORY; with the limit off it returns 0. So any
+    RLIMIT_AS small enough to bound anything kills CUDA, and any value large enough for CUDA
+    bounds nothing. A GPU profile sets as_bytes=None and bounds RESIDENT memory with
+    `mem_max` (a cgroup) instead -- measured under MemoryMax=2G: cuInit -> 0, and a 3 GB
+    resident allocation is killed at the cap.
+    """
+    name: str
+    cpu_seconds: int | None = EXEC_CPU_SECONDS
+    wall_timeout: int = EXEC_WALL_TIMEOUT
+    as_bytes: int | None = EXEC_MEM_MB * 1024 * 1024
+    mem_max: str | None = None
+    fsize_bytes: int | None = EXEC_FSIZE_MB * 1024 * 1024
+    output_cap: int = EXEC_OUTPUT_CAP
+    gpu: bool = False
+    net: bool = False
+
+
+def default_exec_profile() -> ExecProfile:
+    """Value-for-value what run_exec_sandbox did before profiles existed. A member fire gets
+    this and nothing else.
+
+    A FUNCTION, NOT A CONSTANT, AND THE REGRESSION SUITE IS WHY. The first version was a
+    module-level `DEFAULT_EXEC_PROFILE = ExecProfile("default")`, which froze
+    EXEC_WALL_TIMEOUT and friends at IMPORT time. `_nogit/probe_run_exec_sandbox.py` sets
+    `cc.EXEC_WALL_TIMEOUT = 3` to test the wall-deadline reap without waiting 15s, and that
+    assignment silently stopped having any effect -- the probe went red with the escaper
+    correctly reaped but `dt` at 15s instead of 3s. Any other caller patching one of these
+    constants would have been quietly ignored the same way. Reading them at CALL time keeps
+    them the live knobs they have always been.
+    """
+    return ExecProfile("default",
+                       cpu_seconds=EXEC_CPU_SECONDS,
+                       wall_timeout=EXEC_WALL_TIMEOUT,
+                       as_bytes=EXEC_MEM_MB * 1024 * 1024,
+                       fsize_bytes=EXEC_FSIZE_MB * 1024 * 1024,
+                       output_cap=EXEC_OUTPUT_CAP)
+
+
+def elevated_exec_profile(*, gpu: bool = False, net: bool = False,
+                          wall_timeout: int = EXEC_ELEVATED_WALL_TIMEOUT,
+                          mem_max: str | None = None,
+                          output_cap: int = EXEC_ELEVATED_OUTPUT_CAP) -> ExecProfile:
+    """Build the leader's elevated profile: three rlimits INHERITED from the host, and three
+    bounds this harness imposes. Each is listed, because "use the system's limits" describes
+    only part of what this function does. (It was FOUR until RLIMIT_NPROC was dropped
+    entirely on 2026-08-02 -- see the constants block for why the bound went rather than
+    being retuned.)
+
+    INHERITED -- cpu_seconds, as_bytes and fsize_bytes are all None, so RLIMIT_CPU, RLIMIT_AS
+    and RLIMIT_FSIZE are never set and the job gets whatever the host gives it. Measured on
+    this host: all three are (-1, -1), i.e. unlimited.
+
+    IMPOSED, and NOT inherited from anything:
+      mem_max       a cgroup ceiling of MemTotal by default. CALL THIS WHAT IT IS: MemTotal
+                    is PHYSICAL RAM, not a limit the system enforces -- the user slice's
+                    memory.max reads `max` (measured), so this is a NEW policy, chosen
+                    because the alternative is a GPU job with no memory bound at all. The
+                    bench caught an earlier draft calling it "the host's own ceiling".
+      wall_timeout  a property of THIS harness's read loop; the host has no equivalent.
+      output_cap    a prompt budget -- bytes quoted into a model's context. Nothing about the
+                    host constrains it.
+
+    `mem_max` defaults to system_memory_max() -- the machine's MemTotal. Pass a smaller value
+    to bound the job below the host's ceiling. If /proc/meminfo cannot be read the default is
+    None and exec_profile_preflight REFUSES the profile rather than running with no memory
+    bound; there is no fallback constant, deliberately, because a fallback constant is exactly
+    the invented number this design removed.
+
+    `gpu` and `net` decide only WHAT THE SANDBOX CAN REACH -- devices and egress. They vary no
+    limit; do not read them as unlocking one.
+    """
+    return ExecProfile(
+        name="elevated" + ("+gpu" if gpu else "") + ("+net" if net else ""),
+        cpu_seconds=None,
+        wall_timeout=wall_timeout,
+        as_bytes=None,
+        mem_max=mem_max if mem_max is not None else system_memory_max(),
+        fsize_bytes=None,
+        output_cap=output_cap,
+        gpu=gpu, net=net)
+
+
+def gpu_sandbox_args() -> tuple[list[str] | None, dict[str, str], list[str], str]:
+    """bwrap args + env additions that make the host GPU reachable inside the sandbox.
+
+    Returns (args, env, path_dirs, note). `args` is None when no GPU device can be found, and
+    `note` then carries the reason. `path_dirs` are directories the caller must APPEND to the
+    sandbox PATH; they are RETURNED rather than assumed because they differ per branch, and
+    only the WSL branch's contents have been checked here.
+    TWO BRANCHES, NOT EQUALLY EVIDENCED -- say which one ran before quoting either as
+    verified:
+
+      WSL2   /dev/dxg plus the driver libraries in /usr/lib/wsl/lib. MEASURED 2026-08-01
+             (re-runnable: bwrap with `--dev-bind /dev/dxg /dev/dxg` and that directory on
+             PATH/LD_LIBRARY_PATH): `nvidia-smi -L` exits 0 naming the device and ctypes
+             cuInit(0) returns 0 with cuDeviceGetCount 1. CONTROL, same argv WITHOUT the
+             bind: "Failed to initialize NVML: GPU access blocked by the operating system",
+             exit 255. `ls /usr/lib/wsl/lib` shows nvidia-smi and libcuda.so.1 there, which
+             is why that directory is both a PATH and an LD_LIBRARY_PATH entry.
+      NATIVE the /dev/nvidia* character devices. UNMEASURED. Its path_dirs carries the CUDA
+             bin directory and NOT any driver directory -- not because a driver directory was
+             checked and found unnecessary, but because nothing on this branch has been
+             checked at all. This host has no such nodes, in or out of the sandbox, so the
+             branch has never executed here.
+
+    A prior note in this project blamed the missing GPU on `--dev /dev` hiding /dev/nvidia*.
+    That is wrong on WSL2, where those nodes do not exist in the first place; the two real
+    causes were the absent /dev/dxg bind and a PATH pinned to /usr/bin:/bin, which cannot
+    reach /usr/lib/wsl/lib/nvidia-smi.
+    """
+    if os.path.exists(GPU_WSL_DEVICE):
+        return (["--dev-bind", GPU_WSL_DEVICE, GPU_WSL_DEVICE],
+                {"LD_LIBRARY_PATH": GPU_WSL_LIB_DIR},
+                [GPU_WSL_LIB_DIR, GPU_CUDA_BIN],
+                f"WSL2 GPU via {GPU_WSL_DEVICE} + {GPU_WSL_LIB_DIR} (measured on this host)")
+    nodes = sorted(str(p) for p in Path("/dev").glob("nvidia*"))
+    if nodes:
+        args: list[str] = []
+        for n in nodes:
+            args += ["--dev-bind", n, n]
+        return (args, {}, [GPU_CUDA_BIN],
+                f"native NVIDIA devices {', '.join(nodes)} (branch UNMEASURED on this host)")
+    return (None, {}, [],
+            f"no GPU device found: neither {GPU_WSL_DEVICE} nor /dev/nvidia* exists on this "
+            "host, so there is nothing to bind")
+
+
+def net_sandbox_args() -> list[str]:
+    """bwrap args that keep the host network namespace AND supply the minimum /etc a
+    resolver needs.
+
+    MEASURED 2026-08-01, and re-runnable in two commands rather than taken on trust. With
+    `--unshare-all --share-net` and NO /etc bound, `ip -o -4 addr` shows eth0 up while
+    `getent hosts example.com` exits 2 and `ls /etc` reports the directory does not exist.
+    Adding these read-only binds, the same `getent` exits 0 and a urllib HTTPS GET of
+    https://example.com returns 200.
+
+    `--ro-bind-try` skips a source that is absent rather than failing the run; checked on the
+    installed bwrap 0.9.0 -- `bwrap ... --ro-bind-try /nonexistent-abc /nonexistent-abc
+    /bin/true` exits 0.
+
+    NO ORDERING CONSTRAINT IS CLAIMED HERE. An earlier version of this docstring said
+    `--share-net` is accepted only in combination with `--unshare-all`, paraphrasing bwrap's
+    own --help text. A council member probed it and the help text is misleading:
+    `bwrap --ro-bind /usr /usr ... --share-net /bin/true` exits 0 with no --unshare-all
+    present. The caller still emits them in that order, but as a fact about the caller, not
+    a constraint of the tool.
+    """
+    args = ["--share-net"]
+    for p in NET_ETC_BINDS:
+        args += ["--ro-bind-try", p, p]
+    return args
+
+
+_CGROUP_MEM_OK: dict[str, tuple[bool, str]] = {}
+
+
+def _cgroup_memory_available(mem_max: str) -> tuple[bool, str]:
+    """(True, "") if a transient systemd user scope can impose EXACTLY `mem_max` here.
+
+    IT PROBES THE CALLER'S OWN VALUE, not a stand-in, and that distinction is not
+    theoretical. Measured 2026-08-01: `MemoryMax=64M`, `16G` and even `999T` all return rc=0
+    (the bound may exceed physical memory), but `MemoryMax=bogus` returns rc=1 with "Failed
+    to parse MemoryMax=bogus". So a fixed 64M probe would answer "yes, bounded" for a profile
+    carrying a malformed bound that will fail at run time -- a void check for the question
+    actually being asked. Cached PER VALUE, since the probe starts a unit.
+
+    WHAT THIS ESTABLISHES AND WHAT IT DOES NOT: that systemd ACCEPTS the value and the scope
+    starts. It is not an enforcement measurement at that value. Enforcement was measured once,
+    separately, at MemoryMax=2G -- a 3 GB resident allocation was killed at the cap while
+    ctypes cuInit(0) still returned 0 under the same bound.
+
+    The mechanism probed is EXACTLY the mechanism used (`systemd-run --user --scope
+    -p MemoryMax=...`). A harness that wrote memory.max directly would be a DIFFERENT
+    mechanism needing its own enforcement measurement -- the bench raised that, because the
+    observed kill arrived as SIGTERM (rc 143) and the signal's source was never established.
+    """
+    hit = _CGROUP_MEM_OK.get(mem_max)
+    if hit is not None:
+        return hit
+    if shutil.which("systemd-run") is None:
+        res = (False, "systemd-run is not installed")
+    else:
+        try:
+            p = subprocess.run(
+                ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={mem_max}",
+                 "-p", "MemorySwapMax=0", "true"],
+                capture_output=True, timeout=20)
+            res = ((True, "") if p.returncode == 0 else
+                   (False, "systemd-run --user --scope failed: "
+                    + p.stderr.decode(errors="replace").strip()[:160]))
+        except (OSError, subprocess.SubprocessError) as e:
+            res = (False, f"cgroup probe failed ({e.__class__.__name__})")
+    _CGROUP_MEM_OK[mem_max] = res
+    return res
+
+
+def exec_profile_preflight(profile: ExecProfile) -> tuple[bool, str]:
+    """Can this host actually honour `profile`? Returns (ok, reason-when-not).
+
+    FAIL CLOSED, and the memory leg is why this function exists rather than being inlined
+    into the argv build: a GPU profile carries as_bytes=None, so if the cgroup bound cannot
+    be imposed the run would proceed with NO memory bound at all. Refusing to elevate is the
+    only honest outcome there -- silently running unbounded is worse than not running.
+    """
+    if profile.gpu:
+        args, _env, _path_dirs, note = gpu_sandbox_args()
+        if args is None:
+            return False, note
+    if profile.mem_max is not None:
+        ok, why = _cgroup_memory_available(profile.mem_max)
+        if not ok:
+            return False, f"memory bound {profile.mem_max} cannot be imposed: {why}"
+    elif profile.as_bytes is None:
+        return False, ("profile sets neither an address-space limit nor a cgroup memory "
+                       "bound; refusing to run a sandbox with no memory bound at all")
+    return True, ""
+
+
+def run_exec_sandbox(command: str, workdir: Path, *,
+                     profile: ExecProfile | None = None,
+                     scratch: Path | None = None) -> tuple[str | None, str, dict | None]:
+    """Run `command` via `sh -c` in a bubblewrap sandbox over a scrubbed ephemeral copy of
+    workdir, bounded by `profile`. Fail-closed if bubblewrap/userns is unavailable or the
+    profile cannot be honoured on this host.
+
+    CALLED WITHOUT A PROFILE THE SANDBOX IS THE ORIGINAL ONE -- network off, environment
+    cleared, RLIMIT_CPU/AS/FSIZE, wall timeout, process-group kill -- with TWO exceptions to
+    "value for value": the output-cap fix below, which changes what happens to a verbose
+    command for every caller including members; and RLIMIT_NPROC, which the original set and
+    this no longer does at all (see the constants block). The member path (collect_exec_requests) calls
+    with no profile and has no argument with which to elevate, so no roster key can widen a
+    member's sandbox.
+
+    THE OUTPUT-CAP FIX, and it is a bug fix rather than a new feature. The old read loop
+    stopped at the cap and fell into the `finally`, which SIGKILLed the process group -- a
+    command was killed by its own VERBOSITY. Re-runnable discriminating pair, `run_exec_sandbox`
+    against `head -c 20000 /dev/zero | tr '\\0' 'x'; sleep 6; echo AFTER_SLEEP`:
+        OLD code: returned in 0.01s, exit_status -9, timed_out False -- the sleep never ran.
+        THIS code: returns in 6.01s, exit_status 0, discarded 4020, bytes_read 20012.
+    Capping and termination are now separate: bytes past the budget are read and dropped so
+    the pipe never fills, and the job runs to its own exit or the wall deadline.
+
+    WHAT IS DELIVERED IS HEAD **AND** TAIL, not the first N bytes. The measured run above is
+    why: with a head-only slice, `AFTER_SLEEP` -- emitted last -- was discarded, and for a long
+    job the last lines are usually the ones worth having (the traceback, the final metric, the
+    exit banner). The two ends are kept with an explicit marker between them, and the marker
+    plus a UTF-8 severing reserve are charged AGAINST the budget rather than added after it, so
+    the delivered text cannot exceed the cap.
+
+    `scratch`, when given, is bound READ-WRITE at EXEC_SCRATCH_MOUNT and PERSISTS WHEREVER THE
+    CALLER POINTED IT -- it is a path the caller chose, not a containment boundary, and an
+    earlier draft of this docstring wrongly claimed it could not reach the real repo. What is
+    ENFORCED, below, is narrower and checkable: the call is REFUSED when scratch is not a real
+    directory, or when scratch and workdir contain one another after symlink resolution. So
+    scratch cannot be aimed into the tree under review, but a caller that points it somewhere
+    else entirely gets exactly the writes it asked for. The containment claim belongs only to
+    /work, which is a temp copy removed in a `finally`.
+
+    Returns (combined stdout+stderr, note, info), or (None, reason, None) when the sandbox
+    refused to run at all.
 
     `info` is the STRUCTURAL form of what `note` says in prose:
-        {"exit_status": int, "timed_out": bool, "truncated": bool, "bytes_read": int}
+        {"exit_status": int, "timed_out": bool, "truncated": bool, "bytes_read": int,
+         "discarded": int, "profile": str}
     A caller that must COMPARE the exit status reads info["exit_status"] -- it exists
     so that nobody has to parse it back out of `note`, which the brain validator used
     to do and flagged as brittle in its own source.
     READ `timed_out` BEFORE `exit_status`: on a wall-timeout the process group is
     SIGKILLed, so exit_status is -9 (the signal), not the command's own status. It is
     not a verdict about the command and must not be compared as one.
+    `bytes_read` counts every byte THIS FUNCTION READ, delivered or discarded, so it can now
+    exceed the output cap. It is NOT "every byte the command emitted": on a wall-timeout the
+    loop stops and whatever is still sitting in the pipe is never read, so it is neither
+    delivered nor counted.
     """
+    profile = profile or default_exec_profile()
     if len(command) > EXEC_COMMAND_MAX_LEN:
         return None, "command too long", None
     ok, why = _bwrap_available()
     if not ok:
         return None, f"sandbox unavailable: {why}", None
+    ok, why = exec_profile_preflight(profile)
+    if not ok:
+        return None, f"profile {profile.name!r} cannot run here: {why}", None
+    if scratch is not None:
+        # The ONE property claimed for scratch, enforced rather than asserted: it may not be
+        # the tree under review, in either direction. Resolved strictly, so a symlink aimed
+        # into the repo is caught -- the kernel would follow it and the bind would land on the
+        # real tree. Everything else about where scratch points is the caller's choice.
+        try:
+            sc = scratch.resolve(strict=True)
+            wd = workdir.resolve(strict=True)
+        except OSError as e:
+            return None, f"scratch is unusable ({e.__class__.__name__})", None
+        if not sc.is_dir():
+            return None, "scratch is not a directory", None
+        if sc == wd or sc.is_relative_to(wd) or wd.is_relative_to(sc):
+            return None, ("scratch may not be inside the workdir (or contain it): a "
+                          "read-write bind there would put persistent writes into the tree "
+                          "under review, which only a reviewed WRITE may touch"), None
+        scratch = sc
     tmp = Path(tempfile.mkdtemp(prefix="council_exec_"))
     copyroot = tmp / "work"
     try:
         copyroot.mkdir()
         copylog = build_sandbox_copy(workdir, copyroot)
+        env_vars = {"PATH": "/usr/bin:/bin", "HOME": "/tmp"}
+        extra: list[str] = []
+        if profile.gpu:
+            # preflight has already established this branch finds a device; args is not None.
+            gargs, genv, gpath, _note = gpu_sandbox_args()
+            extra += gargs or []
+            env_vars.update(genv)
+            if gpath:
+                env_vars["PATH"] += ":" + ":".join(gpath)
+        if profile.net:
+            extra += net_sandbox_args()
+        if scratch is not None:
+            extra += ["--bind", str(scratch), EXEC_SCRATCH_MOUNT]
         argv = [BWRAP_PATH,
                 "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin",
                 "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
                 "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
                 "--bind", str(copyroot), "/work", "--chdir", "/work",
                 "--unshare-all", "--die-with-parent", "--clearenv",
-                "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", "/tmp",
-                "sh", "-c", command]
+                *extra]
+        for k, v in env_vars.items():
+            argv += ["--setenv", k, v]
+        argv += ["sh", "-c", command]
+        if profile.mem_max is not None:
+            # A cgroup, not RLIMIT_AS -- see ExecProfile. Measured: the exit status of the
+            # command propagates faithfully through the scope (a child exiting 3, 42 or 7
+            # gives systemd-run rc 3, 42, 7, including through bwrap), so info["exit_status"]
+            # keeps meaning what it meant. Measured too: setsid+killpg still reaps the whole
+            # tree through the scope -- a marker process inside was gone after the kill.
+            argv = ["systemd-run", "--user", "--scope", "-q",
+                    "-p", f"MemoryMax={profile.mem_max}",
+                    "-p", "MemorySwapMax=0"] + argv
 
         def _limits():
+            # EVERY limit here is guarded, because None means "inherit the host's own" and an
+            # unguarded setrlimit would TypeError on the first elevated run.
+            # NO RLIMIT_NPROC IS SET, deliberately -- see the constants block. It bounded the
+            # uid's whole session rather than this sandbox, and setting it at all denied every
+            # run on a desktop host. The process-group kill below is what reaps a fork bomb.
             os.setsid()   # own process group so killpg reaps the whole tree
-            resource.setrlimit(resource.RLIMIT_CPU,
-                               (EXEC_CPU_SECONDS, EXEC_CPU_SECONDS + 1))
-            b = EXEC_MEM_MB * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (b, b))
-            f = EXEC_FSIZE_MB * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_FSIZE, (f, f))
-            resource.setrlimit(resource.RLIMIT_NPROC, (EXEC_NPROC, EXEC_NPROC))
+            if profile.cpu_seconds is not None:
+                resource.setrlimit(resource.RLIMIT_CPU,
+                                   (profile.cpu_seconds, profile.cpu_seconds + 1))
+            if profile.as_bytes is not None:
+                resource.setrlimit(resource.RLIMIT_AS,
+                                   (profile.as_bytes, profile.as_bytes))
+            if profile.fsize_bytes is not None:
+                resource.setrlimit(resource.RLIMIT_FSIZE,
+                                   (profile.fsize_bytes, profile.fsize_bytes))
 
         p = subprocess.Popen(argv, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, preexec_fn=_limits)
-        buf = bytearray()
-        deadline = time.monotonic() + EXEC_WALL_TIMEOUT
+        # HEAD + TAIL, with the marker and a severing reserve charged AGAINST the cap. Rule of
+        # thumb from this project's byte-cap bugs: slice to the cap and THEN prepend a header
+        # and you overshoot by exactly the header. EXEC_TRUNC_RESERVE covers the marker plus
+        # the growth from severing a multi-byte character at each of the two slice boundaries
+        # (Python replaces a maximal subpart with ONE U+FFFD, so at most +2 per boundary).
+        EXEC_TRUNC_RESERVE = 96
+        budget = max(0, profile.output_cap - EXEC_TRUNC_RESERVE)
+        head_budget = budget * 2 // 5
+        tail_budget = budget - head_budget
+        head = bytearray()
+        tail = bytearray()
+        total = 0
+        deadline = time.monotonic() + profile.wall_timeout
         timedout = False
         fd = p.stdout.fileno()
         try:
-            # Read output INCREMENTALLY, bounded to EXEC_OUTPUT_CAP AND the wall deadline,
-            # so a runaway print loop cannot buffer unbounded output in the harness (the
-            # old communicate() would). On cap or deadline we stop reading; the child then
-            # blocks on the now-full pipe and is reaped by the killpg in finally.
-            while len(buf) <= EXEC_OUTPUT_CAP:
+            # Read to EOF or the wall deadline, keeping the first `head_budget` bytes and the
+            # LAST `tail_budget`, dropping whatever falls between. Draining rather than
+            # stopping is the fix described above: harness memory stays bounded (the old
+            # communicate() was unbounded) WITHOUT a verbose command killing itself by filling
+            # a pipe nobody drains. The tail is trimmed from the front as it grows, so a job
+            # that prints for an hour costs the same memory as one that prints once.
+            while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timedout = True
@@ -4403,10 +5012,18 @@ def run_exec_sandbox(command: str, workdir: Path) -> tuple[str | None, str, dict
                 if not r:
                     timedout = True
                     break
-                chunk = os.read(fd, min(65536, EXEC_OUTPUT_CAP + 1 - len(buf)))
+                chunk = os.read(fd, 65536)
                 if not chunk:
                     break   # EOF: the process finished writing
-                buf.extend(chunk)
+                total += len(chunk)
+                room = head_budget - len(head)
+                if room > 0:
+                    head.extend(chunk[:room])
+                    chunk = chunk[room:]
+                if chunk:
+                    tail.extend(chunk)
+                    if len(tail) > tail_budget:
+                        del tail[:len(tail) - tail_budget]
         finally:
             try:
                 os.killpg(p.pid, signal.SIGKILL)   # whole group, incl. a pipe-blocked child
@@ -4417,17 +5034,27 @@ def run_exec_sandbox(command: str, workdir: Path) -> tuple[str | None, str, dict
             except subprocess.TimeoutExpired:
                 pass
             p.stdout.close()
-        raw = bytes(buf)
-        capped = len(raw) > EXEC_OUTPUT_CAP - 8
-        text = raw[:EXEC_OUTPUT_CAP - 8].decode("utf-8", errors="replace")
-        note = (f"exit {p.returncode}, {len(raw)} bytes read"
+        discarded = total - len(head) - len(tail)
+        capped = discarded > 0
+        raw = (bytes(head)
+               + (f"\n...[{discarded} bytes dropped from the middle]...\n".encode()
+                  if capped else b"")
+               + bytes(tail))
+        text = raw.decode("utf-8", errors="replace")
+        note = (f"exit {p.returncode}, {total} bytes read"
                 + (" (WALL-TIMEOUT, group killed)" if timedout else "")
-                + (", output truncated" if capped else "")
-                + f"; sandbox copy {copylog['copied']} files/{copylog['skipped']} skipped")
-        # `note` stays byte-for-byte what it was: it is delivered to members and quoted
-        # in logs. `info` is the same facts in a form a caller can compare.
+                + (f", output truncated ({discarded} bytes dropped from the MIDDLE; head and "
+                   "tail kept, and the command was NOT killed for it)" if capped else "")
+                + f"; sandbox copy {copylog['copied']} files/{copylog['skipped']} skipped"
+                # Compared BY VALUE, not by name: a profile merely NAMED "default" that
+                # carries gpu=True is not the default, and tagging it as one would hide an
+                # elevation from the members and logs this note feeds.
+                + (f"; profile {profile.name}" if profile != default_exec_profile() else ""))
+        # `note` is delivered to members and quoted in logs; `info` is the same facts in a
+        # form a caller can compare.
         info = {"exit_status": p.returncode, "timed_out": timedout,
-                "truncated": capped, "bytes_read": len(raw)}
+                "truncated": capped, "bytes_read": total,
+                "discarded": discarded, "profile": profile.name}
         return text, note, info
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -4544,6 +5171,19 @@ def capability_block(member: Member, *, fallback_route: bool = False) -> str:
             f"FILE RETRIEVAL: in your review you may emit up to"
             f" {RETRIEVAL_MAX_REQUESTS_PER_MEMBER} lines, each alone on its line, of the form",
             "", "REQUEST_FILE: relative/path/from/project/root", "",
+            "You may append an INCLUSIVE range to reach a part of a file that does not sit "
+            "in its first bytes -- both ends included, HTTP Range style:", "",
+            "REQUEST_FILE: path#L120-240   lines 120 to 240 (1-based)",
+            "REQUEST_FILE: path#L120-      line 120 to the end",
+            "REQUEST_FILE: path#B24000-    byte 24000 to the end", "",
+            "A plain path returns the file's HEAD, which for a large file may not contain "
+            "what you need. THERE IS ONLY ONE DELIVERY -- every request you make is answered "
+            "together, before your final review, and you cannot follow up on what you "
+            "receive. So ask for the ranges you actually need NOW, in this round; you may "
+            "spend more than one request on different regions of the same file. A truncated "
+            "delivery names the offset it stopped at, which tells you where a later range "
+            "would have to start -- it is not an invitation to ask again in this fire. "
+            "Files that begin with '---' frontmatter are served whole only.", "",
             "The harness (not you) reads each file -- subject to a containment jail, a "
             "secrets denylist, and size caps -- and delivers the content, or the denial "
             "reason, to YOU ALONE before you finalize your review -- a one-time follow-up delivery (any further requests are not processed).", ""]
@@ -4807,10 +5447,35 @@ async def _run_member_transport(member: "Member", base_prompt: str,
     raise ValueError(f"unknown transport {t!r} for member {member.name!r}")
 
 
-# The transports a LEADER may use: a STRICT SUBSET of VALID_TRANSPORTS, because
-# _call_leader's if/elif chain below simply has no `claude_subprocess` branch. That chain
-# predates the claude transport, and nothing has extended it. THAT is the whole reason,
-# and it is a gap rather than a policy.
+# A LEADER RUNS THE CLAUDE CLI WITH NO TOOLS AT ALL, which is NOT the guard the claude
+# VOTING seat uses (CLAUDE_TOOL_GUARD = --tools Read,Glob,Grep). The bench asked for this
+# and the argument that decided it is CONTAINMENT, not bookkeeping: the harness read path
+# (read_repo_file) enforces a workdir jail plus a secrets deny-list, and the CLI's NATIVE
+# Read enforces neither -- a leader that chose to read natively could read anything the
+# user can, ~/.ssh included. An empty tool list removes the choice.
+# WHAT WAS MEASURED, and what it does not settle. Against a real prompt from
+# council_leader._assemble_leader_prompt, in a temp dir holding a planted token, task "report
+# the actual value, do not guess": `--tools ""` emitted the actions envelope with READ and
+# never quoted the token (1 trial), and `--tools Read,Glob,Grep` did the same (4 trials,
+# native tools never used). So the guarded seat's good behaviour is real -- but it is a
+# PREFERENCE, not a boundary, which is why the tool-less form wins anyway. Neither result
+# retires the earlier finding that `--tools ""` FABRICATED a verification session under the
+# MEMBER prompt shape; that was a different prompt and one clean leader-framing trial does
+# not overturn it. The turn record is the mitigation: it lists what was actually read, and
+# author_handoff flags leader assertions the record does not support.
+CLAUDE_LEADER_TOOL_GUARD = ("--tools", "")
+
+
+def claude_leader_cmd() -> list[str]:
+    """Argv for one claude LEADER turn -- tool-less; see CLAUDE_LEADER_TOOL_GUARD. The prompt
+    arrives on STDIN, never as an argv element: a leader prompt carries the ground rules, the
+    prior handoff and every tool result so far, and argv is bounded (codex hit Errno 7 this
+    way once already)."""
+    return ["claude", "-p", "--model", CLAUDE_MODEL, *CLAUDE_LEADER_TOOL_GUARD]
+
+
+# The transports a LEADER may use: a STRICT SUBSET of VALID_TRANSPORTS, because the
+# openrouter branch aside, _call_leader's if/elif chain below must have a branch for each.
 # A REJECTED RATIONALE, recorded so it is not reinvented: an earlier version of this
 # comment said claude_subprocess cannot lead because it is guarded read-only while
 # "leaders write files". The bench refuted it in one line -- codex_subprocess runs
@@ -4822,7 +5487,8 @@ async def _run_member_transport(member: "Member", base_prompt: str,
 # its own copy far from the code it must match. KEEP THE TWO IN STEP -- adding a branch
 # below without adding it here makes the transport unofferable; the reverse offers a
 # leader that fails closed at dispatch with ok=False.
-LEADER_TRANSPORTS = ("openrouter", "codex_subprocess", "gemini_rest", "deepseek_https")
+LEADER_TRANSPORTS = ("openrouter", "codex_subprocess", "claude_subprocess",
+                     "gemini_rest", "deepseek_https")
 
 
 async def _call_leader(leader: "Member", prompt: str, cwd: Path) -> dict:
@@ -4880,6 +5546,14 @@ async def _call_leader(leader: "Member", prompt: str, cwd: Path) -> dict:
                                         stdin_data=prompt)
         finally:
             await asyncio.to_thread(_codex_lock_release, fh)
+    elif t == "claude_subprocess":
+        # No auth lock here, matching run_claude: the codex lock exists for codex's OBSERVED
+        # refresh-token races, and claiming the same failure for claude without having seen it
+        # would be inventing a rationale. CLAUDE_DROP_ENV is passed for exactly the reason
+        # recorded where that constant is defined -- read it there rather than trusting a
+        # second-hand restatement here.
+        res = await _run_subprocess(claude_leader_cmd(), cwd, role=leader.name,
+                                    stdin_data=prompt, drop_env=CLAUDE_DROP_ENV)
     else:
         return {"ok": False, "text": "", "transport": t,
                 "error": f"unknown leader transport {t!r}", "model_used": ""}

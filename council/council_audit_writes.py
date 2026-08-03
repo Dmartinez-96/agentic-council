@@ -188,7 +188,19 @@ def infer_roots(events: list[dict]) -> list[Path]:
     Bash was never scanned: invisible in precisely the case this tool exists for.
     So absolute paths are pulled out of the command STRING instead. Crude, but it is
     the only signal Bash leaves behind.
+
+    THE WORKSPACE DIRECTORY IS DERIVED FROM WHERE THE COUNCIL ITSELF SITS -- its parent.
+    A path under a sibling of the council tree is treated as a project, and its root is
+    that sibling. This was previously the literal component "Professional", which stopped
+    matching anything when the tree moved to ~/Documents on 2026-08-02 and would have made
+    this tool report NO project roots beyond the cwd -- an integrity tool going quiet
+    without saying so, which reads exactly like a clean audit.
+    THE LIMIT IS UNCHANGED AND WORTH STATING: a project living somewhere other than beside
+    the council (say ~/code/thing) is still only reached via the cwd. That was true of the
+    "Professional" version too; deriving the directory did not widen the reach, it only
+    stopped the reach depending on one machine's folder name.
     """
+    workspace = COUNCIL_ROOT.parent
     roots: set[Path] = {Path.cwd().resolve()}
     for e in events:
         cands: list[str] = []
@@ -202,11 +214,15 @@ def infer_roots(events: list[dict]) -> list[Path]:
         if isinstance(cmd, str):
             cands.extend(ABS_PATH_RE.findall(cmd))
         for val in cands:
-            parts = Path(val).parts
-            if "Professional" in parts:
-                i = parts.index("Professional")
-                if i + 1 < len(parts):
-                    roots.add(Path(*parts[: i + 2]))
+            p = Path(val)
+            if not p.is_absolute():
+                continue
+            try:
+                rel = p.relative_to(workspace)
+            except ValueError:
+                continue
+            if rel.parts:
+                roots.add(workspace / rel.parts[0])
     out: list[Path] = []
     for r in sorted(roots):
         if not any(r != o and o in r.parents for o in roots):

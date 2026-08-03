@@ -87,11 +87,28 @@ COUNCIL_FILES = [
     "session_start_probe.py",
     "session_start_directive.py",
     "evidence_logger.py",
+    # Every hook is invoked THROUGH this wrapper (see the hooks template), so an install
+    # that omits it leaves every configured hook pointing at a file that is not there.
+    # It loads OPENROUTER_API_KEY when the launching environment did not carry it, which
+    # is the difference between a full council and one silently reduced to the seats that
+    # need no key.
+    "hook_env.sh",
     "council_system_prompt.md",
     "council_dialogue_prompt.md",
     "council_layer2_prompt.md",
+    # The leader's harness guide. council_leader reads it OPTIONALLY, so omitting it produces
+    # no error -- it seats a leader that never learns the harness is its only write path, and
+    # does so silently. That silence is why it belongs in this list rather than being left to
+    # the operator.
+    "leader_harness_skill.md",
 ]
-EXECUTABLE_FILES = [f for f in COUNCIL_FILES if f.endswith(".py")]
+# NOT `.py`-ONLY, and the widening landed WITH hook_env.sh rather than after it. Hooks are
+# invoked as programs, so anything in this list that a hook execs needs its mode bit; a
+# `.py`-only filter would have installed hook_env.sh without one and every configured hook
+# would then have failed at exec, since all seven are invoked THROUGH it. Extensions are
+# listed rather than inferred, so adding a file with a new extension stays a decision made
+# here instead of an accident.
+EXECUTABLE_FILES = [f for f in COUNCIL_FILES if f.endswith((".py", ".sh"))]
 
 
 class Reporter:

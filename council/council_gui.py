@@ -63,18 +63,83 @@ VERDICT_COLOURS = {"PASS": "#2e7d32", "WARN": "#ef6c00", "BLOCK": "#c62828",
 def leader_transports() -> list[str]:
     """The transports a LEADER may use, read from the engine's LEADER_TRANSPORTS.
 
-    NOT VALID_TRANSPORTS: that is the MEMBER set and is strictly larger. Offering the
-    member set here would put `claude_subprocess` in the dropdown, which _call_leader has
-    no branch for and rejects with ok=False -- a leader that fails at dispatch. I made
-    exactly that mistake and the bench caught it.
+    NOT VALID_TRANSPORTS: that is the MEMBER set and is strictly larger, and offering it
+    would put a transport in the dropdown that _call_leader's chain has no branch for --
+    a leader that fails at dispatch with ok=False. I made exactly that mistake and the
+    bench caught it. (The example it caught me with was `claude_subprocess`, which has
+    SINCE been given a branch and is now a legitimate leader; the rule is unchanged, only
+    that instance of it is gone.)
 
-    Falls back to a literal copy if the import fails, so the GUI still opens.
+    Falls back to an EMPTY list if the import fails, so the GUI still opens. Empty rather
+    than a transcribed copy on purpose: a hardcoded list here is the very drift this
+    function exists to prevent, and it went stale within a day when the engine gained a
+    transport. An empty dropdown is visibly broken; a stale one is silently wrong.
     """
     try:
         import consult_council as cc
         return list(cc.LEADER_TRANSPORTS)
     except Exception:
-        return ["openrouter", "codex_subprocess", "gemini_rest", "deepseek_https"]
+        return []
+
+
+# The two shipped bench layouts, plus the escape hatch. DERIVED, NOT TRANSCRIBED: each
+# member's transport/model/fallback comes from the engine's own DEFAULT_REGISTRY by name,
+# and the one seat that registry does not carry -- claude -- is built from the engine's
+# CLAUDE_MODEL / CLAUDE_OPENROUTER_FALLBACK constants. Nothing here re-types a model slug,
+# because a transcribed slug is exactly what goes stale when the engine moves.
+PRESET_CUSTOM = "Custom (edit the table yourself)"
+PRESET_LAYOUTS = {
+    "Claude leads": ("claude", ["codex", "gemini", "deepseek", "kimi", "grok", "glm"]),
+    "Codex leads": ("codex", ["claude", "gemini", "deepseek", "kimi", "grok", "glm"]),
+}
+PRESET_INSPECTORS = ["muse", "qwen", "minimax", "mimo", "nemotron", "mistral"]
+
+
+def preset_roster(label: str) -> dict | None:
+    """Build one preset roster dict, or None if `label` is not a preset (e.g. Custom).
+
+    Returns the same shape `save()` writes, so applying a preset and saving by hand produce
+    the same file. Raises nothing: if the engine cannot be imported the caller gets None and
+    the UI says so, rather than writing a roster built from guesses.
+    """
+    if label not in PRESET_LAYOUTS:
+        return None
+    try:
+        import consult_council as cc
+    except Exception:
+        return None
+    by_name = {m.name: m for m in cc.DEFAULT_REGISTRY}
+
+    def seat(name: str, tier: str) -> dict:
+        m = by_name.get(name)
+        if m is not None:
+            rec = {"name": name, "tier": tier, "transport": m.transport, "model": m.model}
+            if m.fallback_model:
+                rec["fallback_model"] = m.fallback_model
+            return rec
+        # Only `claude` reaches here today: the built-in registry seats codex as the
+        # subscription voter and has no claude row, so its values come from the constants
+        # the claude transport itself runs on.
+        if name == "claude":
+            return {"name": "claude", "tier": tier, "transport": "claude_subprocess",
+                    "model": cc.CLAUDE_MODEL,
+                    "fallback_model": cc.CLAUDE_OPENROUTER_FALLBACK}
+        raise KeyError(f"preset names {name!r}, which is in neither the registry nor the "
+                       "claude special case")
+
+    leader_name, voting = PRESET_LAYOUTS[label]
+    try:
+        members = ([seat(n, "voting") for n in voting]
+                   + [seat(n, "inspector") for n in PRESET_INSPECTORS])
+        lead = seat(leader_name, "voting")   # borrow its transport/model, not its tier
+    except KeyError:
+        # A preset naming a seat the engine no longer knows. Same posture as a failed
+        # import: return None and let the caller say so, rather than writing a roster with
+        # a guessed transport and model.
+        return None
+    return {"members": members,
+            "leader": {"name": leader_name, "transport": lead["transport"],
+                       "model": lead["model"]}}
 
 
 def engine_rules() -> dict:
@@ -181,6 +246,22 @@ class ConfigTab(QWidget):
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
 
+        # PRESETS. An ACTION, not a state display: the combo does not track what the table
+        # currently holds, it applies a layout to it. Selecting one only STAGES the change
+        # (the table and leader box are rewritten); roster.json is untouched until Save, the
+        # same rule every other edit in this tab follows. Confirmed first, because a
+        # mis-click would otherwise silently discard a hand-built bench.
+        prow = QHBoxLayout()
+        self.preset = QComboBox()
+        self.preset.addItem(PRESET_CUSTOM, "")
+        for label in PRESET_LAYOUTS:
+            self.preset.addItem(label, label)
+        self.preset.currentIndexChanged.connect(lambda _i: self._apply_preset())
+        prow.addWidget(QLabel("preset"))
+        prow.addWidget(self.preset, 1)
+        prow.addWidget(QLabel("(stages the table -- Save roster.json to persist)"))
+        lay.addLayout(prow)
+
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
             ["member", "tier", "transport", "model", "fallback"])
@@ -227,6 +308,71 @@ class ConfigTab(QWidget):
             b = QPushButton(label); b.clicked.connect(slot); row.addWidget(b)
         lay.addLayout(row)
         self.reload()
+
+    def _apply_preset(self) -> None:
+        """Stage a preset layout into the table and the leader box. Never writes a file.
+
+        The two failure modes are handled the same way -- do nothing and say why -- because
+        the alternative is a half-applied bench: `preset_roster` returns None if the engine
+        cannot be imported or names a seat it no longer knows, and a declined confirmation
+        leaves everything untouched. In both cases the combo snaps back to Custom so it never
+        claims a layout the table does not hold.
+        """
+        label = self.preset.currentData() or ""
+        if not label:
+            return                      # Custom: the table is whatever the user made it
+        roster = preset_roster(label)
+        if roster is None:
+            QMessageBox.warning(self, "Preset",
+                                f"could not build the {label!r} preset from the engine -- "
+                                "the roster is unchanged.")
+            self._select_preset(PRESET_CUSTOM)
+            return
+        seats = ", ".join(f"{m['name']}({m['tier'][:3]})" for m in roster["members"])
+        if QMessageBox.question(
+                self, "Apply preset",
+                f"Replace the roster table with '{label}'?\n\n"
+                f"leader: {roster['leader']['name']} ({roster['leader']['transport']})\n"
+                f"seats: {seats}\n\n"
+                "Nothing is written until you press Save roster.json."
+        ) != QMessageBox.StandardButton.Yes:
+            self._select_preset(PRESET_CUSTOM)
+            return
+        self.table.setRowCount(0)
+        self.table.setRowCount(len(roster["members"]))
+        for r, m in enumerate(roster["members"]):
+            self._build_row(r, m)
+        lead = roster["leader"]
+        leader_note = f"leader {lead['name']}"
+        idx = self.leader_transport.findData(lead["transport"])
+        if idx < 0:
+            leader_note = "LEADER UNCHANGED (its transport is not offered)"
+            # The engine no longer offers this leader transport. The leader box is LEFT AS
+            # IT WAS -- the table now holds the preset's seats while the leader is whatever
+            # was selected before, so both the dialog and the status line say so explicitly
+            # rather than letting that mismatch pass as a clean apply.
+            QMessageBox.warning(self, "Preset",
+                                f"the table was applied, but transport "
+                                f"{lead['transport']!r} is not in LEADER_TRANSPORTS, so the "
+                                "leader was left alone -- set it by hand before saving.")
+        else:
+            self.leader_transport.setCurrentIndex(idx)
+            self.leader_name.setText(lead["name"])
+            self.leader_model.setText(lead["model"])
+            # After the setText calls, exactly as reload() does: setting the index above
+            # fires the cascade, and the two setText calls then overwrite what it forced.
+            self._leader_cascade()
+        self._warn_duplicate_names()
+        self.status.setText(f"preset '{label}' staged -- {len(roster['members'])} seats, "
+                            f"{leader_note}. NOT SAVED: press Save roster.json to "
+                            "write it, or Reload from engine to discard.")
+        self._select_preset(PRESET_CUSTOM)
+
+    def _select_preset(self, label: str) -> None:
+        """Move the combo without re-entering _apply_preset."""
+        self.preset.blockSignals(True)
+        self.preset.setCurrentIndex(max(self.preset.findText(label), 0))
+        self.preset.blockSignals(False)
 
     def _row_of(self, widget) -> int:
         """Which row a cell widget sits in. Found by scanning rather than captured in the
@@ -523,7 +669,40 @@ class RunTab(QWidget):
 
     def on_event(self, rec: dict) -> None:
         ev = rec.get("ev")
-        if ev == "member_started":
+        if ev == "run_started":
+            # THE SEAT LIST AND THE DEPTH, BEFORE ANY VERDICT ARRIVES. Both are things the
+            # operator otherwise cannot see and both have burned this project:
+            #   - a missing API key drops seats SILENTLY: the dropped seat is announced on
+            #     stderr and leaves no record in the log, and the fire still returns a
+            #     confident-looking verdict from whoever remained. This list is the bench that
+            #     actually ran. THE ORDER IS THE WHOLE POINT AND IS EASY TO GET BACKWARDS --
+            #     a review of this comment argued the opposite -- so check it rather than
+            #     assume: in consult_council.main(), the key-drop loop rebinds `members` and
+            #     the run_started emit passes `list(members)` AFTER it. Were the emit first,
+            #     this would print the configured roster and show nothing.
+            #   - fast_mode is `FAST_PATH.exists()`, and FAST_PATH is a file in the COUNCIL
+            #     DIRECTORY (consult_council.py:248), so it is one marker for the whole
+            #     install rather than per session and another session can set it for this
+            #     one. What it changes, traced rather than assumed: FAST_PATH -> the
+            #     _FAST_SNAPSHOT at :279 -> fast_mode() -> effort_for(), which returns
+            #     FAST_EFFORT instead of _FULL_EFFORT, with openrouter seats getting a
+            #     FAST-aware effort of their own. It moves EFFORT ONLY -- models and round
+            #     count are untouched. Say "lower effort", not "lower quality" -- but do not
+            #     read that as reassurance either. The measured position is that low effort is
+            #     FASTER and has never been measured as GOOD; nobody has shown it is as good,
+            #     which is not the same as showing it is no worse. The banner states what
+            #     changed and leaves the quality question open, because that is where it is.
+            voting = rec.get("voting") or []
+            inspectors = rec.get("inspectors") or []
+            self.append(f"== {rec.get('layer')} / {rec.get('tool_name')} -> "
+                        f"{rec.get('target_path')}")
+            self.append(f"   voting({len(voting)}): {', '.join(map(str, voting)) or 'NONE'}"
+                        f"   inspectors({len(inspectors)}): "
+                        f"{', '.join(map(str, inspectors)) or 'none'}")
+            if rec.get("fast_mode"):
+                self.append("   FAST is armed (install-wide): members will run at LOW "
+                            "reasoning effort, same models and rounds")
+        elif ev == "member_started":
             name = str(rec.get("member"))
             r = self.rows.get(name)
             if r is None:
@@ -549,6 +728,19 @@ class RunTab(QWidget):
                             f"({rec.get('why')})")
         elif ev == "round_started":
             self.append(f"-- round {rec.get('round')} --")
+        elif ev == "round_finished":
+            # THE PER-ROUND SNAPSHOT, which the seats table cannot keep. That table holds one
+            # cell per member and round 2 OVERWRITES round 1 in it, so by the time a fire ends
+            # the independent round-1 verdicts are gone from the display even though they are
+            # in the log. Printing them here keeps both rounds visible in one place, which is
+            # the comparison that matters: round 2 is where members see each other, so a
+            # verdict that moves between the two is the only visible sign of peer exposure.
+            # It does NOT distinguish herding from being genuinely persuaded -- nothing in
+            # this stream can -- it just stops the earlier position from vanishing.
+            verdicts = rec.get("verdicts") or {}
+            if verdicts:
+                shown = ", ".join(f"{k}={v}" for k, v in sorted(verdicts.items()))
+                self.append(f"-- round {rec.get('round')} verdicts: {shown}")
         elif ev == "tool_request":
             self.append(f"[{rec.get('member')}] {rec.get('kind')}: "
                         f"{'granted' if rec.get('granted') else 'DENIED'}")
@@ -694,6 +886,17 @@ class LeaderTab(QWidget):
     approve-each answers travel on a dedicated control pipe, not stdin -- stdin carries
     the task and is closed straight after, so a decision read from there would EOF and
     silently decline every write.
+
+    The GPU checkbox is the tab's other control, and it is a SANDBOX decision rather than a
+    permission one -- it varies what the turn's EXEC can REACH, not what it may write.
+    council_leader_run builds the profile from it (:167-172): ticked gives
+    cc.elevated_exec_profile(gpu=True), unticked leaves profile=None so run_exec_sandbox
+    falls back to its default. Read those two functions for the actual bounds rather than
+    trusting a summary here; this docstring deliberately does not restate them, because a
+    copied list of limits is the thing that goes stale when one of them changes.
+
+    The turn streams as it runs -- rounds, the leader's prose, actions and rejected
+    envelopes -- through on_event below.
     """
 
     def __init__(self) -> None:
@@ -705,11 +908,32 @@ class LeaderTab(QWidget):
         row = QHBoxLayout()
         self.mode = QComboBox(); self.mode.addItems(["approve-each", "plan-only", "auto"])
         self.workdir = QLineEdit(str(COUNCIL_ROOT))
+        # ELEVATION IS A PER-TURN OPERATOR DECISION, which is why it is a checkbox here and
+        # not a roster key: members fire unattended, a leader turn has a person watching it.
+        # UNTICKED IS NOT THE MEMBER SANDBOX, and this comment used to say it was
+        # ("byte-for-byte"). Line references, so this is checkable rather than asserted:
+        #   the PROFILE does match. Unticked leaves profile=None (council_leader_run.py:167)
+        #   and run_exec_sandbox takes profile=None as its default (consult_council.py:4735),
+        #   resolving it at :4790 via `profile = profile or default_exec_profile()` -- the
+        #   same default profile VALUES a member fire gets. Not the same OBJECT:
+        #   default_exec_profile() is a function that builds a fresh ExecProfile per call,
+        #   deliberately, so the module's constants stay live knobs (see its docstring).
+        #   THE SCRATCH IS WHAT DIFFERS. council_leader_run.py:208 creates a per-turn scratch
+        #   for EVERY leader turn, ticked or not, and run_exec_sandbox binds it read-write at
+        #   /scratch (consult_council.py:4840, `--bind <scratch> EXEC_SCRATCH_MOUNT`). The
+        #   member path at :5005 calls run_exec_sandbox with no scratch argument at all.
+        # So an unticked leader turn still has one writable location that survives the turn;
+        # a member never does. That is a difference in what EXEC can WRITE, not only reach.
+        self.gpu = QCheckBox("GPU")
+        self.gpu.setToolTip(
+            "Let this turn's EXEC reach the host GPU, with memory bounded by a cgroup and "
+            "the host's own CPU/file-size limits inherited. Network stays OFF. Refused "
+            "before the turn starts if this host has no GPU device.")
         self.go = QPushButton("Run turn"); self.go.clicked.connect(self.start)
         self.stop = QPushButton("Stop"); self.stop.clicked.connect(self.cancel)
         self.stop.setEnabled(False)
         self.state = QLabel("idle")
-        for w in (QLabel("mode"), self.mode, QLabel("workdir"), self.workdir,
+        for w in (QLabel("mode"), self.mode, QLabel("workdir"), self.workdir, self.gpu,
                   self.go, self.stop, self.state):
             row.addWidget(w)
         lay.addLayout(row)
@@ -745,10 +969,19 @@ class LeaderTab(QWidget):
             QMessageBox.information(self, "Leader", "The task is empty.")
             return
         self.out.clear()
-        self.go.setEnabled(False); self.stop.setEnabled(True)
+        # THE MODE IS LOCKED FOR THE DURATION, not just the Run button. Every read of it
+        # happens in this method, before the worker thread starts -- once for --mode and once
+        # for the approve-each control-pipe decision below -- so leaving the combo live let it
+        # drift while a turn ran, and the control could read "plan-only" while the turn it
+        # launched went on applying writes under "auto". Nothing consults the widget after
+        # launch, so disabling it changes no behaviour; it stops the display from
+        # contradicting the running turn. on_finished restores it on every exit path.
+        self.go.setEnabled(False); self.stop.setEnabled(True); self.mode.setEnabled(False)
         self.state.setText("running")
         args = ["--task", task, "--workdir", self.workdir.text().strip() or str(COUNCIL_ROOT),
                 "--mode", self.mode.currentText()]
+        if self.gpu.isChecked():
+            args.append("--gpu")
         need_control = self.mode.currentText() == "approve-each"
         self.worker = FireWorker(args, engine=COUNCIL_ROOT / "council_leader_run.py",
                                  control=need_control)
@@ -765,16 +998,101 @@ class LeaderTab(QWidget):
             self.state.setText("stopping")
 
     def on_event(self, rec: dict) -> None:
+        """Render one streamed event. Anything unhandled is DROPPED SILENTLY, which is why
+        the set below has to track what the engine actually emits.
+
+        THAT DROP IS NOT HYPOTHETICAL: this handler covered only approval_request,
+        leader_action, note and final_verdict, while run_leader_turn had been emitting
+        leader_round / leader_text / leader_problem (council_leader.py:853, 865, 878) and
+        council_leader_run a leader_action_final recap. Four event kinds arrived and
+        vanished. BE EXACT ABOUT WHAT THAT COST, because the original complaint that opened
+        this item said the tab "shows NOTHING until the whole task finishes" and that is not
+        true of the code this replaced: writes, notes, approval prompts and the final
+        verdict already streamed live. What was missing is the leader's REASONING -- round
+        boundaries, the prose of each reply, and envelopes rejected whole -- so a turn
+        showed its actions with nothing explaining them.
+
+        FIELD NAMES ARE READ FROM THE EMITTERS, not guessed: leader_round carries `round`;
+        leader_text `round` and `text`; leader_problem `round` and `problems` (emitted at
+        council_leader.py:853, 865, 878). Check a new field against its emitter rather than
+        against this list, which goes stale the moment the engine adds one.
+        """
         ev = rec.get("ev")
-        if ev == "approval_request":
-            self.ask(rec)
-        elif ev == "leader_action":
-            applied = "APPLIED" if rec.get("applied") else "not applied"
+        if ev == "run_started":
+            # The leader path emits this with layer="leader_turn" and tool_name set to the
+            # PERMISSION MODE, which is the one field here that changes what the turn may do
+            # to the tree: auto applies every write the council permits, approve-each asks
+            # first, plan-only never applies anything. The tab's combo box shows what was
+            # SELECTED; this shows what the running turn was actually launched with, and the
+            # two can differ if the box moved after Run was pressed.
             self.out.appendPlainText(
-                f"{rec.get('action')} {rec.get('target')}: {rec.get('verdict')} -- {applied}"
-                + (f"  ({rec.get('reason')})" if rec.get("reason") else ""))
+                f"== leader turn: mode={rec.get('tool_name')} "
+                f"leader={', '.join(map(str, rec.get('voting') or [])) or 'unknown'} "
+                f"workdir={rec.get('target_path')}")
+        elif ev == "approval_request":
+            self.ask(rec)
+        elif ev == "leader_round":
+            self.out.appendPlainText(f"\n--- round {rec.get('round')} ---")
+        elif ev == "leader_text":
+            # The round's COMPLETE reply, delivered once the model call returns -- not a
+            # token stream. It arrives BEFORE that round's actions, which is the ordering
+            # that makes the tab readable: reasoning, then what it did about it.
+            text = str(rec.get("text") or "").rstrip()
+            if text:
+                self.out.appendPlainText(text)
+        elif ev == "leader_reprompt":
+            # The turn tried to END here with no WRITE ever emitted, and the harness sent it
+            # back once. Shown because the alternative is a round that reads, in the live
+            # stream, as the leader inexplicably speaking twice in a row -- and because an
+            # operator watching a plan-only turn needs to know the extra model call was the
+            # harness's doing, not the leader's.
+            self.out.appendPlainText(
+                f"[round {rec.get('round')}] ended with no WRITE emitted -- re-prompted once")
+        elif ev == "leader_problem":
+            # An actions envelope rejected WHOLE -- none of it ran. Surfaced loudly because
+            # the turn otherwise looks like a round that simply chose to do nothing.
+            problems = rec.get("problems") or []
+            joined = "; ".join(str(p) for p in problems) if problems else "unspecified"
+            self.out.appendPlainText(
+                f"[round {rec.get('round')}] ACTIONS REJECTED, none ran: {joined}")
+        elif ev in ("leader_action", "leader_action_final"):
+            # THREE EMITTERS, TWO SCHEMAS, ONE EVENT NAME -- and this branch used to know only
+            # one of them, so every non-write action rendered as "read a.py: None -- not
+            # applied": the verdict field does not exist on that schema, and `ok` (True) was
+            # never read, so a successful read displayed as a failure and its note -- the byte
+            # count, the exit status, the denial reason -- was dropped entirely.
+            #   council_leader.py:983      leader_action        round, action, target, ok, note
+            #   council_leader_run.py:158  leader_action        action, target, verdict,
+            #                                                   applied, reason   (WRITES only)
+            #   council_leader_run.py:224  leader_action_final  action, target, applied,
+            #                                                   verdict="", reason
+            # Only the middle one carries a council verdict, because only a write is reviewed.
+            # In the recap, `applied` is populated from `res.ok`, so it means "the action
+            # succeeded" and is worded that way rather than as an application decision.
+            if ev == "leader_action_final" or "ok" in rec:
+                outcome = "ok" if (rec.get("ok") if "ok" in rec
+                                   else rec.get("applied")) else "FAILED"
+                detail = str(rec.get("note") or rec.get("reason") or "")
+            else:
+                verdict = str(rec.get("verdict") or "")
+                outcome = "APPLIED" if rec.get("applied") else "not applied"
+                outcome = f"{verdict} -- {outcome}" if verdict else outcome
+                detail = str(rec.get("reason") or "")
+            prefix = "recap: " if ev == "leader_action_final" else ""
+            self.out.appendPlainText(
+                f"{prefix}{rec.get('action')} {rec.get('target')}: {outcome}"
+                + (f"  ({detail})" if detail else ""))
         elif ev == "note":
             self.out.appendPlainText(str(rec.get("text")))
+        elif ev == "dropped":
+            # The SAME emitter serves both tabs and emits this on either stream, but only
+            # RunTab was listening -- so a leader turn that outran its UI lost records AND the
+            # notice that it had. That is the worst shape for this tab in particular: its
+            # content is the leader's REASONING, so a silent gap reads as the leader having
+            # said less than it did, and nothing distinguishes that from a quiet turn.
+            self.out.appendPlainText(
+                f"[{rec.get('n')} progress record(s) dropped -- the UI fell behind; the "
+                f"turn itself was unaffected]")
         elif ev == "final_verdict":
             self.out.appendPlainText(str(rec.get("verdict")))
 
@@ -802,7 +1120,12 @@ class LeaderTab(QWidget):
             + ("" if sent else "  (could not reach the turn; it will decline on its own)"))
 
     def on_finished(self, run) -> None:
-        self.go.setEnabled(True); self.stop.setEnabled(False)
+        # EVERY control start() disabled is restored HERE, and mode is now in that set. A
+        # disable without a matching re-enable froze the combo permanently after the first
+        # turn -- the tab kept working and silently stopped being reconfigurable, which is the
+        # shape of bug that survives testing because nothing raises. This runs on the failed,
+        # cancelled and completed paths alike, since all three land here.
+        self.go.setEnabled(True); self.stop.setEnabled(False); self.mode.setEnabled(True)
         if run.start_error:
             self.state.setText("failed"); self.out.appendPlainText(run.start_error)
         elif run.cancelled:

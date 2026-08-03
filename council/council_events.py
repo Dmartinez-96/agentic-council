@@ -70,13 +70,31 @@ from typing import Any, Callable
 #   round_finished   round, verdicts{}
 #   tool_request     member, kind (file|url|exec), granted -- NEVER the argument itself
 #   leader_action    action, target, verdict, applied
+#   leader_round     round -- a leader round began
+#   leader_text      round, text -- that round's COMPLETE reply (not token streaming)
+#   leader_problem   round, problems[] -- an actions envelope rejected WHOLE; none of it ran
+#   leader_reprompt  round -- the turn tried to end with no WRITE ever emitted and was sent
+#                    back once (council_leader.run_leader_turn). Fires at most once per turn
+#   leader_action_final  action, target, applied, verdict, reason -- end-of-turn recap
+#   approval_request id, target, verdict, bytes -- an operator decision is pending
 #   final_verdict    verdict, log_path
 #   dropped          n -- records lost while the consumer was behind (emitted by us)
 #   note             text -- free-form diagnostics
+# THIS LIST HAD GONE STALE, which is worth stating rather than quietly correcting: it is
+# referenced by nothing (grep: this line is its only occurrence), so it is documentation and
+# unenforced documentation at that. SIX names were missing when this was written --
+# leader_round, leader_text, leader_problem, leader_action_final and approval_request had all
+# been emitted for some time; leader_reprompt is new in the same change as this comment.
+# Nothing broke, because the contract is that a consumer IGNORES an unknown `ev`. The cost is
+# narrower than a bug and worth naming exactly: a reader asking "what does the engine emit?"
+# and answering from this tuple got a wrong answer. That is NOT what caused the GUI to drop
+# four leader events -- those were dropped by missing handler branches, and this tuple, being
+# unused, could not have caused it. It is the same class of staleness, not the same defect.
 EVENT_NAMES = (
     "run_started", "round_started", "member_started", "member_finished",
     "member_corrected", "round_finished", "tool_request", "leader_action",
-    "final_verdict", "dropped", "note",
+    "leader_round", "leader_text", "leader_problem", "leader_reprompt",
+    "leader_action_final", "approval_request", "final_verdict", "dropped", "note",
 )
 
 FIELD_MAX = 4000            # chars per string field before truncation

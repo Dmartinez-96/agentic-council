@@ -90,25 +90,48 @@ OK, NEEDS_ADJ, NOT_RUN, INVALID, SUPERSEDED = (
     "PASS", "NEEDS_ADJUDICATION", "NOT_RUN", "INVALID", "SUPERSEDED")
 
 
-def _engine():
+def _engine(root=None):
     """Import the council engine for its hardened fetch/exec primitives.
 
-    Returns the module or None. The brain deliberately does NOT reimplement URL
-    validation or sandboxing: `fetch_web_url` carries the exact-host allowlist, the
-    per-hop redirect revalidation and the DNS-rebinding IP pin, and
+    Returns (module, path) -- either may be None. The brain deliberately does NOT
+    reimplement URL validation or sandboxing: `fetch_web_url` carries the exact-host
+    allowlist, the per-hop redirect revalidation and the DNS-rebinding IP pin, and
     `run_exec_sandbox` carries the bubblewrap containment. Reimplementing either
     here would mean a second, weaker copy of a security boundary.
+
+    `--root` IS PREFERRED OVER THE PACKAGE COPY, and this ordering is the whole point.
+    Command checks run against the tree at --root, so validating them with an engine
+    from somewhere else measures a combination that exists nowhere. That is not
+    hypothetical: on 2026-08-02 a live tree under development had an exec-sandbox fix
+    the packaged engine lacked, and running every command check through the packaged
+    engine turned ALL 23 checkable notes into NEEDS_ADJUDICATION with an identical
+    71-byte sandbox error. It read as a vault of rotted facts and was a version skew --
+    the worst possible presentation, since the instrument for detecting stale facts was
+    itself reporting one stale thing 23 times.
+
+    THE PATH IS RETURNED SO THE CALLER CAN PRINT IT. Which engine ran was previously
+    invisible, which is why the skew above took a debugging session to see rather than
+    being read off the output.
+
+    IMPORTING FROM --root MEANS EXECUTING CODE FROM --root. That is not a new exposure:
+    a command check already runs that tree's code, and --root is operator-supplied
+    rather than discovered. Worth knowing, not worth a guard the rest of the tool
+    would contradict.
     """
     here = Path(__file__).resolve().parent
-    for cand in (here.parent / "council", here.parent):
+    cands = []
+    if root is not None:
+        cands.append(Path(root))
+    cands += [here.parent / "council", here.parent]
+    for cand in cands:
         if (cand / "consult_council.py").exists():
             sys.path.insert(0, str(cand))
             try:
                 import consult_council  # noqa: PLC0415
-                return consult_council
+                return consult_council, cand
             except Exception:  # noqa: BLE001 -- a broken engine must not crash validation
-                return None
-    return None
+                return None, cand
+    return None, None
 
 
 # --------------------------------------------------------------------------
@@ -418,7 +441,17 @@ def main():
         print(f"ERROR: not a directory: {vault}", file=sys.stderr)
         return 2
     root = Path(args.root).resolve()
-    engine = _engine()
+    engine, engine_path = _engine(root)
+    # NAME THE ENGINE, whether or not it resolved. A command check's result is a statement
+    # about an engine as much as about a note, and without this the reader cannot tell which
+    # one produced it. (`--json` emits a schema rather than prose, so it is excluded here.)
+    if not args.json:
+        if engine is None:
+            print(f"engine: NONE reachable (tried {engine_path or 'no candidate'}) -- "
+                  f"command and url checks cannot run")
+        else:
+            print(f"engine: {engine_path}"
+                  + ("  [--root]" if engine_path == root else "  [packaged]"))
 
     # ENUMERATION AND ITS ERROR DETECTION ARE ONE TRAVERSAL, deliberately.
     # This used to be `vault.rglob("*.md")`, which SILENTLY OMITS the contents of a
