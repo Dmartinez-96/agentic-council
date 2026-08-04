@@ -65,6 +65,7 @@ contract guard described above, not an identity check against the configured lea
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import secrets
@@ -72,7 +73,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import consult_council as cc
@@ -533,6 +534,8 @@ class ActionResult:
     ok: bool
     content: str
     note: str
+    target: str = ""
+    sha256: str = ""
 
 
 # Per-CALL tool bounds for the leader, borrowed from the member-side caps so the leader is
@@ -631,8 +634,23 @@ def run_leader_actions(actions, workdir: Path, leader: "cc.Member", *,
             review_text = (r.get("review") or "").strip()
             content = note if not review_text else (
                 note + "\n--- council review ---\n" + review_text[:LEADER_REVIEW_ECHO_MAX])
-            results.append(emit(ActionResult("write", a.arg, bool(r.get("applied")),
-                                             content, note)))
+            # CAPTURED HERE BECAUSE IT CANNOT BE DERIVED LATER. review_and_write resolves the
+            # jailed path and hashes nothing; ActionResult kept neither, so a turn-end
+            # reconciliation had no path to stat and no bytes to compare. Both are taken from
+            # the write that just happened, at the only point where both are in hand.
+            # THE KEY IS ASYMMETRIC ON PURPOSE: the three branches that deny BEFORE path
+            # resolution return "path" (the raw rel_path) and the six after return "target"
+            # (resolved), so a bare r.get("target") is None for exactly the denials most worth
+            # reading. Falling back to a.arg keeps the field populated for every branch.
+            # THE HASH IS OF THE BYTES WE ASKED TO WRITE, and only when the write was APPLIED:
+            # hashing content that never reached disk would invite a later comparison against
+            # a file that was never supposed to exist.
+            applied = bool(r.get("applied"))
+            results.append(emit(ActionResult(
+                "write", a.arg, applied, content, note,
+                target=str(r.get("target") or r.get("path") or a.arg),
+                sha256=(hashlib.sha256(a.body.encode("utf-8", "surrogatepass")).hexdigest()
+                        if applied else ""))))
             continue
         cap_n, cap_b = caps[k]
         label = _note_label(k, a.arg)
@@ -673,6 +691,192 @@ def run_leader_actions(actions, workdir: Path, leader: "cc.Member", *,
         used[k] += nbytes
         results.append(emit(ActionResult(k, a.arg, True, content, f"{label}: {note}")))
     return results
+
+
+def _claims_sentinels(nonce: str) -> tuple[str, str]:
+    return (f"--- BEGIN CLAIMS {nonce} ---", f"--- END CLAIMS {nonce} ---")
+
+
+_CLAIM_LINE_RE = re.compile(r"^\s*CLAIMED:\s*(\S[^\n]*?)\s*$")
+
+
+def parse_claims(text: str, nonce: str) -> list[str]:
+    """Extract CLAIMED paths from a leader's final answer, in order, deduplicated.
+
+    Grammar, scoped by the SAME per-round nonce the actions envelope uses so a claims block
+    echoed back from an earlier round cannot replay:
+        --- BEGIN CLAIMS <nonce> ---
+        CLAIMED: relative/path
+        --- END CLAIMS <nonce> ---
+    A path is confined to ONE line, matching parse_write_requests' rule for the same reason.
+    Lines that are not CLAIMED: are ignored, so the leader may write prose inside the block.
+    Returns [] when there is no block -- which is NOT the same as a verified empty claim, and
+    the caller must keep the two apart.
+    """
+    begin, end = _claims_sentinels(nonce)
+    i = text.find(begin)
+    if i < 0:
+        return []
+    j = text.find(end, i + len(begin))
+    if j < 0:
+        return []
+    seen, out = set(), []
+    for line in text[i + len(begin):j].splitlines():
+        m = _CLAIM_LINE_RE.match(line)
+        if m and m.group(1) not in seen:
+            seen.add(m.group(1))
+            out.append(m.group(1))
+    return out
+
+
+# What a claimed path turned out to be. Read these as EVIDENCE STATES, not accusations:
+# only CONTRADICTED implies the leader was told otherwise (see verify_claims).
+CLAIM_VERIFIED = "VERIFIED"              # applied by the harness, bytes still match
+CLAIM_ALTERED = "ALTERED"                # applied, but what is on disk now differs
+CLAIM_CONTRADICTED = "CONTRADICTED"      # a WRITE was requested for it and did NOT apply
+CLAIM_UNSUBSTANTIATED = "UNSUBSTANTIATED"  # no WRITE was ever requested for this path
+
+
+def _norm_claim(path: str, workdir: Path) -> str:
+    """A claimed path reduced to a workdir-relative form for comparison, or "" if outside.
+
+    Absolute paths are accepted and made relative when they are inside the workdir, because a
+    leader naming the file it just wrote may reasonably name it either way; anything outside
+    normalizes to "" and can therefore never match a write this turn.
+    """
+    p = path.strip()
+    if not p:
+        return ""
+    try:
+        if os.path.isabs(p):
+            rel = os.path.relpath(os.path.normpath(p), str(workdir))
+            return "" if rel.startswith("..") else rel
+        return os.path.normpath(p)
+    except ValueError:                   # e.g. paths on different drives
+        return ""
+
+
+def verify_claims(claims, results, workdir: Path) -> tuple:
+    """Check each CLAIMED path against what the harness actually did and what is on disk.
+
+    Returns a tuple of {"claim", "status", "detail"}. The four states are defined above.
+
+    THE ONE STATE THAT CARRIES WEIGHT IS CONTRADICTED, and the reason is measured rather than
+    assumed: a WRITE that did not apply is reported back to the leader IN THAT ROUND, carrying
+    the verdict and the council's reason (probe_block_feedback.py -- the next round's prompt
+    contains the path, verdict=BLOCK, applied=False and the review text, with a control
+    showing none of it in the first prompt). So a leader claiming such a path is contradicting
+    something it was demonstrably told, which is a stronger signal than an unverifiable claim.
+
+    UNSUBSTANTIATED IS NOT A LIE DETECTOR. It says only that no WRITE was requested for the
+    path. A leader that changed nothing and truthfully says so, or that names a file it merely
+    READ, lands here too. It is the weakest state and must be rendered as such.
+    """
+    by_path: dict = {}
+    for r in results:
+        if r.kind != "write":
+            continue
+        keys = {_norm_claim(r.arg, workdir)}
+        if r.target:
+            keys.add(_norm_claim(r.target, workdir))
+        for k in keys:
+            if k:
+                by_path.setdefault(k, []).append(r)
+    out = []
+    for c in claims:
+        k = _norm_claim(c, workdir)
+        writes = by_path.get(k, []) if k else []
+        if not writes:
+            out.append({"claim": c, "status": CLAIM_UNSUBSTANTIATED,
+                        "detail": "no WRITE was requested for this path this turn"})
+            continue
+        applied = [w for w in writes if w.ok]
+        if not applied:
+            out.append({"claim": c, "status": CLAIM_CONTRADICTED,
+                        "detail": writes[-1].note})
+            continue
+        last = applied[-1]               # last write to a path wins, as in reconcile_writes
+        p = Path(last.target)
+        try:
+            if p.is_symlink():
+                got = "symlink (not followed)"
+            elif p.is_file():
+                got = hashlib.sha256(p.read_bytes()).hexdigest()
+            else:
+                got = ""
+        except OSError as e:
+            got = f"unreadable: {e.__class__.__name__}"
+        if got == last.sha256:
+            out.append({"claim": c, "status": CLAIM_VERIFIED, "detail": last.target})
+        else:
+            out.append({"claim": c, "status": CLAIM_ALTERED,
+                        "detail": f"{last.target}: expected {last.sha256 or '(none)'}, "
+                                  f"found {got or '(absent)'}"})
+    return tuple(out)
+
+
+def reconcile_writes(results) -> dict:
+    """Reconcile what a turn ASKED to write against what is ON DISK at turn end.
+
+    Returns {"requested", "applied", "unapplied", "altered"}. `requested` is every WRITE
+    action that parsed; `applied` those that reached disk (resolved target); `unapplied` the
+    rest, each carrying the note that says WHY (verdict + reason); `altered` the applied ones
+    whose bytes no longer match what was written.
+
+    WHAT THIS IS, precisely, because the bench forced this distinction three times: it
+    reconciles WRITE ACTIONS against the FILESYSTEM. It does NOT read the leader's prose and
+    cannot detect a false claim -- a leader that honestly reports "blocked.py was blocked"
+    produces exactly the same `unapplied` entry as one that claims it succeeded. This is
+    DISCREPANCY METADATA, and a consumer that renders it as an accusation is misreading it.
+
+    `altered` COMPARES A HASH, NOT A DIFF, and that is the whole reason it survives where a
+    before/after workdir diff did not: a diff cannot tell "did not survive" from "idempotent
+    write of identical bytes", and in a live tree it cannot tell the leader's mutation from a
+    concurrent writer's. Hashing a NAMED path against the bytes we ourselves wrote asks a
+    narrower question that has an answer. MEASURED (_nogit/probe_write_hash.py): an existence
+    check calls a tampered file present, while the hash reports it differs.
+    THE LAST WRITE WINS, deliberately: a turn may legitimately write the same path twice, and
+    comparing against the FIRST hash would flag that honest sequence. Measured in the same
+    probe -- last-hash is clean, first-hash false-positives.
+    A MISSING file is reported under `altered` with sha "" so a consumer reading one key sees
+    both ways an applied write can fail to be there.
+    """
+    requested, applied, unapplied = [], [], []
+    last_hash: dict = {}
+    for r in results:
+        if r.kind != "write":
+            continue
+        requested.append(r.arg)
+        if r.ok:
+            applied.append(r.target)
+            last_hash[r.target] = r.sha256          # last write to a path wins
+        else:
+            unapplied.append({"path": r.arg, "target": r.target, "note": r.note})
+    altered = []
+    for target, want in last_hash.items():
+        p = Path(target)
+        # A SYMLINK PRESENT AT CHECK TIME IS NOT FOLLOWED -- and that is the exact claim, not
+        # "never followed", which a check-then-use race falsifies: is_symlink() and
+        # read_bytes() are two syscalls, so a link swapped in between them IS followed.
+        # _resolve_write_target refuses a symlink BEFORE the write; nothing stops one being
+        # put there AFTER, and reading through it would hash a file outside the jail and
+        # report it as the leader's own. Reported as altered rather than read, because a
+        # target that became a link is a discrepancy in its own right. The racing case sits
+        # inside the same boundary _resolve_write_target already names: this is not proof
+        # against a hostile filesystem racing the write.
+        try:
+            if p.is_symlink():
+                got = "symlink (not followed)"
+            elif p.is_file():
+                got = hashlib.sha256(p.read_bytes()).hexdigest()
+            else:
+                got = ""
+        except OSError as e:                        # unreadable is not "unchanged"
+            got = f"unreadable: {e.__class__.__name__}"
+        if got != want:
+            altered.append({"target": target, "expected": want, "found": got})
+    return {"requested": tuple(requested), "applied": tuple(applied),
+            "unapplied": tuple(unapplied), "altered": tuple(altered)}
 
 
 LEADER_MAX_ROUNDS_PER_TURN = 8   # provisional: max act->observe cycles within one turn,
@@ -721,11 +925,14 @@ class TurnRecord:
     results: tuple = ()
     scratch: str = ""
     reprompted: bool = False
+    writes: dict = field(default_factory=dict)
+    claims: tuple = ()
 
 
 def _action_grammar_instructions(nonce: str) -> str:
     a_begin, a_end = _actions_sentinels(nonce)
     c_begin, c_end = _write_sentinels(nonce)
+    k_begin, k_end = _claims_sentinels(nonce)
     return (
         "# HOW TO ACT\n\n"
         "To use tools, emit ONE actions block EXACTLY like the template below, using this\n"
@@ -743,6 +950,18 @@ def _action_grammar_instructions(nonce: str) -> str:
         "Actions run IN THE ORDER listed. READ/FETCH/EXEC are non-mutating. A WRITE is\n"
         "reviewed by the council BEFORE it can touch disk and is applied only on PASS/WARN;\n"
         "its verdict and the review come back to you. Include only actions you truly want run."
+        "\n\n"
+        "# WHEN YOU FINISH: DECLARE WHAT YOU CHANGED\n\n"
+        "In your FINAL answer (the one with no actions block), if you state that you created\n"
+        "or modified any file, list those files in a claims block using this round's nonce:\n\n"
+        f"{k_begin}\n"
+        "CLAIMED: relative/path/you/changed\n"
+        f"{k_end}\n\n"
+        "Each path is checked against what the harness actually applied and against the file\n"
+        "on disk. THIS IS NOT A TEST YOU CAN FAIL BY BEING HONEST: declaring nothing is fine\n"
+        "if you changed nothing, and a path the council BLOCKED is expected to come back as\n"
+        "contradicted -- say so in your prose rather than claiming it. The block exists so a\n"
+        "reader downstream can tell a verified change from an unverified sentence about one."
     )
 
 
@@ -916,6 +1135,7 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
     wrote = False           # a WRITE has PARSED this turn (see the re-prompt block below)
     reprompted = False      # the zero-write notice has already fired; it never fires twice
     notice = ""             # queued for the NEXT round's prompt, then cleared
+    claims: tuple = ()      # verified CLAIMS from the final answer; () when none was emitted
     for i in range(max_rounds):
         nonce = nonce_fn()
         event("leader_round", round=i)
@@ -952,6 +1172,11 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
                 event("leader_reprompt", round=i)
                 continue
             final_text = text
+            # THE CLAIMS BLOCK IS READ HERE AND NOWHERE ELSE: it belongs to the FINAL answer,
+            # and it is scoped by THIS round's nonce, so a block echoed from an earlier round
+            # cannot replay. An absent block yields () -- which the record must never render
+            # as "verified", only as "none declared".
+            claims = verify_claims(parse_claims(text, nonce), all_results, workdir)
             stop_reason = ("final answer (no actions, after zero-write re-prompt)"
                            if reprompted else "final answer (no actions)")
             rounds.append({"round": i, "notes": (), "leader_chars": len(text)})
@@ -990,7 +1215,8 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
         rounds.append({"round": i, "notes": notes, "leader_chars": len(text)})
         all_results.extend(results)
     return TurnRecord(leader.name, tuple(rounds), final_text, stop_reason,
-                      tuple(all_results), str(scratch) if scratch else "", reprompted)
+                      tuple(all_results), str(scratch) if scratch else "", reprompted,
+                      reconcile_writes(all_results), claims)
 
 
 _HANDOFF_PANEL_INSTRUCTIONS = (
