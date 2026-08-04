@@ -36,8 +36,8 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QGroupBox, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QSplitter, QTableWidget, QTableWidgetItem,
-    QTabWidget, QVBoxLayout, QWidget,
+    QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QTableWidget,
+    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 import council_gui_engine as ge
@@ -282,6 +282,24 @@ class ConfigTab(QWidget):
         self.leader_transport.currentIndexChanged.connect(
             lambda _i: self._leader_cascade())
         lay.addWidget(leader_box)
+
+        # RETRIEVAL BUDGET. The user's ruling of 2026-08-03: 128k is the right default, but the
+        # user must be able to raise it per install. The value, its default and its bounds all
+        # come from the ENGINE via print_roster -- the GUI hardcodes none of them, for the same
+        # reason it never parses roster.json itself: a second source of truth eventually
+        # disagrees with the first, and the user would be configuring against a fiction.
+        # Seeded in reload(); range and suffix are set there too.
+        ret_box = QGroupBox("Member file retrieval")
+        rl = QHBoxLayout(ret_box)
+        self.retrieval_cap = QSpinBox()
+        self.retrieval_cap.setGroupSeparatorShown(True)
+        self.retrieval_cap.setSingleStep(8_000)
+        self.retrieval_cap_note = QLabel()
+        self.retrieval_cap_note.setWordWrap(True)
+        rl.addWidget(QLabel("bytes per granted file"))
+        rl.addWidget(self.retrieval_cap)
+        rl.addWidget(self.retrieval_cap_note, 1)
+        lay.addWidget(ret_box)
 
         sw = QGroupBox("Switches (take effect on the next fire; GLOBAL to this install)")
         sl = QVBoxLayout(sw)
@@ -552,6 +570,32 @@ class ConfigTab(QWidget):
         # change signal when it was already 0, and the harness case still has to disable
         # the two fields.
         self._leader_cascade()
+        # RETRIEVAL BUDGET, seeded from the engine. Bounds first, then the value: setValue
+        # CLAMPS to the current range, so seeding a 128,000 default into a spin box still
+        # holding Qt's stock 0..99 maximum would silently store 99. Signals are blocked
+        # because reload() runs on Save, and a valueChanged handler firing mid-reload would
+        # be reacting to the engine's own answer rather than to the user.
+        cap = int(data.get("retrieval_per_file_cap") or 0)
+        cap_default = int(data.get("retrieval_per_file_cap_default") or 0)
+        lo = int(data.get("retrieval_per_file_cap_min") or 0)
+        hi = int(data.get("retrieval_per_file_cap_max") or 0)
+        self.retrieval_cap.blockSignals(True)
+        if hi >= lo > 0:
+            self.retrieval_cap.setRange(lo, hi)
+        if cap:
+            self.retrieval_cap.setValue(cap)
+        self.retrieval_cap.blockSignals(False)
+        self._cap_default = cap_default
+        note = (f"default {cap_default:,}" if cap_default else "")
+        if cap and cap_default and cap > cap_default:
+            note += (f" -- RAISED to {cap:,}: a grant may now carry up to that many bytes, "
+                     f"and a member that requests a file of at least that size pays it")
+        elif cap and cap_default and cap < cap_default:
+            note += (f" -- LOWERED to {cap:,}: a file larger than that is truncated, and a "
+                     f"member may not be able to reach what it is reviewing")
+        if lo and hi:
+            note += f"   (allowed {lo:,}-{hi:,})"
+        self.retrieval_cap_note.setText(note)
         errs, warns = data.get("errors") or [], data.get("warnings") or []
         bits = [f"active source: {data.get('source')}", f"{len(members)} seats"]
         if errs:
@@ -589,6 +633,13 @@ class ConfigTab(QWidget):
                 rec["fallback_model"] = cell(4)
             members.append(rec)
         roster: dict = {"members": members}
+        # WRITTEN ONLY WHEN IT DIFFERS FROM THE DEFAULT. Persisting the default would bake
+        # today's 128,000 into every roster.json, so a later change to the engine's default
+        # would silently not reach any install that had ever pressed Save. Absent means
+        # "whatever the engine's default is", which is what the user chose by not changing it.
+        cap = int(self.retrieval_cap.value())
+        if cap and cap != getattr(self, "_cap_default", 0):
+            roster["retrieval_per_file_cap"] = cap
         transport = self.leader_transport.currentData()
         if transport:
             roster["leader"] = {"name": self.leader_name.text().strip() or "leader",

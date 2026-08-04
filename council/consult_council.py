@@ -3169,6 +3169,38 @@ def _validate_transport_model(rec: dict, name: str, where: str,
     return transport, model, fallback
 
 
+# BYTE BUDGET PER GRANT (8 reserved, rule 8). This is a PROMPT budget -- these bytes land in a
+# member's context and are paid for on every fire -- so it is the one retrieval number with a
+# real cost attached, and it is not derived from the host.
+# WHY 128,000 AND NOT 24,000, which is what it was until 2026-08-03. At 24,000 a member got
+# m*z = 72,000 bytes, while consult_council.py in this tree is 375,963 bytes: a reviewer could
+# reach 19% of the file it was reviewing, and retrieval is ONE-SHOT so it cannot walk the rest
+# across rounds. Members said so in their own verdicts -- "I can neither confirm nor refute the
+# code-level claims" (kimi, log 20260802T054717Z-98058e60).
+# THE BASIS IS THE TREE, not a feeling: largest source file / m = 375,963 / 3 = 125,321,
+# rounded up. Three requests therefore cover the largest file here completely.
+# WHAT IT COSTS, and the conversion is an ESTIMATE, not a measurement: at the usual rule of
+# thumb of ~4 bytes per token, one full grant is roughly 32k tokens, and a fire in which all
+# six voting members took all three grants would carry roughly 576k tokens of retrieved source.
+# Nothing here tokenizes anything, and the real figure varies by model and by content; the
+# number is offered to weigh a change of scale, not as an accounting.
+# IT IS A DEFAULT, NOT A LAW. The user's ruling of 2026-08-03: 128k is the right default and the
+# user may set their own. The override is roster.json's optional top-level
+# "retrieval_per_file_cap", validated by _validate_retrieval_cap below.
+# THESE LIVE HERE, ABOVE _validate_roster, RATHER THAN WITH THE OTHER RETRIEVAL CONSTANTS,
+# because that validator runs during load_registry() at import and would NameError on constants
+# defined further down the file.
+# THE FLOOR AND CEILING ARE CHOSEN, not derived, and are labelled so rather than dressed up.
+# BE PRECISE ABOUT WHAT THEY CATCH: only a GROSS mistake -- 0, 12, or 20_000_000. They do NOT
+# catch a single misplaced zero either side of the default, since 12_800 and 1_280_000 both sit
+# inside them. A value between the bounds is accepted; above the default it is accepted WITH a
+# warning naming the raised grant size and the fact that it recurs on every fire, which is a
+# note to the user, not a refusal.
+RETRIEVAL_PER_FILE_CAP_DEFAULT = 128_000
+RETRIEVAL_PER_FILE_CAP_MIN = 4_000
+RETRIEVAL_PER_FILE_CAP_MAX = 2_000_000
+
+
 def _validate_roster(raw: object) -> tuple[tuple[Member, ...], list[str],
                                            list[str]]:
     """Validate a parsed roster.json. Returns (members, errors, warnings);
@@ -3238,7 +3270,39 @@ def _validate_roster(raw: object) -> tuple[tuple[Member, ...], list[str],
             warnings.append(f"only {n_vote} voting member(s): quorum is "
                             f"{block_quorum(n_vote)}, so a SINGLE member can "
                             f"auto-revert at this roster")
+    _validate_retrieval_cap(raw, errors, warnings)
     return tuple(out), errors, warnings
+
+
+def _validate_retrieval_cap(raw: dict, errors: list[str],
+                            warnings: list[str]) -> None:
+    """Check roster.json's optional top-level "retrieval_per_file_cap".
+
+    ABSENT IS THE NORMAL CASE and means the built-in default. A present value is validated
+    here, inside the roster validation, so a bad value REJECTS THE ROSTER WHOLE exactly as a
+    bad member entry does -- rather than being silently coerced into a budget the user did not
+    ask for. This appends to `errors`/`warnings` and returns nothing; the accepted value is
+    returned by load_registry() and bound to the module-level RETRIEVAL_PER_FILE_CAP.
+    """
+    if "retrieval_per_file_cap" not in raw:
+        return
+    v = raw["retrieval_per_file_cap"]
+    # bool is an int subclass, and `True` as a byte budget is a typo, not a budget.
+    if isinstance(v, bool) or not isinstance(v, int):
+        errors.append('retrieval_per_file_cap: must be an integer number of bytes')
+        return
+    if v < RETRIEVAL_PER_FILE_CAP_MIN:
+        errors.append(f"retrieval_per_file_cap: {v} is below the {RETRIEVAL_PER_FILE_CAP_MIN} "
+                      f"byte floor; a budget this small cannot deliver a useful grant")
+    elif v > RETRIEVAL_PER_FILE_CAP_MAX:
+        errors.append(f"retrieval_per_file_cap: {v} exceeds the {RETRIEVAL_PER_FILE_CAP_MAX} "
+                      f"byte ceiling; this budget is spent on every member of every fire")
+    elif v > RETRIEVAL_PER_FILE_CAP_DEFAULT:
+        # NOT an error. Raising it is exactly what the knob is for; the user should simply be
+        # told what it costs, since m * n * v is the fire budget that follows from it.
+        warnings.append(f"retrieval_per_file_cap raised to {v} bytes (default "
+                        f"{RETRIEVAL_PER_FILE_CAP_DEFAULT}); each grant is delivered into a "
+                        f"member's context and paid for on every fire")
 
 
 def _validate_leader(raw: dict, errors: list[str],
@@ -3284,9 +3348,12 @@ def _validate_leader(raw: dict, errors: list[str],
 
 
 def load_registry() -> tuple[tuple[Member, ...], "Member | None", str,
-                             list[str], list[str]]:
+                             list[str], list[str], int]:
     """The active roster: roster.json when present and valid, else the default.
-    Returns (registry, leader, source, errors, warnings). `leader` is the
+    Returns (registry, leader, source, errors, warnings, per_file_cap). The last is the
+    active retrieval grant budget: roster.json's "retrieval_per_file_cap" when the file was
+    ACCEPTED, and RETRIEVAL_PER_FILE_CAP_DEFAULT otherwise -- a rejected roster does not get
+    to set what every fire spends. `leader` is the
     configured council-native leader Member, or None when none is configured (the
     Claude Code harness leads by default) or the roster was rejected.
 
@@ -3298,24 +3365,29 @@ def load_registry() -> tuple[tuple[Member, ...], "Member | None", str,
     edits entirely unreviewed until someone noticed the hook failing.
     """
     if not ROSTER_PATH.exists():
-        return DEFAULT_REGISTRY, None, "default", [], []
+        return (DEFAULT_REGISTRY, None, "default", [], [],
+                RETRIEVAL_PER_FILE_CAP_DEFAULT)
     try:
         raw = json.loads(ROSTER_PATH.read_text())
     except (OSError, ValueError) as e:
         return (DEFAULT_REGISTRY, None, "default (roster.json rejected)",
-                [f"roster.json unreadable: {e}"], [])
+                [f"roster.json unreadable: {e}"], [], RETRIEVAL_PER_FILE_CAP_DEFAULT)
     members, errors, warnings = _validate_roster(raw)
     # Validate the leader only once the members list is clean, so a members-list
     # error surfaces first and the leader is not checked against an
     # already-rejected roster. Either error set rejects the whole file.
     leader = _validate_leader(raw, errors, warnings) if not errors else None
     if errors:
+        # REJECTED WHOLE means the cap too: a roster the engine refused must not get to
+        # set the budget, or a bad file could still raise what every fire spends.
         return (DEFAULT_REGISTRY, None, "default (roster.json rejected)",
-                errors, warnings)
-    return members, leader, ROSTER_PATH.name, [], warnings
+                errors, warnings, RETRIEVAL_PER_FILE_CAP_DEFAULT)
+    return (members, leader, ROSTER_PATH.name, [], warnings,
+            raw.get("retrieval_per_file_cap", RETRIEVAL_PER_FILE_CAP_DEFAULT))
 
 
-REGISTRY, LEADER_MEMBER, ROSTER_SOURCE, ROSTER_ERRORS, ROSTER_WARNINGS = load_registry()
+(REGISTRY, LEADER_MEMBER, ROSTER_SOURCE, ROSTER_ERRORS, ROSTER_WARNINGS,
+ RETRIEVAL_PER_FILE_CAP) = load_registry()
 
 
 def voting_members() -> tuple[Member, ...]:
@@ -3363,8 +3435,55 @@ TRANSPORT_KEY_ENV = {
 # Provisional starting points -- design knobs sized for prompt sanity, not
 # measured optima. Retune against real fires once the feature has traffic.
 RETRIEVAL_MAX_REQUESTS_PER_MEMBER = 3
-RETRIEVAL_PER_FILE_CAP = 24_000       # byte budget per grant (8 reserved, rule 8)
-RETRIEVAL_PER_FIRE_CAP = 64_000       # bytes of delivered content per fire
+# RETRIEVAL_PER_FILE_CAP IS NOT DEFINED HERE. It is the ACTIVE per-grant budget and is bound
+# where the roster is loaded, above, because roster.json may override it -- see
+# RETRIEVAL_PER_FILE_CAP_DEFAULT and _validate_retrieval_cap for the value, its basis, and its
+# bounds. A second literal at this spot is exactly what this comment replaced: it sat below the
+# roster load and would have silently overwritten the user's configured budget on import.
+# Structural bytes a granted section costs on top of its content: the "### path (note)" line,
+# the code fence, and -- for a brain note -- the gate's STATUS banner. 1024 is an ALLOWANCE,
+# not a measurement; it is deliberately generous because its only job is to keep the derived
+# fire cap below from binding on formatting.
+RETRIEVAL_SECTION_OVERHEAD = 1024
+# The per-member WRAPPER paragraph, charged once to each member that gets any block. Also an
+# allowance rather than a measurement, for the same reason.
+RETRIEVAL_WRAPPER_ALLOWANCE = 512
+
+
+def retrieval_fire_cap(n_retrievers: int) -> int:
+    """The per-fire delivery budget for a bench of `n_retrievers` retrieval-capable members.
+
+    DERIVED, NOT CHOSEN, and that is the user's ruling of 2026-08-03: "set it above the
+    reasonable maximum possible ... the per FIRE cap should be m * n * z", with m the requests
+    a member may make, n the members on the bench, and z the per-file cap. Everything below is
+    that product plus the structural bytes the fire actually charges.
+
+    WHAT WAS WRONG WITH THE OLD NUMBER, since a derived bound is only worth the failure it
+    removes. The cap was a flat 64,000 shared across the WHOLE bench while a single grant may
+    be 24,000 -- so a fire allowed roughly 2.7 full-size grants for all members combined, and
+    the per-member allowance of 3 could never bind first. The first members parsed took the
+    budget and the rest were told "per-fire delivery budget exhausted".
+    WHAT IS AND IS NOT EVIDENCED FOR THAT, because an earlier draft of this docstring got it
+    wrong and blamed the wrong cap. The arithmetic above is certain -- 64,000 shared against a
+    24,000 grant is 2.7 grants, and it is why the per-member allowance of 3 could never bind
+    first. NO FIRE HAS BEEN OBSERVED HITTING IT during this work: the retrieval failures
+    actually recorded on 2026-08-03 were absolute-path denials, a different defect with its own
+    fix. So this change removes a bound that provably CANNOT accommodate the bench it governs;
+    it does not claim to fix a failure anyone measured.
+
+    SO THIS CAP NO LONGER BINDS BEFORE THE OTHER TWO, BY CONSTRUCTION. It is a backstop
+    against the payload growing in some way the per-member and per-file caps do not describe,
+    not a rationing device. If it ever fires, one of the three inputs is wrong -- which is a
+    better failure than silently rationing review.
+
+    n_retrievers is counted from the ACTUAL batch, so a bench that grows gets a bigger budget
+    without anyone editing a constant, and the leader (a bench of one) gets its own.
+    """
+    per_member = RETRIEVAL_MAX_REQUESTS_PER_MEMBER * (
+        RETRIEVAL_PER_FILE_CAP + RETRIEVAL_SECTION_OVERHEAD + 2)  # +2: the "\n\n" join
+    return max(0, n_retrievers) * (RETRIEVAL_WRAPPER_ALLOWANCE + per_member)
+
+
 # Sanity bounds on the member-supplied path STRING (not filesystem limits):
 # reject an absurd request path at read time, and cap the path rendered into a
 # member's block so an always-delivered denial cannot inflate the payload. The
@@ -3504,8 +3623,41 @@ def read_repo_file(workdir: Path, rel_path: str,
     true path cannot be read back, the request is DENIED rather than served on
     the weaker pre-open check alone.
     """
-    if not rel_path or rel_path.startswith(("/", "~")):
-        return None, "absolute and home-relative paths are denied"
+    if not rel_path:
+        return None, "empty path"
+    if rel_path.startswith("~"):
+        return None, ("home-relative paths are denied; request the path relative to the "
+                      "workdir root")
+    if rel_path.startswith("/"):
+        # AN ABSOLUTE PATH INSIDE THE WORKDIR IS REWRITTEN TO ITS RELATIVE FORM, not refused.
+        # This was a flat denial, and it cost real review: on 2026-08-03 both deepseek and glm
+        # asked for a file by the absolute path THIS ENGINE PRINTS in the evidence header, were
+        # denied, and lost their one retrieval to it -- deepseek spent its round-2 body on a
+        # REQUEST_FILE it could never be answered on, and glm wrote that it could not verify a
+        # claim as a result. Punishing a member for using the only path spelling it was shown
+        # is a defect in the harness, not in the member.
+        # CONTAINMENT IS UNCHANGED. This branch only decides how to SPELL the request: it
+        # rewrites, then falls through to every check below -- traversal, dotfiles, denylist,
+        # O_NOFOLLOW, the resolved-path check and the fail-closed fd re-check. Nothing here
+        # grants access; a path that survives rewriting still has to survive all of that.
+        # normpath, NOT resolve: collapsing '..' lexically is enough to decide "is this under
+        # the root", and resolving symlinks HERE would let a link decide its own containment
+        # before the real checks run.
+        cand = Path(os.path.normpath(rel_path))
+        roots = []
+        for r in (workdir, workdir.resolve()):
+            # BOTH SPELLINGS, because the two can differ when the tree is reached through a
+            # symlink, and the member is shown whichever the caller passed.
+            rn = Path(os.path.normpath(str(r)))
+            if rn not in roots:
+                roots.append(rn)
+        for root in roots:
+            if cand != root and cand.is_relative_to(root):
+                rel_path = str(cand.relative_to(root))
+                break
+        else:
+            return None, ("absolute paths are accepted only inside the workdir; this one is "
+                          "outside it. Request the path relative to the workdir root instead")
     if len(rel_path) > REQUEST_PATH_MAX_LEN:
         return None, "path too long"
     low = rel_path.lower()
@@ -3883,7 +4035,13 @@ def collect_file_requests(round1_results: list[dict],
     egress. Returns (blocks_by_member, log_record).
     """
     blocks: dict[str, str] = {}
-    log: dict = {"workdir": str(workdir), "requests": [], "any_granted": False}
+    log: dict = {"workdir": str(workdir), "requests": [], "any_granted": False,
+                 # RECORDED so the accounting can be checked from outside rather than trusted.
+                 # `delivered_bytes` on a request is that SECTION's size and says nothing about
+                 # whether the wrapper and the joins were charged; delivered_total is the only
+                 # number that does, and a test comparing sections to sections cannot tell the
+                 # difference. Set at the end, once it is final.
+                 "delivered_total": 0}
     # Per-fire budget accounting: delivered_total EQUALS the total bytes of the
     # blocks delivered to members -- for each member, the WRAPPER (once), every
     # section, and the "\n\n" joins between them. Only GRANTS are gated by the
@@ -3892,6 +4050,17 @@ def collect_file_requests(round1_results: list[dict],
     # single "further requests ignored" summary bound how many sections a
     # member can produce, so denials cannot blow up the payload past the cap.
     delivered_total = 0
+    # THE FIRE BUDGET IS DERIVED FROM THIS BATCH, not from a module constant -- see
+    # retrieval_fire_cap. n counts the members in `round1_results` that actually hold the
+    # capability, so the inspector pass and the voting pass each get their own budget sized to
+    # their own bench, and adding a seat to the roster raises it without an edit.
+    n_retrievers = sum(1 for r in round1_results
+                       if (member_by_name(r.get("role", "")) is not None
+                           and "file_retrieval" in member_by_name(
+                               r.get("role", "")).capabilities))
+    fire_cap = retrieval_fire_cap(n_retrievers)
+    log["fire_cap"] = fire_cap
+    log["retrievers"] = n_retrievers
     WRAPPER = ("## Requested repo files (your round-1 REQUEST_FILE lines)\n\n"
                "Delivered to YOU alone; other members did not receive "
                "these.\n\n")
@@ -3970,7 +4139,7 @@ def collect_file_requests(round1_results: list[dict],
                              "[note body withheld by the brain gate; see STATUS above]")
                     section = f"### {disp} ({note})\n{banner}\n{shown}"
                 gb = len(section.encode("utf-8"))
-                if delivered_total + overhead + gb > RETRIEVAL_PER_FIRE_CAP:
+                if delivered_total + overhead + gb > fire_cap:
                     reason = "per-fire delivery budget exhausted"
                 else:
                     delivered_total += overhead + gb
@@ -3992,6 +4161,7 @@ def collect_file_requests(round1_results: list[dict],
             # No trailing newline: the block is exactly WRAPPER + joined sections,
             # so delivered_total equals its byte length.
             blocks[name] = WRAPPER + "\n\n".join(sections)
+    log["delivered_total"] = delivered_total
     return blocks, log
 
 
@@ -4566,6 +4736,19 @@ GPU_CUDA_BIN = "/usr/local/cuda/bin"  # nvcc et al., already inside the existing
 # interfaces up and `getent hosts` still fails, because the sandbox has no /etc whatsoever.
 NET_ETC_BINDS = ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/ssl")
 EXEC_SCRATCH_MOUNT = "/scratch"      # where a per-turn scratch dir appears inside the sandbox
+EXEC_SPILL_DIRNAME = ".council_exec_logs"   # subdir of scratch holding full spilled output
+# The two spill numbers, with their standing stated because it differs.
+#   EXEC_SPILL_CAP is DERIVED, and from the DEFAULT profile specifically: it is that profile's
+#       own RLIMIT_FSIZE, the ceiling a member's command hits writing a file for itself. An
+#       elevated profile sets fsize_bytes=None, so for THAT path this is not parity with the
+#       command's own limit -- it is stricter, which is the safe direction but not the same
+#       claim, and an earlier version of this comment made the wrong one.
+#   EXEC_SPILL_DISK_RESERVE is CHOSEN, not measured, and is labelled so rather than dressed up.
+#       Free space on the scratch filesystem is what supplies the actual number; this constant
+#       only holds back the last of it, so that the harness is never the process that fills a
+#       disk. 256 MiB is a judgement call and is the one number here the user may want to move.
+EXEC_SPILL_CAP = EXEC_FSIZE_MB * 1024 * 1024
+EXEC_SPILL_DISK_RESERVE = 256 * 1024 * 1024
 
 # ELEVATED BOUNDS ARE INHERITED FROM THE HOST, NOT INVENTED HERE, and that is the user's
 # correction: "why have caps at all and not just use the system limit caps?". An earlier
@@ -4613,9 +4796,11 @@ def system_memory_max() -> str | None:
 class ExecProfile:
     """One sandbox configuration. Frozen, so a profile handed to a callee cannot be widened.
 
-    None ON A LIMIT FIELD MEANS "DO NOT SET IT" -- inherit whatever the host gives the
+    None ON AN RLIMIT FIELD MEANS "DO NOT SET IT" -- inherit whatever the host gives the
     process. That is how an elevated profile expresses "use the system's own caps" rather
-    than a number someone chose.
+    than a number someone chose. IT DOES NOT MEAN THAT ON `spill_cap`, which is not an
+    rlimit and has no host analogue to inherit: None there means the harness imposes no
+    ceiling of its own on the spilled log, leaving free disk space as the only bound.
 
     as_bytes IS NOT A MEMORY LIMIT FOR GPU WORK, and this is the field most likely to be
     "fixed" by someone raising it. RLIMIT_AS bounds VIRTUAL address space, and the NVIDIA
@@ -4635,6 +4820,7 @@ class ExecProfile:
     mem_max: str | None = None
     fsize_bytes: int | None = EXEC_FSIZE_MB * 1024 * 1024
     output_cap: int = EXEC_OUTPUT_CAP
+    spill_cap: int | None = EXEC_SPILL_CAP
     gpu: bool = False
     net: bool = False
 
@@ -4657,18 +4843,24 @@ def default_exec_profile() -> ExecProfile:
                        wall_timeout=EXEC_WALL_TIMEOUT,
                        as_bytes=EXEC_MEM_MB * 1024 * 1024,
                        fsize_bytes=EXEC_FSIZE_MB * 1024 * 1024,
-                       output_cap=EXEC_OUTPUT_CAP)
+                       output_cap=EXEC_OUTPUT_CAP,
+                       # PASSED EXPLICITLY for the reason in this docstring: relying on the
+                       # dataclass default would freeze it at IMPORT time, so a probe setting
+                       # cc.EXEC_SPILL_CAP would be silently ignored -- the exact regression
+                       # that made this a function.
+                       spill_cap=EXEC_SPILL_CAP)
 
 
 def elevated_exec_profile(*, gpu: bool = False, net: bool = False,
                           wall_timeout: int = EXEC_ELEVATED_WALL_TIMEOUT,
                           mem_max: str | None = None,
-                          output_cap: int = EXEC_ELEVATED_OUTPUT_CAP) -> ExecProfile:
-    """Build the leader's elevated profile: three rlimits INHERITED from the host, and three
+                          output_cap: int = EXEC_ELEVATED_OUTPUT_CAP,
+                          spill_cap: int | None = None) -> ExecProfile:
+    """Build the leader's elevated profile: three rlimits INHERITED from the host, and four
     bounds this harness imposes. Each is listed, because "use the system's limits" describes
-    only part of what this function does. (It was FOUR until RLIMIT_NPROC was dropped
-    entirely on 2026-08-02 -- see the constants block for why the bound went rather than
-    being retuned.)
+    only part of what this function does. (The INHERITED side was four until RLIMIT_NPROC was
+    dropped entirely on 2026-08-02 -- see the constants block for why the bound went rather
+    than being retuned. The four below are the imposed side and are a different four.)
 
     INHERITED -- cpu_seconds, as_bytes and fsize_bytes are all None, so RLIMIT_CPU, RLIMIT_AS
     and RLIMIT_FSIZE are never set and the job gets whatever the host gives it. Measured on
@@ -4683,6 +4875,13 @@ def elevated_exec_profile(*, gpu: bool = False, net: bool = False,
       wall_timeout  a property of THIS harness's read loop; the host has no equivalent.
       output_cap    a prompt budget -- bytes quoted into a model's context. Nothing about the
                     host constrains it.
+      spill_cap     the ceiling on the spilled log, and DEFAULTED TO None HERE, unlike the
+                    default profile. None is not "unbounded": run_exec_sandbox still stops at
+                    free space less EXEC_SPILL_DISK_RESERVE. It means this harness adds no
+                    ceiling of its own BELOW the disk's -- deliberately unlike the inherited
+                    rlimits, which at None leave the harness enforcing nothing whatsoever.
+                    An elevated job may legitimately produce a log far larger than a member's
+                    16 MB, and the disk is the only honest bound on it. Pass an int for less.
 
     `mem_max` defaults to system_memory_max() -- the machine's MemTotal. Pass a smaller value
     to bound the job below the host's ceiling. If /proc/meminfo cannot be read the default is
@@ -4701,6 +4900,7 @@ def elevated_exec_profile(*, gpu: bool = False, net: bool = False,
         mem_max=mem_max if mem_max is not None else system_memory_max(),
         fsize_bytes=None,
         output_cap=output_cap,
+        spill_cap=spill_cap,
         gpu=gpu, net=net)
 
 
@@ -4841,6 +5041,32 @@ def exec_profile_preflight(profile: ExecProfile) -> tuple[bool, str]:
     return True, ""
 
 
+def spill_take(chunk_len: int, spilled: int, ceiling: int) -> tuple[int, bool]:
+    """How many bytes of the next chunk may be spilled, and whether that hits the ceiling.
+
+    A FUNCTION RATHER THAN THREE INLINE LINES, for a reason worth stating: the vault's
+    checkable notes execute INSIDE the exec sandbox, and on THIS host a nested bwrap fails --
+    measured 2026-08-03, a check calling run_exec_sandbox got "No permissions to create a new
+    namespace, likely because the kernel does not allow non-privileged user namespaces" from
+    the inner bwrap. That is a statement about this host's kernel configuration as seen from
+    inside the sandbox, not a universal law about bubblewrap; a host permitting nested
+    unprivileged userns would presumably behave differently, and none has been tried. What
+    follows for the vault HERE is that a checkable note cannot exercise run_exec_sandbox, so
+    the arithmetic deciding where the spill stops is separated out and pinned instead. The
+    kill, the tmpfs mask and the end-to-end path are covered by
+    `_nogit/probe_spill_to_scratch.py`, which must run on a host with working bwrap.
+
+    Returns (n, capped). `capped` means THIS CHUNK COULD NOT BE WRITTEN IN FULL, which is the
+    caller's signal to stop reading and kill the command. A chunk that fills the ceiling
+    EXACTLY returns False: nothing was lost, so nothing yet justifies killing the job. The
+    following chunk then returns (0, True), and a zero-byte take is still a cap, not a no-op.
+    """
+    room = ceiling - spilled
+    if chunk_len <= room:
+        return chunk_len, False
+    return max(0, room), True
+
+
 def run_exec_sandbox(command: str, workdir: Path, *,
                      profile: ExecProfile | None = None,
                      scratch: Path | None = None) -> tuple[str | None, str, dict | None]:
@@ -4881,12 +5107,35 @@ def run_exec_sandbox(command: str, workdir: Path, *,
     else entirely gets exactly the writes it asked for. The containment claim belongs only to
     /work, which is a temp copy removed in a `finally`.
 
+    GIVING `scratch` ALSO TURNS ON SPILL-TO-SCRATCH, and that is the only way to turn it on.
+    Bytes read are written to a fresh file under scratch/EXEC_SPILL_DIRNAME, so far more
+    survives than the head+tail delivered inline. NOT "the full output", and the difference is
+    not pedantry -- three things stop the file short, all of them reported: the spill ceiling
+    (which truncates the crossing chunk and kills the command), a spill write failure, and a
+    wall-timeout, after which whatever is still in the pipe is never read by anyone. Trust
+    info["spilled"] for what the file holds; it is the count of bytes actually written to it.
+    WITHOUT `scratch` there is
+    no spill and nothing about this function changes -- which is the MEMBER path, since
+    collect_exec_requests passes no scratch. Three properties are worth stating exactly:
+      - THE LOG IS NOT REACHABLE BY THE COMMAND. A --tmpfs is stacked over the same subpath
+        inside the sandbox, so the command cannot read or rewrite the record of its own output.
+        Measured; see the comment at the bind site.
+      - THE SPILL IS BOUNDED, and reaching the bound KILLS THE COMMAND. That is the one case
+        where verbosity is fatal, and it is deliberate: the output-cap truncation above costs
+        only context, whereas an unbounded spill costs the disk. The ceiling is the tighter of
+        profile.spill_cap (None = no harness bound) and free space less EXEC_SPILL_DISK_RESERVE.
+      - A SPILL THAT FAILS DOES NOT FAIL THE RUN. The delivered text and the exit status are
+        unaffected; the failure is named in `note` and in info["spill_error"].
+
     Returns (combined stdout+stderr, note, info), or (None, reason, None) when the sandbox
     refused to run at all.
 
     `info` is the STRUCTURAL form of what `note` says in prose:
         {"exit_status": int, "timed_out": bool, "truncated": bool, "bytes_read": int,
-         "discarded": int, "profile": str}
+         "discarded": int, "profile": str, "spill_path": str, "spilled": int,
+         "spill_capped": bool, "spill_ceiling": int, "spill_error": str}
+    `spill_path` is "" when nothing was spilled -- including when the command printed nothing
+    at all, in which case the empty file is removed rather than reported.
     A caller that must COMPARE the exit status reads info["exit_status"] -- it exists
     so that nobody has to parse it back out of `note`, which the brain validator used
     to do and flagged as brittle in its own source.
@@ -4940,8 +5189,45 @@ def run_exec_sandbox(command: str, workdir: Path, *,
                 env_vars["PATH"] += ":" + ":".join(gpath)
         if profile.net:
             extra += net_sandbox_args()
+        spill_fh = None
+        spill_path: Path | None = None
+        spill_err = ""
+        spill_ceiling = 0
         if scratch is not None:
             extra += ["--bind", str(scratch), EXEC_SCRATCH_MOUNT]
+            # THE SPILL LOG IS MASKED OUT OF THE SANDBOX, not merely tucked away in it. The
+            # bind above is READ-WRITE, so a directory under it is writable BY THE COMMAND --
+            # a command could truncate or rewrite the record of what it printed. A --tmpfs
+            # over the same subpath, applied after the bind, replaces it with an empty
+            # in-sandbox filesystem: the command sees an empty directory, its writes land on
+            # the tmpfs and die with the sandbox, and the host file is untouched.
+            # MEASURED, not assumed (2026-08-03, this host, bubblewrap 0.11.1): inside, `ls -a`
+            # on the masked dir showed only . and ..; `cat` of the host file gave "No such
+            # file or directory"; a redirect into that path succeeded (rc=0) and afterwards
+            # the host file still read SECRET. The directory NAME is still visible in
+            # /scratch -- masking hides contents, not the entry.
+            try:
+                spill_dir = scratch / EXEC_SPILL_DIRNAME
+                spill_dir.mkdir(exist_ok=True)
+                fd_s, name_s = tempfile.mkstemp(dir=str(spill_dir), prefix="exec-",
+                                                suffix=".log")
+                spill_fh = os.fdopen(fd_s, "wb")
+                spill_path = Path(name_s)
+                extra += ["--tmpfs", f"{EXEC_SCRATCH_MOUNT}/{EXEC_SPILL_DIRNAME}"]
+                # THE CEILING IS THE TIGHTER OF TWO, and free space is read HERE rather than
+                # taken on faith, so the number in the note is this filesystem's, now.
+                free = shutil.disk_usage(str(spill_dir)).free
+                by_disk = max(0, free - EXEC_SPILL_DISK_RESERVE)
+                spill_ceiling = (by_disk if profile.spill_cap is None
+                                 else min(profile.spill_cap, by_disk))
+            except OSError as e:
+                # A spill that cannot be opened must not take the RUN down with it: the
+                # command's output still reaches the member either way. It is reported, never
+                # swallowed, because a silently absent log is worse than a named failure.
+                if spill_fh is not None:
+                    spill_fh.close()
+                spill_fh, spill_path = None, None
+                spill_err = f"{e.__class__.__name__}: {e}"
         argv = [BWRAP_PATH,
                 "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin",
                 "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
@@ -4993,6 +5279,8 @@ def run_exec_sandbox(command: str, workdir: Path, *,
         head = bytearray()
         tail = bytearray()
         total = 0
+        spilled = 0
+        spill_capped = False
         deadline = time.monotonic() + profile.wall_timeout
         timedout = False
         fd = p.stdout.fileno()
@@ -5016,6 +5304,31 @@ def run_exec_sandbox(command: str, workdir: Path, *,
                 if not chunk:
                     break   # EOF: the process finished writing
                 total += len(chunk)
+                if spill_fh is not None:
+                    # SPILL FIRST, because the head/tail slicing below CONSUMES `chunk` -- it
+                    # reassigns it to the unconsumed remainder. Writing after that would spill
+                    # a hole exactly the size of the head budget.
+                    n, spill_capped = spill_take(len(chunk), spilled, spill_ceiling)
+                    take = chunk[:n]
+                    try:
+                        if take:
+                            spill_fh.write(take)
+                            spilled += len(take)
+                    except OSError as e:
+                        spill_err = f"{e.__class__.__name__}: {e}"
+                        try:
+                            spill_fh.close()
+                        except OSError:
+                            pass
+                        spill_fh, spill_capped = None, False
+                    if spill_capped:
+                        # THE USER'S RULING, 2026-08-03: bound the spill file too -- stop at the
+                        # ceiling, KILL THE COMMAND, and say so. This is the one place the
+                        # harness kills a job for its VERBOSITY, which the output-cap fix above
+                        # deliberately stopped doing; the difference is that inline truncation
+                        # costs only context, while an unbounded spill costs the disk. Breaking
+                        # falls into the `finally`, which SIGKILLs the process group.
+                        break
                 room = head_budget - len(head)
                 if room > 0:
                     head.extend(chunk[:room])
@@ -5034,6 +5347,19 @@ def run_exec_sandbox(command: str, workdir: Path, *,
             except subprocess.TimeoutExpired:
                 pass
             p.stdout.close()
+            if spill_fh is not None:
+                try:
+                    spill_fh.close()
+                except OSError as e:
+                    spill_err = spill_err or f"{e.__class__.__name__}: {e}"
+            # A run that printed NOTHING leaves no log behind. Otherwise every scratch-using
+            # exec would litter the directory with empty files and the note would point at one.
+            if spill_path is not None and spilled == 0 and not spill_err:
+                try:
+                    spill_path.unlink()
+                except OSError:
+                    pass
+                spill_path = None
         discarded = total - len(head) - len(tail)
         capped = discarded > 0
         raw = (bytes(head)
@@ -5045,6 +5371,15 @@ def run_exec_sandbox(command: str, workdir: Path, *,
                 + (" (WALL-TIMEOUT, group killed)" if timedout else "")
                 + (f", output truncated ({discarded} bytes dropped from the MIDDLE; head and "
                    "tail kept, and the command was NOT killed for it)" if capped else "")
+                + (f"; output spilled to {spill_path} ({spilled} bytes)"
+                   if spill_path is not None else "")
+                # The partial log is still on disk and still worth reading, so this clause
+                # QUALIFIES the path above rather than replacing it.
+                + ("; SPILL CEILING REACHED -- the command WAS KILLED for it, so both that "
+                   "file and the text above stop mid-output and the exit status is the kill, "
+                   "not the command's own" if spill_capped else "")
+                + (f"; spill-to-scratch FAILED ({spill_err}), so only the text above survives"
+                   if spill_err else "")
                 + f"; sandbox copy {copylog['copied']} files/{copylog['skipped']} skipped"
                 # Compared BY VALUE, not by name: a profile merely NAMED "default" that
                 # carries gpu=True is not the default, and tagging it as one would hide an
@@ -5054,7 +5389,13 @@ def run_exec_sandbox(command: str, workdir: Path, *,
         # form a caller can compare.
         info = {"exit_status": p.returncode, "timed_out": timedout,
                 "truncated": capped, "bytes_read": total,
-                "discarded": discarded, "profile": profile.name}
+                "discarded": discarded, "profile": profile.name,
+                # READ `spill_capped` BEFORE `exit_status`, for the same reason `timed_out`
+                # comes first: the ceiling kills the process group, so exit_status is -9 and
+                # is not the command's own verdict.
+                "spill_path": str(spill_path) if spill_path is not None else "",
+                "spilled": spilled, "spill_capped": spill_capped,
+                "spill_ceiling": spill_ceiling, "spill_error": spill_err}
         return text, note, info
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -5171,6 +5512,9 @@ def capability_block(member: Member, *, fallback_route: bool = False) -> str:
             f"FILE RETRIEVAL: in your review you may emit up to"
             f" {RETRIEVAL_MAX_REQUESTS_PER_MEMBER} lines, each alone on its line, of the form",
             "", "REQUEST_FILE: relative/path/from/project/root", "",
+            "An ABSOLUTE path is accepted too, provided it lies inside the project root -- so "
+            "a path copied verbatim out of the evidence header works, and you do not have to "
+            "guess where the root starts. Paths outside the root are still denied.", "",
             "You may append an INCLUSIVE range to reach a part of a file that does not sit "
             "in its first bytes -- both ends included, HTTP Range style:", "",
             "REQUEST_FILE: path#L120-240   lines 120 to 240 (1-based)",
@@ -6231,6 +6575,13 @@ async def main() -> int:
                                 "Code harness leads via hooks (the default)")})
         json.dump({"source": ROSTER_SOURCE, "errors": ROSTER_ERRORS,
                    "warnings": ROSTER_WARNINGS,
+                   # THE ACTIVE cap, not roster.json's raw value: on a rejected roster these
+                   # differ, and the GUI must show what the engine is really using. Its bounds
+                   # travel with it so the UI does not hardcode a second copy of them.
+                   "retrieval_per_file_cap": RETRIEVAL_PER_FILE_CAP,
+                   "retrieval_per_file_cap_default": RETRIEVAL_PER_FILE_CAP_DEFAULT,
+                   "retrieval_per_file_cap_min": RETRIEVAL_PER_FILE_CAP_MIN,
+                   "retrieval_per_file_cap_max": RETRIEVAL_PER_FILE_CAP_MAX,
                    "leader": leader_out,
                    "members": [{"name": m.name, "tier": m.tier,
                                 "transport": m.transport, "model": m.model,

@@ -539,7 +539,10 @@ class ActionResult:
 # no more privileged than a member on the non-mutating channels (writes are bounded
 # separately by LEADER_MAX_WRITES_PER_TURN + LEADER_WRITE_MAX_BYTES). (count_cap, byte_cap).
 _TOOL_CAPS = {
-    "read": (cc.RETRIEVAL_MAX_REQUESTS_PER_MEMBER, cc.RETRIEVAL_PER_FIRE_CAP),
+    # A BENCH OF ONE. The fire cap is now derived from how many retrievers share it
+    # (cc.retrieval_fire_cap), and the leader shares it with nobody -- so it gets exactly one
+    # member's worth, which is what "no more privileged than a member" has always meant here.
+    "read": (cc.RETRIEVAL_MAX_REQUESTS_PER_MEMBER, cc.retrieval_fire_cap(1)),
     "fetch": (cc.WEB_MAX_REQUESTS_PER_MEMBER, cc.WEB_PER_FIRE_CAP),
     "exec": (cc.EXEC_MAX_REQUESTS_PER_MEMBER, cc.EXEC_PER_FIRE_CAP),
 }
