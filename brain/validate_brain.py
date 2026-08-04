@@ -165,11 +165,39 @@ def parse_note(path):
             continue
         key, _, val = line.partition(":")
         key, val = key.strip(), val.strip()
+        # A PLAIN SCALAR MAY NOT CONTAIN ": ", and this parser is lenient enough to miss it.
+        # YAML reads colon-space as a nested mapping, so ONE such character pair invalidates
+        # the WHOLE frontmatter block for every real YAML reader -- including Obsidian, which
+        # then shows the note with no tags and no metadata at all and drops it out of the
+        # graph. Measured 2026-08-04: ten notes in this vault had it, every one on the
+        # `falsifier:` line, and every one looked fine to this parser.
+        # THIS CHECK EXISTS BECAUSE THE LENIENCY IS THE HAZARD. A vault that only ever passes
+        # through this parser drifts out of YAML compatibility silently; the notes stay
+        # readable to the validator and become invisible to the humans the vault is for.
+        if key not in LIST_FIELDS and ": " in val and not val.startswith(('"', "'", "[")):
+            errors.append(
+                f"line {lineno}: {key!r} is a plain scalar containing ': ', which YAML reads "
+                f"as a nested mapping -- the whole frontmatter block fails to parse in "
+                f"Obsidian and any YAML reader. Rephrase (' -- ' works) or quote the value")
         if key in LIST_FIELDS:
             val = val.strip("[]")
             fields[key] = [v.strip().strip("'\"") for v in val.split(",") if v.strip()]
         else:
             fields[key] = val.strip("'\"")
+    # BELT AND BRACES when PyYAML is present: the rule above catches the failure this vault
+    # actually hit, but it is a targeted heuristic, not a YAML implementation. If the real
+    # parser is importable, let IT have the last word -- and stay silent when it is not,
+    # rather than making the dependency mandatory for a tool whose flat schema does not need
+    # one. NOTE the disagreement direction that matters: this can only ADD errors.
+    try:
+        import yaml
+    except ImportError:
+        pass
+    else:
+        try:
+            yaml.safe_load(head)
+        except yaml.YAMLError as e:
+            errors.append(f"frontmatter is not valid YAML ({str(e).splitlines()[0]})")
     return fields, body, errors
 
 
