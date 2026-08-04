@@ -1942,7 +1942,7 @@ async def _run_subprocess(cmd: list[str], cwd: Path, role: str,
         )
     except FileNotFoundError as e:
         return {
-            "role": role, "text": "", "stderr": f"exec failed: {e}",
+            "role": role, "text": "", "stderr": f"exec failed: {e}", "stdout": "",
             "returncode": -1, "verdict": "ERROR",
             "duration_s": round(time.monotonic() - t0, 2),
         }
@@ -1956,7 +1956,7 @@ async def _run_subprocess(cmd: list[str], cwd: Path, role: str,
         await proc.wait()
         return {
             "role": role, "text": "",
-            "stderr": f"TIMEOUT after {PER_CRITIC_TIMEOUT_S}s",
+            "stderr": f"TIMEOUT after {PER_CRITIC_TIMEOUT_S}s", "stdout": "",
             "returncode": -1, "verdict": "ERROR",
             "duration_s": round(time.monotonic() - t0, 2),
         }
@@ -1979,12 +1979,17 @@ async def _run_subprocess(cmd: list[str], cwd: Path, role: str,
     verdict = parse_verdict(text) if proc.returncode == 0 else "ERROR"
     return {
         "role": role, "text": text, "stderr": stderr,
+        # RAW STDOUT, kept even when post_read supplied `text`. It used to be decoded ONLY in
+        # the else-branch above, so the codex path (which always passes post_read) discarded
+        # it entirely -- and with --json that stream is the ONLY place the agent's
+        # non-final messages exist. See codex_agent_messages.
+        "stdout": stdout_b.decode("utf-8", errors="replace"),
         "returncode": proc.returncode, "verdict": verdict,
         "duration_s": duration,
     }
 
 
-def codex_cmd(out_path: Path) -> list[str]:
+def codex_cmd(out_path: Path, json_events: bool = False) -> list[str]:
     # The prompt is delivered on stdin (the trailing "-" tells codex to
     # read instructions from stdin, per `codex exec --help`), not as an
     # argv string. A single argv string is capped at MAX_ARG_STRLEN
@@ -1992,7 +1997,7 @@ def codex_cmd(out_path: Path) -> list[str]:
     # evidence caps were raised the prompt exceeded that as one argv
     # element and raised "Argument list too long" (Errno 7) this
     # session. stdin has no per-argument size cap.
-    return [
+    cmd = [
         "codex", "exec",
         "--ephemeral",
         "--skip-git-repo-check",
@@ -2003,6 +2008,18 @@ def codex_cmd(out_path: Path) -> list[str]:
         "-c", f'model_reasoning_effort="{effort_for("codex")}"',
         "-",
     ]
+    if json_events:
+        # JSONL EVENTS ON STDOUT, for the LEADER ONLY. Without it stdout holds just the final
+        # message and the agent's EARLIER messages exist nowhere the harness can read -- which
+        # is exactly how a correctly-emitted actions envelope was lost (see
+        # codex_agent_messages). It also empties stderr of the prompt echo (MEASURED: 0 lines
+        # with --json, 653 bytes without).
+        # NOT ON BY DEFAULT, because codex_cmd is SHARED with the MEMBER path (run_codex): a
+        # member answers in one message and gains nothing here, while it would LOSE the stderr
+        # diagnostics that the stale-models-cache failure documented above was found through.
+        # Insert before the trailing "-" so the stdin sentinel stays last.
+        cmd.insert(-1, "--json")
+    return cmd
 
 
 # --- codex auth serialisation ---------------------------------------------
@@ -2190,6 +2207,88 @@ CLAUDE_OPENROUTER_FALLBACK = "anthropic/claude-opus-5"
 # is included because the warning above names "ANTHROPIC_API_KEY **or another auth
 # source**", so scrubbing only the first would leave a second override in place.
 CLAUDE_DROP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+# THE LEADER TOOL TRACE. A leader subprocess reports its OWN tool activity on stderr, and
+# that is the only place it appears: MEASURED 2026-08-04 on the exact production codex argv
+# with the streams separated, a write refused by the read-only sandbox printed
+#   ERROR codex_core::tools::router: error=patch rejected: writing is blocked by
+#   read-only sandbox; rejected by user approval settings
+# to STDERR, while STDOUT held only the 119-byte final message (which --output-last-message
+# already delivers). An earlier capture used 2>&1 and so could not tell the two apart, which
+# is why this was recorded for a year as a "capture stdout" problem.
+# WHY TAIL-WEIGHTED. codex echoes the ENTIRE prompt to stderr before it runs, so the head is
+# the prompt and the tool activity is at the END. A symmetric head+tail slice sized for
+# diagnosing launch failures would cut exactly the lines this exists to keep.
+LEADER_TRACE_HEAD_BYTES = 4_000
+LEADER_TRACE_TAIL_BYTES = 60_000
+
+
+def codex_agent_messages(stdout: str) -> list:
+    """Every agent message from a `codex exec --json` run, in order.
+
+    WHY THIS EXISTS, and it is a HARNESS DEFECT it repairs rather than a feature. codex may
+    answer in MORE THAN ONE message. `--output-last-message` writes only the LAST one, and
+    that file was the harness's sole view of the leader's reply -- so a turn whose FIRST
+    message carried a correct actions envelope and whose SECOND summarised it looked, to the
+    harness, exactly like a leader that never acted. MEASURED 2026-08-04 on two independent
+    reproductions: message 1 held a well-formed `WRITE: hello.py` envelope, message 2 held
+    "Created `hello.py` with the requested contents.", and only message 2 reached the parser.
+    The zero-write re-prompt then fired and the event was recorded as a false completion
+    claim by the MODEL. It was not: the model acted and the harness dropped the action.
+
+    THE STREAM IS PARSED, NOT THE TRANSCRIPT, and that distinction is a safety boundary.
+    codex echoes the entire prompt when not in --json mode, and the prompt contains the
+    ACTIONS TEMPLATE rendered with the LIVE nonce -- feeding that to parse_leader_actions
+    yields four executable actions (verified: a READ, a FETCH, an `EXEC: a shell command`
+    and a WRITE), i.e. the harness executing its own example. Reading typed JSONL events
+    means only text the MODEL produced is ever returned from here.
+
+    Unparseable lines and non-agent_message events are skipped rather than raising: a future
+    codex event type must not be able to fail a leader turn.
+    """
+    out = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            d = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(d, dict) or d.get("type") != "item.completed":
+            continue
+        item = d.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            t = item.get("text")
+            if isinstance(t, str) and t:
+                out.append(t)
+    return out
+
+
+def leader_trace_slice(stderr: str) -> str:
+    """A bounded, TAIL-WEIGHTED slice of a leader subprocess's stderr.
+
+    Returns the text unchanged when it already fits. Otherwise keeps the head (which carries
+    the banner and any startup error) and a much larger tail (which carries tool activity),
+    with an explicit marker naming how much was dropped -- never a silent truncation.
+    """
+    b = stderr.encode("utf-8", "replace")
+    cap = LEADER_TRACE_HEAD_BYTES + LEADER_TRACE_TAIL_BYTES
+    if len(b) <= cap:
+        return stderr
+    # THE MARKER IS CHARGED AGAINST THE BUDGET, not added on top of it. Slicing the body to
+    # the cap and THEN prepending a header overruns by the header's length -- measured here
+    # at 64042 bytes against a 64000 cap before this was fixed.
+    # RESERVE 8 MORE for UTF-8 severance: slicing raw bytes can cut a multi-byte character,
+    # and its replacement can re-encode LARGER than the bytes it replaced (up to +2 under
+    # maximal-subpart, up to +6 for a byte-by-byte decoder). 8 covers both.
+    marker = f"\n... [{len(b) - cap} bytes of stderr omitted] ...\n"
+    budget = cap - len(marker.encode("utf-8")) - 8
+    head_n = min(LEADER_TRACE_HEAD_BYTES, budget // 5)
+    tail_n = budget - head_n
+    head = b[:head_n].decode("utf-8", "replace")
+    tail = b[-tail_n:].decode("utf-8", "replace")
+    return f"{head}{marker}{tail}"
 
 
 # THE TOOL BOUNDARY, AND IT IS NOT OPTIONAL. Left alone, the claude CLI runs a FULL agent
@@ -5845,8 +5944,14 @@ async def _call_leader(leader: "Member", prompt: str, cwd: Path) -> dict:
     critic. The caller (the driver's turn loop) must pass a FULLY-ASSEMBLED prompt;
     this function adds no framing of its own.
 
-    Returns {"ok", "text", "error", "transport", "model_used"} -- and deliberately NO
-    "verdict" key, so no caller can mistake the leader for a voter. ok is False on any
+    Returns {"ok", "text", "error", "transport", "model_used", "trace"} -- and deliberately
+    NO "verdict" key, so no caller can mistake the leader for a voter. `trace` is a bounded,
+    TAIL-WEIGHTED slice of the subprocess's stderr, kept on SUCCESS as well as failure
+    (`error` is populated only on failure, so a turn that SUCCEEDED -- ok=True, non-empty
+    text -- used to leave no record of what happened inside the subprocess; reading that
+    record is what showed a dropped envelope rather than a lying model). It
+    carries the prompt echo and MUST NOT be persisted except on a detected discrepancy; see
+    the comment at the return statement. ok is False on any
     transport failure (non-zero rc), on a blank response (a blank leader turn is not a
     success and would otherwise read as an empty "final answer"), and on an unknown
     transport, so the driver fails closed rather than looping on nothing.
@@ -5885,7 +5990,7 @@ async def _call_leader(leader: "Member", prompt: str, cwd: Path) -> dict:
         # acquired/released in a worker thread so the flock never stalls the loop.
         fh = await asyncio.to_thread(_codex_lock_acquire)
         try:
-            res = await _run_subprocess(codex_cmd(out_path), cwd,
+            res = await _run_subprocess(codex_cmd(out_path, json_events=True), cwd,
                                         role=leader.name, post_read=out_path,
                                         stdin_data=prompt)
         finally:
@@ -5903,6 +6008,15 @@ async def _call_leader(leader: "Member", prompt: str, cwd: Path) -> dict:
                 "error": f"unknown leader transport {t!r}", "model_used": ""}
     text = res.get("text") or ""
     rc = res.get("returncode")
+    # codex emits typed JSONL events; every other transport returns one message.
+    msgs = codex_agent_messages(res.get("stdout") or "") if t == "codex_subprocess" else []
+    if not text and msgs:
+        # --output-last-message was not written (it only appears when the agent produces a
+        # final message). The last agent message IS that answer, so recover it rather than
+        # reporting an empty turn.
+        text = msgs[-1]
+    if not msgs and text:
+        msgs = [text]
     # SUCCESS IS A NON-EMPTY RESPONSE, not a zero exit status.
     # WHAT WAS OBSERVED 2026-08-01, stated without the cause I cannot evidence: a codex
     # leader turn reported "leader call failed" even though codex had produced a complete,
@@ -5943,6 +6057,33 @@ async def _call_leader(leader: "Member", prompt: str, cwd: Path) -> dict:
                                 or f"leader call failed (rc={rc}, no output)"),
         "transport": t,
         "model_used": model_used,
+        # THE TRACE IS KEPT REGARDLESS OF `ok`, and that is the entire point of it existing.
+        # `error` above is populated ONLY on failure, so a leader call that SUCCEEDS -- which
+        # these runs did: non-empty text, ok=True -- discarded every trace of what happened
+        # inside the subprocess. Reading one settled the question this was built for, and the
+        # answer was NEITHER hypothesis on offer ("tools attempted and failed" vs
+        # "confabulated with no attempt"): the envelope had been emitted and then dropped.
+        # A TRACE KEPT ONLY ON FAILURE WOULD NEVER HAVE FOUND IT -- these runs did not fail.
+        # IT IS NOT PERSISTED HERE, and that is a CALLER CONTRACT this function cannot
+        # enforce. WHAT IT CONTAINS CHANGED WITH --json, and the earlier note here is no
+        # longer true of codex: MEASURED, codex's stderr went from 653 bytes carrying the
+        # whole prompt echo to ZERO LINES once events moved to stdout. THE CAUTION STILL
+        # STANDS for any OTHER subprocess transport (claude_subprocess is not measured here),
+        # and the gate stays as defence in depth rather than being relaxed on one
+        # transport's behaviour. Bounded to LEADER_TRACE_HEAD+TAIL_BYTES either way.
+        # AUDITED 2026-08-04, the only two production consumers read individual keys and never
+        # the dict: run_leader_turn (ok/error/text, plus trace and messages -- it RETAINS only
+        # `trace`, on the TurnRecord; `messages` is consumed for parsing and not stored) and
+        # author_handoff's panel (ok/text/error).
+        # A future caller that dumps the dict breaks the "persist only on discrepancy" ruling
+        # without this function being able to tell.
+        "trace": leader_trace_slice(res.get("stderr") or ""),
+        # EVERY agent message, in order -- not just the last. The caller parses its action
+        # envelope from ALL of them, because codex can put the envelope in an earlier message
+        # and the summary in the last; `text` above (the --output-last-message file) is still
+        # the FINAL ANSWER and is what a turn ends on. Transports that answer in a single
+        # message report that one message here, so the caller needs no per-transport branch.
+        "messages": tuple(msgs),
     }
 
 

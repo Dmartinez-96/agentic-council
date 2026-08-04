@@ -693,6 +693,34 @@ def run_leader_actions(actions, workdir: Path, leader: "cc.Member", *,
     return results
 
 
+def turn_has_discrepancy(record: "TurnRecord") -> tuple:
+    """Reasons this turn's record does not reconcile, or () when it does.
+
+    THE GATE FOR PERSISTING A TRACE. `TurnRecord.traces` holds each round's leader stderr,
+    which carries the prompt echo (ground rules, task, every tool result read), so it is kept
+    in memory and written to disk only when this returns non-empty -- the user's ruling,
+    2026-08-04, chosen over always-persisting a filtered slice because a keyword filter is a
+    substring hypothesis that would miss a failure phrased differently.
+
+    A CLAIM STATE ALONE IS NOT A DISCREPANCY. Only CONTRADICTED and ALTERED are counted:
+    UNSUBSTANTIATED is the weak state (equally true of a file merely read) and VERIFIED is the
+    good one, so counting either would make the gate fire on ordinary turns and put prompt
+    echoes on disk for nothing.
+    """
+    why = []
+    if record.writes.get("unapplied"):
+        why.append(f"{len(record.writes['unapplied'])} requested write(s) did not apply")
+    if record.writes.get("altered"):
+        why.append(f"{len(record.writes['altered'])} applied write(s) no longer match on disk")
+    bad = [c for c in record.claims
+           if c["status"] in (CLAIM_CONTRADICTED, CLAIM_ALTERED)]
+    if bad:
+        why.append("claim(s) " + ", ".join(f"{c['claim']}={c['status']}" for c in bad))
+    if record.reprompted:
+        why.append("the zero-write re-prompt fired")
+    return tuple(why)
+
+
 def _claims_sentinels(nonce: str) -> tuple[str, str]:
     return (f"--- BEGIN CLAIMS {nonce} ---", f"--- END CLAIMS {nonce} ---")
 
@@ -927,6 +955,7 @@ class TurnRecord:
     reprompted: bool = False
     writes: dict = field(default_factory=dict)
     claims: tuple = ()
+    traces: tuple = ()
 
 
 def _action_grammar_instructions(nonce: str) -> str:
@@ -1136,6 +1165,9 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
     reprompted = False      # the zero-write notice has already fired; it never fires twice
     notice = ""             # queued for the NEXT round's prompt, then cleared
     claims: tuple = ()      # verified CLAIMS from the final answer; () when none was emitted
+    traces: list = []       # per-round bounded stderr from the leader subprocess. HELD IN
+    #                         MEMORY ONLY -- it carries the prompt echo, so a caller persists
+    #                         it only when turn_has_discrepancy() says something is wrong.
     for i in range(max_rounds):
         nonce = nonce_fn()
         event("leader_round", round=i)
@@ -1147,12 +1179,28 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
             stop_reason = f"leader call failed: {resp.get('error') or 'unknown'}"
             break
         text = resp.get("text") or ""
+        # KEPT ON SUCCESS TOO. `error` is populated only when ok is False, so a turn that
+        # succeeded while appearing to do nothing left no record of what happened inside the
+        # subprocess. Reading that record is what revealed the cause was not the model at all
+        # (see the envelope-parsing comment below) -- which is why a trace kept ONLY on
+        # failure would never have found it: these runs did not fail.
+        traces.append({"round": i, "trace": resp.get("trace") or ""})
         # The model's own words for this round, emitted the moment the call returns rather
         # than being held until the turn ends. Not token streaming. What a CONSUMER does with
         # it is the consumer's business -- this layer only makes the text available while the
         # turn is still running, which is the part that was impossible before.
         event("leader_text", round=i, text=text)
-        parse = parse_leader_actions(text, nonce)
+        # PARSE THE ENVELOPE FROM EVERY MESSAGE THIS ROUND, not only the last. A leader may
+        # answer in several messages -- codex demonstrably does -- putting the actions
+        # envelope in one and a summary in the next. Reading only the last made a leader that
+        # acted correctly indistinguishable from one that never acted, and that is what the
+        # "false completion claim" in the record actually was.
+        # SAFE BECAUSE THE SOURCE IS THE MODEL'S OWN MESSAGES, never the raw subprocess
+        # stream: the prompt echo contains the ACTIONS TEMPLATE rendered with this round's
+        # LIVE nonce, so parsing the stream would execute the harness's own example.
+        # `text` remains the FINAL answer -- the turn still ends on the last message.
+        msgs = list(resp.get("messages") or ([text] if text else []))
+        parse = parse_leader_actions("\n".join(msgs), nonce)
         if not parse.actions and not parse.problems:
             # THE ZERO-WRITE RE-PROMPT. A response with no envelope ends the turn, so a leader
             # that decides in prose that it cannot write looks EXACTLY like one that finished.
@@ -1216,7 +1264,7 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
         all_results.extend(results)
     return TurnRecord(leader.name, tuple(rounds), final_text, stop_reason,
                       tuple(all_results), str(scratch) if scratch else "", reprompted,
-                      reconcile_writes(all_results), claims)
+                      reconcile_writes(all_results), claims, tuple(traces))
 
 
 _HANDOFF_PANEL_INSTRUCTIONS = (
