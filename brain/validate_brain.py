@@ -65,6 +65,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -400,6 +401,71 @@ def run_check(f, root, engine, allow_commands):
 # integrity across the vault
 # --------------------------------------------------------------------------
 
+WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)")
+
+
+def graph(notes):
+    """Wikilink/tag reachability across the vault. Returns (fatal, advisory, stats).
+
+    WHY THIS IS A CHECK AND NOT A STYLE OPINION. The vault's whole purpose is that an agent
+    or a human can arrive at one fact and FOLLOW something to the next -- a link, or a tag.
+    A note reachable by neither is still true and still passes its own check, while being
+    invisible to the only workflow it exists to serve. Measured 2026-08-04, before this
+    function existed: three notes were reachable from nowhere and unreachable to anywhere,
+    six had no outbound link at all, and fourteen had nothing pointing at them. Every one of
+    them reported PASS. Nothing in this tool was positioned to notice; a human looking at the
+    Obsidian graph was.
+
+    SEVERITY IS SPLIT ON PURPOSE, because these are not the same kind of wrong:
+      FATAL     a dangling wikilink. It names a note that does not exist, so it is simply
+                broken -- a reader following it lands nowhere, and no judgement is involved.
+      ADVISORY  orphans, no-inbound, no-outbound, single-use tags. Each is a smell rather
+                than a defect: a brand-new note legitimately has nothing pointing at it yet,
+                and a genuinely one-off tag is not an error. `--strict-graph` promotes these
+                to fatal for anyone who wants the stricter contract.
+
+    ONLY [[wikilinks]] COUNT AS EDGES. `supersedes`/`superseded_by` are semantic relations
+    and are already integrity-checked above, but Obsidian does not draw them, so they do not
+    rescue a note from being an orphan in the view a human actually reads.
+    """
+    ids = {n["fields"].get("id") for n in notes if n["fields"].get("id")}
+    ids |= {n["path"].stem for n in notes}
+    out, inb, dangling, tags = {}, {i: 0 for i in ids}, [], {}
+    for n in notes:
+        me = n["fields"].get("id") or n["path"].stem
+        targets = {t.strip() for t in WIKILINK_RE.findall(n["body"])}
+        # A note linking to ITSELF is not reachability; exclude it before anything counts.
+        real = {t for t in targets if t in ids and t != me}
+        out[me] = real
+        for t in sorted(targets - ids):
+            dangling.append(f"{me}: [[{t}]] names no note in this vault")
+        for t in real:
+            inb[t] = inb.get(t, 0) + 1
+        for tag in n["fields"].get("tags") or []:
+            tags[tag] = tags.get(tag, 0) + 1
+    no_out = sorted(m for m, t in out.items() if not t)
+    no_in = sorted(m for m in out if not inb.get(m))
+    orphans = sorted(set(no_out) & set(no_in))
+    singles = sorted(t for t, c in tags.items() if c == 1)
+    advisory = []
+    if orphans:
+        advisory.append(f"{len(orphans)} orphan note(s) -- no inbound AND no outbound link, "
+                        f"so unreachable by following anything: {', '.join(orphans)}")
+    if no_out:
+        advisory.append(f"{len(no_out)} note(s) with no outbound link: {', '.join(no_out)}")
+    if no_in:
+        advisory.append(f"{len(no_in)} note(s) with nothing linking to them: "
+                        f"{', '.join(no_in)}")
+    if singles:
+        advisory.append(f"{len(singles)} tag(s) used exactly once, which group nothing: "
+                        f"{', '.join(singles)}")
+    stats = {"notes": len(notes), "edges": sum(len(v) for v in out.values()),
+             "dangling": len(dangling), "orphans": len(orphans),
+             "no_outbound": len(no_out), "no_inbound": len(no_in),
+             "tags": len(tags), "single_use_tags": len(singles)}
+    return sorted(dangling), advisory, stats
+
+
 def integrity(notes):
     """Cross-note checks. A link graph that lies is worse than no link graph."""
     problems = []
@@ -462,6 +528,10 @@ def main():
                          "default: per-check time is already bounded by the engine "
                          "sandbox, and a total cap is a number only you can justify")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--strict-graph", action="store_true",
+                    help="promote graph ADVISORIES (orphans, no-inbound, no-outbound, "
+                         "single-use tags) to failures. Dangling wikilinks are ALWAYS a "
+                         "failure and need no flag")
     args = ap.parse_args()
 
     vault = Path(args.vault)
@@ -666,6 +736,13 @@ def main():
             ledger.pop(stale, None)
 
     problems = integrity(notes)
+    # GRAPH HEALTH. Dangling links join `problems`, so they fail the run through the same
+    # exit path as any other integrity defect -- a link naming no note is broken by
+    # definition, not by preference. The advisories stay separate unless asked for.
+    g_fatal, g_advisory, g_stats = graph(notes)
+    problems.extend(g_fatal)
+    if args.strict_graph:
+        problems.extend(g_advisory)
     # Every ledger mutation this run made -- writes, pops and prunes alike -- exists
     # only in memory until this succeeds, so the report below must not present prunes
     # as deletions that happened unless they did.
@@ -700,6 +777,7 @@ def main():
 
     if args.json:
         print(json.dumps({"results": results, "integrity": problems,
+                          "graph": g_stats, "graph_advisory": g_advisory,
                           "pruned": pruned, "prune_skipped": prune_skipped,
                           "ledger_written": ledger_written,
                           "ran": ran, "elapsed_s": round(time.monotonic() - started, 2)},
@@ -730,6 +808,15 @@ def main():
             print("\nINTEGRITY PROBLEMS:")
             for p in problems:
                 print(f"  - {p}")
+        print(f"\ngraph: {g_stats['edges']} link(s) among {g_stats['notes']} notes; "
+              f"{g_stats['tags']} tag(s)")
+        if g_advisory:
+            label = "GRAPH PROBLEMS" if args.strict_graph else "GRAPH ADVISORIES (not failures)"
+            print(f"{label}:")
+            for a in g_advisory:
+                print(f"  - {a}")
+        elif not g_fatal:
+            print("  no orphans, no dangling links, no single-use tags")
         print("\nA failing check is NOT a false fact: the world may have changed, the "
               "check may have\nrotted, or it may be transient. NEEDS_ADJUDICATION is "
               "for a human to resolve.")

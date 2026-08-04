@@ -21,7 +21,7 @@ Concrete steps (do all of them; do NOT skip any):
 4. Invoke the wrapper via Bash, piping the pitch on stdin. Pattern:
 
 ```
-python3 {{COUNCIL_ROOT}}/consult_council.py \
+{{COUNCIL_ROOT}}/hook_env.sh python3 {{COUNCIL_ROOT}}/consult_council.py \
   --layer reasoning \
   --transcript-path <transcript_path> \
   --evidence-file <evidence_file_if_present> \
