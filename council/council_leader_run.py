@@ -52,6 +52,7 @@ from pathlib import Path
 import consult_council as cc
 import council_events
 import council_leader as cl
+import council_session as cs
 
 MODES = ("auto", "approve-each", "plan-only")
 PREVIEW_MAX = 4000
@@ -69,6 +70,20 @@ def main() -> int:
                          "per decision ('APPROVE <id>'). NOT stdin: the GUI seam closes "
                          "stdin after sending the task, so decisions read from there "
                          "would EOF and silently decline every write.")
+    ap.add_argument("--interrupt-fd", type=int, default=None, metavar="N",
+                    help="Read operator interrupts from already-open fd N, one per line: "
+                         "'ABORT' or 'STEER <text>'. A SEPARATE CHANNEL FROM --control-fd on "
+                         "purpose: that one is a BLOCKING request/response for write "
+                         "approvals, so a steering message typed while an approval was "
+                         "pending would be consumed as that approval's answer and silently "
+                         "decline a write the council had permitted.")
+    ap.add_argument("--conversation", default="", metavar="ID",
+                    help="Continue (or start) a multi-turn conversation with this id. "
+                         "Carries the prior turn's handoff, the derived spine and the "
+                         "DECIDED ledger into this turn, and shares ONE scratch across the "
+                         "whole conversation. DISTINCT FROM --session-id, which is the "
+                         "Claude Code session forwarded to the council review. Omitted, a "
+                         "turn behaves exactly as it always has: fresh scratch, no context.")
     ap.add_argument("--session-id", default="")
     ap.add_argument("--transcript-path", default="")
     # ELEVATION IS OPT-IN, PER TURN, FROM THE OPERATOR. Not a roster key and not a default:
@@ -112,6 +127,44 @@ def main() -> int:
 
     pending = {"n": 0}
     control = None
+    # THE INTERRUPT CHANNEL IS NON-BLOCKING, which is the whole difference from --control-fd.
+    # That one BLOCKS waiting for a specific approval answer; this one is POLLED many times a
+    # second from inside the turn loop, so a read that waited would freeze the turn it exists
+    # to interrupt. Set O_NONBLOCK and treat "nothing there" as "no interrupt".
+    interrupt_fn = None
+    if args.interrupt_fd is not None:
+        try:
+            os.set_blocking(args.interrupt_fd, False)
+            ifh = os.fdopen(args.interrupt_fd, "r", buffering=1)
+        except OSError as e:
+            print(f"--interrupt-fd {args.interrupt_fd} is unusable: {e}", file=sys.stderr)
+            return 2
+
+        def _read_interrupt():
+            """Return (verb, text) or None. NEVER blocks, never raises into the turn."""
+            try:
+                line = ifh.readline()
+            except (OSError, ValueError):       # nothing available, or the fd went away
+                return None
+            if not line:
+                return None
+            line = line.strip()
+            if not line:
+                return None
+            if line.upper() == "ABORT":
+                events.emit("note", text="operator: ABORT")
+                return (cl.INTERRUPT_ABORT, "")
+            if line.upper().startswith("STEER "):
+                msg = line[6:]
+                events.emit("note", text=f"operator: STEER ({len(msg)} chars)")
+                return (cl.INTERRUPT_STEER, msg)
+            # UNRECOGNISED IS REPORTED, NOT SWALLOWED: an operator who typed the wrong verb
+            # must not be left believing the turn was told something.
+            events.emit("note", text=f"operator: unrecognised interrupt {line[:40]!r}; ignored")
+            return None
+
+        interrupt_fn = _read_interrupt
+
     if args.control_fd is not None:
         try:
             control = os.fdopen(args.control_fd, "r", buffering=1)
@@ -205,14 +258,34 @@ def main() -> int:
     # NOT deleted on exit, deliberately: a training run's artifacts are the deliverable, and a
     # turn that vanished its own outputs would be useless. The path is printed and recorded on
     # the TurnRecord so the operator knows where they are.
-    scratch = Path(tempfile.mkdtemp(prefix="council_leader_scratch_"))
-    events.emit("note", text=f"per-turn scratch (read-write, persists after the turn): "
-                             f"{scratch}")
+    # A CONVERSATION CHANGES BOTH THE SCRATCH AND THE PROMPT. Without --conversation this is
+    # exactly the old one-shot turn: a fresh scratch, no prior context. With one, the scratch
+    # is the conversation's (so turn 3 can see what turn 1 installed) and the previous turn's
+    # handoff, spine and DECIDED ledger are carried in.
+    # STARTED EXPLICITLY, NEVER INFERRED -- no model judges whether a task is "related
+    # enough" to continue an older conversation, because a wrong call silently discards the
+    # context the operator needed.
+    prior = ""
+    if args.conversation:
+        if args.conversation not in cs.existing_conversations():
+            cs.new_conversation(args.workdir, leader.name, cid=args.conversation)
+            events.emit("note", text=f"conversation {args.conversation}: started")
+        scratch = cs.scratch_dir(args.conversation)
+        prior = cs.carried_context(args.conversation)
+        events.emit("note", text=(
+            f"conversation {args.conversation}: turn "
+            f"{len(cs.turn_numbers(args.conversation)) + 1}, "
+            f"carrying {len(prior)} chars of prior context"))
+    else:
+        scratch = Path(tempfile.mkdtemp(prefix="council_leader_scratch_"))
+    events.emit("note", text=f"scratch (read-write, persists after the turn): {scratch}")
 
     record = asyncio.run(cl.run_leader_turn(
         leader, args.task, args.workdir, session_id=args.session_id,
         transcript_path=args.transcript_path, max_rounds=args.max_rounds,
-        apply_write=apply_write, profile=profile, scratch=scratch, on_event=on_event))
+        prior_handoff=prior,
+        apply_write=apply_write, profile=profile, scratch=scratch, on_event=on_event,
+        interrupt=interrupt_fn))
 
     # The end-of-turn summary. Every non-write action ALREADY streamed live via on_event, so
     # this is a recap, not the only report -- which is what it used to be, and it was empty:
@@ -223,6 +296,31 @@ def main() -> int:
         if res.kind != "write":                 # writes already reported by apply_write
             events.emit("leader_action_final", action=res.kind, target=res.arg,
                         applied=bool(res.ok), verdict="", reason=res.note or "")
+
+    # PERSIST THE TURN, and author its handoff FIRST so the handoff is part of the same
+    # atomic directory rename. The user ruled the panel runs EVERY turn (R1), over my
+    # suggestion to make it opt-in so its value could be measured against the bare record.
+    # THE PANEL IS LEADERLESS BY CONSTRUCTION -- author_handoff drops the turn's own leader
+    # from the panel, so the actor never writes its own report card.
+    # A FAILED PANEL MUST NOT LOSE THE TURN: the record is the receipts and the handoff is
+    # commentary on it, so a panel that errors persists an empty handoff rather than
+    # discarding everything the turn actually did.
+    if args.conversation:
+        # author_handoff returns a DICT, not a string -- {"handoff", "record", "panel",
+        # "panelist_notes"} -- and `handoff` is the assembled text (the verbatim record plus
+        # the union of the panel's notes). Checked rather than assumed: verifying a symbol
+        # EXISTS is not verifying its CONTRACT, and a first version of this call passed the
+        # whole dict where a string was expected.
+        handoff = ""
+        try:
+            handoff = (asyncio.run(cl.author_handoff(record, args.workdir)) or {}).get(
+                "handoff", "")
+        except Exception as e:                  # noqa: BLE001 -- see above
+            events.emit("note", text=f"handoff panel failed ({type(e).__name__}); "
+                                     "persisting the turn record without it")
+        turn_dir = cs.persist_turn(args.conversation, record, args.task, handoff)
+        events.emit("note", text=f"conversation {args.conversation}: turn persisted to "
+                                 f"{turn_dir}")
 
     stop = getattr(record, "stop_reason", "")
     events.emit("final_verdict", verdict=f"turn ended: {stop}", log_path=str(scratch),

@@ -1099,6 +1099,21 @@ class LeaderTab(QWidget):
             # harness's doing, not the leader's.
             self.out.appendPlainText(
                 f"[round {rec.get('round')}] ended with no WRITE emitted -- re-prompted once")
+        elif ev == "leader_steer":
+            # THE HUMAN redirecting the turn, as distinct from leader_reprompt, which is the
+            # HARNESS nudging it. Rendered as QUEUED, never as delivered, and the reason is
+            # that the two arrival points differ: a steer read at a ROUND BOUNDARY goes into
+            # that round's prompt, assembled moments later, so it is all but certain to land;
+            # one buffered during an IN-FLIGHT CALL waits for the following round, which a
+            # turn ending first never reaches. The event cannot tell them apart, so the
+            # weaker of the two claims is the honest one to show.
+            # "THE NEXT PROMPT ASSEMBLED" is exact and covers both arrival points: a steer
+            # read at a ROUND BOUNDARY goes into THAT round's prompt, assembled moments later,
+            # while one buffered during an in-flight call waits for the following round. An
+            # earlier version said "the next prompt", which was false for the boundary case.
+            self.out.appendPlainText(
+                f"[round {rec.get('round')}] operator steer QUEUED for the next prompt "
+                f"assembled (none is assembled if the turn ends first)")
         elif ev == "leader_problem":
             # An actions envelope rejected WHOLE -- none of it ran. Surfaced loudly because
             # the turn otherwise looks like a round that simply chose to do nothing.

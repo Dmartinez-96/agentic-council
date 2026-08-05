@@ -75,6 +75,14 @@ from typing import Any, Callable
 #   leader_problem   round, problems[] -- an actions envelope rejected WHOLE; none of it ran
 #   leader_reprompt  round -- the turn tried to end with no WRITE ever emitted and was sent
 #                    back once (council_leader.run_leader_turn). Fires at most once per turn
+#   leader_steer     round -- the OPERATOR's mid-turn STEER was ACCEPTED AND QUEUED. It says
+#                    the message was read and will go into the NEXT prompt assembled; it does
+#                    NOT promise a prompt was assembled. A turn that ends in that same round
+#                    (final answer, call failure, abort) never delivers it, so a consumer must
+#                    render this as "queued", never as "delivered".
+#                    Distinct from leader_reprompt: that is the HARNESS nudging the leader,
+#                    this is the HUMAN redirecting it. An ABORT emits no event of its own --
+#                    it ends the turn, and final_verdict carries the stop_reason
 #   leader_action_final  action, target, applied, verdict, reason -- end-of-turn recap
 #   approval_request id, target, verdict, bytes -- an operator decision is pending
 #   final_verdict    verdict, log_path
@@ -93,7 +101,7 @@ from typing import Any, Callable
 EVENT_NAMES = (
     "run_started", "round_started", "member_started", "member_finished",
     "member_corrected", "round_finished", "tool_request", "leader_action",
-    "leader_round", "leader_text", "leader_problem", "leader_reprompt",
+    "leader_round", "leader_text", "leader_problem", "leader_reprompt", "leader_steer",
     "leader_action_final", "approval_request", "final_verdict", "dropped", "note",
 )
 

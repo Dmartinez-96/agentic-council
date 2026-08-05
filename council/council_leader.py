@@ -693,6 +693,58 @@ def run_leader_actions(actions, workdir: Path, leader: "cc.Member", *,
     return results
 
 
+# The operator's two verbs. SEPARATE ON PURPOSE: "stop" and "do it differently" are different
+# intentions and collapsing them would make one of them unavailable.
+INTERRUPT_ABORT = "abort"
+INTERRUPT_STEER = "steer"
+# How often an in-flight await is checked against the interrupt channel. Small enough that a
+# stop feels immediate, large enough not to spin: the wait is dominated by a model call whose
+# observed median in this project is ~36s and whose maximum was 173s.
+INTERRUPT_POLL_S = 0.25
+
+
+async def await_or_interrupt(coro, interrupt, poll: float = INTERRUPT_POLL_S):
+    """Await `coro`. Returns (result, abort_signal, deferred_signals).
+
+    ONLY AN ABORT CUTS THE WAIT SHORT. A STEER cannot be delivered into a call already in
+    flight -- the prompt is gone -- so it is BUFFERED and returned in `deferred` for the
+    caller to fold into the NEXT round. THIS WAS A REAL DEFECT: the first version cancelled
+    on ANY signal and the caller called every signal an abort, so a STEER typed during a model
+    call KILLED THE TURN. With a ~36s median call and a 0.25s poll, that is the overwhelmingly
+    likely window for an operator to type in -- the one place steering would be used most was
+    the one place it did the opposite. Found by a layer-2 inspector; all six voting seats
+    passed over it, and the probe that "tested" STEER had only ever exercised it at a round
+    boundary.
+
+    On abort, `result` is None and the coroutine is CANCELLED and ABANDONED.
+
+    ABANDONED IS THE RULING, and it is honest about what it can and cannot do. The user chose
+    it over waiting, because the tokens are spent either way and a stop button that waits up
+    to ~173s reads as broken. But cancelling an `asyncio.to_thread` call does NOT stop the
+    thread -- the HTTP transports run that way and a Python thread is not killable -- so the
+    request really does keep running to completion somewhere and its answer is dropped. A
+    codex subprocess is separately killable; that is the caller's job, not this helper's.
+
+    `interrupt` is a zero-argument callable returning None, or (verb, text).
+    """
+    task = asyncio.ensure_future(coro)
+    deferred: list = []
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=poll)
+        if done:
+            return task.result(), None, deferred
+        sig = interrupt() if interrupt else None
+        if not sig:
+            continue
+        if sig[0] == INTERRUPT_ABORT:
+            task.cancel()
+            return None, sig, deferred
+        # NOT DROPPED. Consuming a steer and discarding it would lose the operator's message
+        # entirely -- worse than never having read it, because the channel reported it as
+        # delivered.
+        deferred.append(sig)
+
+
 def turn_has_discrepancy(record: "TurnRecord") -> tuple:
     """Reasons this turn's record does not reconcile, or () when it does.
 
@@ -810,7 +862,7 @@ def _claims_sentinels(nonce: str) -> tuple[str, str]:
 _CLAIM_LINE_RE = re.compile(r"^\s*CLAIMED:\s*(\S[^\n]*?)\s*$")
 
 
-def parse_claims(text: str, nonce: str) -> list[str]:
+def parse_claims(text: str, nonce: str, problems: list | None = None) -> list[str] | None:
     """Extract CLAIMED paths from a leader's final answer, in order, deduplicated.
 
     Grammar, scoped by the SAME per-round nonce the actions envelope uses so a claims block
@@ -819,7 +871,9 @@ def parse_claims(text: str, nonce: str) -> list[str]:
         CLAIMED: relative/path
         --- END CLAIMS <nonce> ---
     A path is confined to ONE line, matching parse_write_requests' rule for the same reason.
-    Lines that are not CLAIMED: are ignored, so the leader may write prose inside the block.
+    Lines that are not CLAIMED: are ignored ALONGSIDE valid ones, so the leader may write
+    prose inside the block -- but a block of NOTHING BUT such lines is malformed, not empty;
+    see below.
     Returns None when there is NO BLOCK, and a list (possibly EMPTY) when a block is present.
     THE DISTINCTION IS LOAD-BEARING and was added after codex raised it in dialogue: with a
     bare list, an empty block is indistinguishable from no block, so a leader CANNOT RETRACT.
@@ -827,6 +881,15 @@ def parse_claims(text: str, nonce: str) -> list[str]:
     empty CLAIMS block to withdraw the claim would have had that withdrawal read as silence
     and the stale claim kept. Absent means "said nothing"; empty means "declares nothing",
     and only the second may overwrite an earlier declaration.
+
+    ONLY A GENUINELY BLANK BLOCK RETRACTS. codex raised the follow-on hazard in the same
+    dialogue: unrecognized lines are skipped, so a leader that typed `CLAIM: a.py` (one letter
+    short) would emit a block parsing to [] and SILENTLY RETRACT its real claims -- a typo
+    performing a withdrawal. A block whose body carries non-blank text but yields NO valid
+    CLAIMED line is therefore treated as MALFORMED: it returns None (so it changes nothing)
+    and appends a note to `problems` if one was passed. The user ruled this shape over an
+    explicit RETRACTED verb, because a leader that forgets the verb cannot retract at all.
+    `problems` is an optional out-list so the return contract stays None | list.
     """
     begin, end = _claims_sentinels(nonce)
     i = text.find(begin)
@@ -835,12 +898,25 @@ def parse_claims(text: str, nonce: str) -> list[str]:
     j = text.find(end, i + len(begin))
     if j < 0:
         return None
-    seen, out = set(), []
-    for line in text[i + len(begin):j].splitlines():
+    body = text[i + len(begin):j]
+    seen, out, junk = set(), [], 0
+    for line in body.splitlines():
         m = _CLAIM_LINE_RE.match(line)
-        if m and m.group(1) not in seen:
-            seen.add(m.group(1))
-            out.append(m.group(1))
+        if m:
+            if m.group(1) not in seen:
+                seen.add(m.group(1))
+                out.append(m.group(1))
+        elif line.strip():
+            junk += 1
+    if not out and junk:
+        # MALFORMED, NOT EMPTY. The block says something this parser could not read, so it is
+        # not evidence that the leader declares nothing -- and treating it as a retraction
+        # would let a one-letter typo withdraw real claims.
+        if problems is not None:
+            problems.append(
+                f"CLAIMS block present but no CLAIMED: line parsed ({junk} unreadable "
+                f"line(s)); nothing was retracted -- check the spelling of CLAIMED:")
+        return None
     return out
 
 
@@ -1044,6 +1120,11 @@ class TurnRecord:
     claims: tuple = ()
     traces: tuple = ()
     intent: dict | None = None
+    # THE OPERATOR'S MARKS ON THE TURN. Machine-readable, beside `stop_reason`'s prose, for
+    # the same reason `reprompted` is: a consumer counting interrupted turns should not have
+    # to match on the wording of a string written for humans.
+    interrupted: bool = False
+    steered: bool = False
 
 
 def _action_grammar_instructions(nonce: str) -> str:
@@ -1198,7 +1279,7 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
                           call_leader=None, nonce_fn=None, review=_council_review,
                           read=None, fetch=None, run_exec=None,
                           apply_write=None, profile=None, scratch: Path | None = None,
-                          on_event=None) -> TurnRecord:
+                          on_event=None, interrupt=None) -> TurnRecord:
     """Run one leader turn as a bounded act -> observe -> act loop.
 
     Each round: assemble the leader prompt (ground rules RE-INJECTED, the prior-turn handoff,
@@ -1270,18 +1351,56 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
     claims: tuple = ()      # verified CLAIMS from the final answer; () when none was emitted
     intent: dict | None = None   # declared INTENT; None means "none declared", not "empty"
     seen_claims: list = []       # CLAIMS declared at ANY candidate-final answer this turn
+    interrupted = False          # the operator ABORTed this turn
+    steered = False              # the operator sent a STEER that reached a prompt
     intent_reprompted = False    # the intent notice has fired; like the zero-write one it
     #                              never fires twice, and never on the last round
     traces: list = []       # per-round bounded stderr from the leader subprocess. HELD IN
     #                         MEMORY ONLY -- it carries the prompt echo, so a caller persists
     #                         it only when turn_has_discrepancy() says something is wrong.
     for i in range(max_rounds):
+        # THE ROUND BOUNDARY, the cheapest place to honour an interrupt: nothing is in flight,
+        # so there is nothing to abandon. A STEER arriving here is folded into this round's
+        # prompt rather than the next one, which is the whole point of steering.
+        sig = interrupt() if interrupt else None
+        if sig and sig[0] == INTERRUPT_ABORT:
+            stop_reason = "aborted by operator (between rounds)"
+            interrupted = True
+            break
+        if sig and sig[0] == INTERRUPT_STEER:
+            # APPENDED, like every other notice: a steer buffered during the PREVIOUS round's
+            # model call may already be sitting in `notice`, and assigning would drop it after
+            # the channel had reported it read.
+            notice = (notice + "\n\n# OPERATOR MESSAGE (delivered mid-turn; this is the "
+                      "human, not the harness)\n\n" + (sig[1] or "")).strip()
+            steered = True
+            event("leader_steer", round=i)
         nonce = nonce_fn()
         event("leader_round", round=i)
         prompt = _assemble_leader_prompt(ground_rules, prior_handoff, task, rounds,
                                          all_results, nonce, notice)
         notice = ""
-        resp = await call_leader(leader, prompt, workdir)
+        # RACED AGAINST THE INTERRUPT, because the model call is the LONG wait -- measured in
+        # this project at a ~36s median and a 173s maximum, which is exactly the window in
+        # which a stop button that only worked between rounds would feel broken.
+        # THE RESULT IS ABANDONED on abort, per the user's ruling, and `await_or_interrupt`
+        # documents precisely what that does and does not stop.
+        resp, sig, deferred = await await_or_interrupt(
+            call_leader(leader, prompt, workdir), interrupt)
+        if sig:
+            stop_reason = (f"aborted by operator (during a leader call, round {i}; the "
+                           "in-flight response was abandoned)")
+            interrupted = True
+            break
+        # A STEER THAT ARRIVED MID-CALL is queued onto the NEXT round's prompt. It could not
+        # be delivered into a request already in flight, and dropping it would lose the
+        # operator's message after the channel had already reported it read.
+        if deferred:
+            notice = (notice + "\n\n# OPERATOR MESSAGE (delivered mid-turn; this is the "
+                      "human, not the harness)\n\n"
+                      + "\n".join(d[1] or "" for d in deferred)).strip()
+            steered = True
+            event("leader_steer", round=i)
         if not resp.get("ok"):
             stop_reason = f"leader call failed: {resp.get('error') or 'unknown'}"
             break
@@ -1308,6 +1427,36 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
         # `text` remains the FINAL answer -- the turn still ends on the last message.
         msgs = list(resp.get("messages") or ([text] if text else []))
         parse = parse_leader_actions("\n".join(msgs), nonce)
+        # CAPTURE DECLARATIONS EVERY ROUND, BEFORE ANY BRANCH. This is the FOURTH place a
+        # declaration was found being lost, and all four are one shape: the capture sat behind
+        # control flow that could skip it. The others were the dropped codex envelope, the
+        # intent re-prompt making a later answer final, and the zero-write `continue`. This one
+        # was found by asking the bench whether the shape was exhausted -- it was not: a single
+        # message carrying BOTH an actions envelope AND a CLAIMS/INTENT block had the
+        # declarations dropped, because the capture lived inside the no-actions branch.
+        # READ FROM `msgs`, not `text`, for the same reason the envelope is: a declaration can
+        # arrive in a non-final message.
+        # A PRESENT CLAIMS BLOCK WINS, EVEN AN EMPTY ONE -- that is how a leader RETRACTS. Only
+        # a genuinely ABSENT block (None) leaves an earlier declaration standing; `or` would
+        # collapse those two and make retraction impossible.
+        joined = "\n".join(msgs)
+        # `claim_problems` is PASSED, not discarded: a malformed CLAIMS block changes nothing
+        # by design, so without surfacing the note the leader would get NO signal that its
+        # declaration was unreadable -- a silent no-op is how a typo becomes invisible.
+        claim_problems: list = []
+        declared = parse_claims(joined, nonce, claim_problems)
+        if declared is not None:
+            seen_claims = declared
+        # PREPENDED AT EVERY EXIT BELOW, not just one. A first attempt wired this into the
+        # terminal branch alone and the other four discarded it -- rule 2's silent-nothing-
+        # delivered shape, and the fifth time this session that a declaration-related value
+        # was computed and then dropped on some path. On the branches that `continue` this
+        # reaches the LEADER (round notes are re-injected as "THIS TURN SO FAR"); on the
+        # terminal branches it reaches the RECORD and the handoff.
+        claim_notes = tuple(f"PROBLEM: {p}" for p in claim_problems)
+        # INTENT has no retraction case: parse_intent REJECTS a block with an empty DECIDED
+        # (returns None), so there is no "declares nothing" state to distinguish.
+        intent = parse_intent(joined, nonce) or intent
         if not parse.actions and not parse.problems:
             # THE ZERO-WRITE RE-PROMPT. A response with no envelope ends the turn, so a leader
             # that decides in prose that it cannot write looks EXACTLY like one that finished.
@@ -1317,66 +1466,54 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
             # STRUCTURAL, NOT SEMANTIC: the trigger is the absence of a parsed WRITE, never a
             # keyword hunt through the prose. A phrase list would miss paraphrase and would
             # fire on a leader that merely quotes the skill file back.
-            # CAPTURE DECLARATIONS BEFORE ANY BRANCH THAT CAN `continue`. codex caught this
-            # in dialogue: the capture used to sit BELOW the zero-write re-prompt, so a leader
-            # that declared INTENT or CLAIMS in the very answer that triggered that re-prompt
-            # had the declaration thrown away. It is the same defect as the dropped envelope
-            # and the re-prompt-discards-claims bug -- three times now, the harness losing
-            # something the leader correctly emitted, each time because the capture sat behind
-            # a control-flow branch rather than in front of it.
-            # A PRESENT BLOCK WINS, EVEN AN EMPTY ONE -- that is how a leader RETRACTS. Only a
-            # genuinely ABSENT block (None) leaves an earlier declaration standing. `or` would
-            # have collapsed those two cases and made retraction impossible.
-            declared = parse_claims(text, nonce)
-            if declared is not None:
-                seen_claims = declared
-            # INTENT has no retraction case: a block with an empty DECIDED is REJECTED by
-            # parse_intent (it returns None), so there is no "declares nothing" state to
-            # distinguish -- an intent block either carries a decision or it does not exist.
-            intent = parse_intent(text, nonce) or intent
             if not wrote and not reprompted and i < max_rounds - 1:
                 reprompted = True
-                notice = ZERO_WRITE_REPROMPT
+                # APPENDED, NOT ASSIGNED. `notice` may already hold an OPERATOR MESSAGE from
+                # a mid-call steer, and overwriting it discarded the human's words after the
+                # channel had reported them read -- the sixth instance in this file of a
+                # value being captured and then dropped on another path.
+                notice = (notice + "\n\n" + ZERO_WRITE_REPROMPT).strip()
                 rounds.append({"round": i,
-                               "notes": ("NOTICE: turn ended with no WRITE emitted; "
-                                         "re-prompted once",),
+                               "notes": claim_notes + (
+                                   "NOTICE: turn ended with no WRITE emitted; "
+                                   "re-prompted once",),
                                "leader_chars": len(text)})
                 event("leader_reprompt", round=i)
                 continue
-            # DECLARED BLOCKS ARE KEPT AS SOON AS THEY APPEAR, not read off whichever
-            # answer happens to be last. THIS WAS A REAL DEFECT, caught by this project's own
-            # NO SECOND CAPTURE HERE. An earlier version re-parsed CLAIMS at this point with
-            # `parse_claims(...) or seen_claims`, left behind when the capture moved above the
-            # zero-write branch. It was harmless only by accident -- the site above had
-            # already run in the same iteration -- and it contradicted the absent/empty
-            # contract, since `or` collapses [] into None and would have silently undone a
-            # retraction the moment the two sites diverged. Found by a layer-2 inspector after
-            # all six voting seats passed over it.
+            # NO SECOND CAPTURE HERE -- there is exactly ONE, at the top of the loop. Two
+            # earlier versions of this spot re-parsed the blocks, and both were wrong in the
+            # same way: the first used `parse_claims(...) or seen_claims`, which collapses an
+            # empty block into an absent one and would have silently undone a retraction; the
+            # second assigned `parsed_intent = intent` and was simple dead code, a no-op on
+            # every path. A layer-2 inspector caught the first after all six voting seats
+            # passed over it; glm caught the second.
             # THE INTENT RE-PROMPT, checked AFTER the zero-write one so a turn that never
             # acted is asked about its actions before it is asked about its intentions.
             # Structural: it fires on an ABSENT or DECIDED-less block, never on what was said.
-            parsed_intent = intent
-            if parsed_intent is None and not intent_reprompted and i < max_rounds - 1:
+            if intent is None and not intent_reprompted and i < max_rounds - 1:
                 intent_reprompted = True
-                notice = INTENT_REPROMPT
+                notice = (notice + "\n\n" + INTENT_REPROMPT).strip()   # appended, see above
                 rounds.append({"round": i,
-                               "notes": ("NOTICE: no INTENT declared; re-prompted once",),
+                               "notes": claim_notes + (
+                                   "NOTICE: no INTENT declared; re-prompted once",),
                                "leader_chars": len(text)})
                 event("leader_reprompt", round=i)
                 continue
-            intent = parsed_intent
             final_text = text
-            # THE CLAIMS BLOCK IS READ HERE AND NOWHERE ELSE: it belongs to the FINAL answer,
-            # and it is scoped by THIS round's nonce, so a block echoed from an earlier round
-            # cannot replay. An absent block yields () -- which the record must never render
-            # as "verified", only as "none declared".
+            # VERIFIED HERE, CAPTURED EVERY ROUND ABOVE. An earlier comment here said the
+            # block was "READ HERE AND NOWHERE ELSE", which stopped being true the moment the
+            # capture moved to the top of the loop -- it is left recorded rather than quietly
+            # deleted because that sentence is exactly how a stale comment survives a refactor.
+            # Each round's block is scoped by THAT round's nonce, so one echoed from an
+            # earlier round cannot replay. No block at any point yields () -- which the record
+            # must never render as "verified", only as "none declared".
             claims = verify_claims(seen_claims, all_results, workdir)
             stop_reason = ("final answer (no actions, after zero-write re-prompt)"
                            if reprompted else "final answer (no actions)")
-            rounds.append({"round": i, "notes": (), "leader_chars": len(text)})
+            rounds.append({"round": i, "notes": claim_notes, "leader_chars": len(text)})
             break
         if parse.overflow:
-            probs = tuple(f"PROBLEM: {p}" for p in parse.problems)
+            probs = claim_notes + tuple(f"PROBLEM: {p}" for p in parse.problems)
             rounds.append({"round": i, "notes": probs, "leader_chars": len(text)})
             all_results.append(ActionResult("problem", "", False,
                                "Your actions were REJECTED and none ran:\n"
@@ -1404,13 +1541,14 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
             # distinction for the same reason.
             on_action=lambda r, _i=i: event("leader_action", round=_i, action=r.kind,
                                             target=r.arg, ok=r.ok, note=r.note))
-        notes = tuple([r.note for r in results]
-                      + [f"PROBLEM: {p}" for p in parse.problems])
+        notes = claim_notes + tuple([r.note for r in results]
+                                    + [f"PROBLEM: {p}" for p in parse.problems])
         rounds.append({"round": i, "notes": notes, "leader_chars": len(text)})
         all_results.extend(results)
     return TurnRecord(leader.name, tuple(rounds), final_text, stop_reason,
                       tuple(all_results), str(scratch) if scratch else "", reprompted,
-                      reconcile_writes(all_results), claims, tuple(traces), intent)
+                      reconcile_writes(all_results), claims, tuple(traces), intent,
+                      interrupted, steered)
 
 
 _HANDOFF_PANEL_INSTRUCTIONS = (
