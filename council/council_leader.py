@@ -721,6 +721,88 @@ def turn_has_discrepancy(record: "TurnRecord") -> tuple:
     return tuple(why)
 
 
+def _intent_sentinels(nonce: str) -> tuple[str, str]:
+    return (f"--- BEGIN INTENT {nonce} ---", f"--- END INTENT {nonce} ---")
+
+
+_INTENT_FIELD_RE = re.compile(r"^\s*(DECIDED|NEXT|OPEN|SUPERSEDES):\s*(.*?)\s*$")
+
+
+def parse_intent(text: str, nonce: str) -> dict | None:
+    """The leader's declared INTENT for the next turn, or None when no valid block is present.
+
+    Grammar, nonce-scoped like every other block so one echoed from an earlier round cannot
+    replay:
+        --- BEGIN INTENT <nonce> ---
+        DECIDED: <required, must be NON-EMPTY>
+        NEXT: <optional>
+        OPEN: <optional>
+        SUPERSEDES: turn <N> -- <reason>      (optional, repeatable)
+        --- END INTENT <nonce> ---
+
+    Returns {"decided", "next", "open", "supersedes": [...]} or None.
+
+    WHY THIS EXISTS. A conversation spine derived from turn RECORDS can carry paths, verdicts
+    and denials -- it cannot carry INTENT. If turn 1 decided "approach X, not Y, because Z",
+    nothing in the record says so, and it is gone as soon as the turn that holds it scrolls
+    out of what is carried forward. (How many turns that is depends on the carry policy and is
+    NOT a number this docstring is entitled to state.) DECIDED is the field a deterministic
+    derivation provably cannot produce, which is why it is the mandatory one.
+
+    VALIDATION IS STRUCTURAL AND NON-EMPTY, NEVER SEMANTIC. A block whose DECIDED is present
+    but blank is REJECTED (returns None): checking only that the key appears would pass an
+    empty promise, which is a void check -- it would print the same thing whether the leader
+    declared anything or not. Nothing here judges whether the intent is GOOD; that is not
+    checkable, and pretending otherwise repeats the error of grepping prose for meaning.
+
+    RETURNING None IS NOT AN ERROR STATE. An absent or invalid block means "no intent
+    declared", which the caller records as such -- never as an empty intent that later reads
+    like a leader who decided nothing.
+    """
+    begin, end = _intent_sentinels(nonce)
+    i = text.find(begin)
+    if i < 0:
+        return None
+    j = text.find(end, i + len(begin))
+    if j < 0:
+        return None
+    out = {"decided": "", "next": "", "open": "", "supersedes": []}
+    for line in text[i + len(begin):j].splitlines():
+        m = _INTENT_FIELD_RE.match(line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if key == "SUPERSEDES":
+            if val:
+                out["supersedes"].append(val)
+        elif not out[key.lower()]:      # first NON-EMPTY wins: a blank first line is falsy,
+            #                                 so a later filled repeat still lands. Stated as
+            #                                 the code behaves -- an earlier comment here said
+            #                                 "first occurrence wins", which this line is not.
+            out[key.lower()] = val
+    return out if out["decided"] else None
+
+
+INTENT_REPROMPT = (
+    "# HARNESS NOTICE (automatic; fires at most once per turn)\n\n"
+    "Your answer ended the turn without a valid INTENT block. This notice is STRUCTURAL: it\n"
+    "is triggered by the ABSENCE of the block (or by an empty DECIDED field), not by anything\n"
+    "you said, and it is not a judgement that your work was wrong.\n\n"
+    "The next turn of this conversation sees a record of what was READ, RUN and WRITTEN, and\n"
+    "that record cannot carry a DECISION. If you chose an approach, rejected one, or\n"
+    "established a constraint that should bind later turns, it is lost unless you declare it.\n\n"
+    "Reply again with your final answer, including:\n\n"
+    f"{_intent_sentinels('<this-round-nonce>')[0]}\n"
+    "DECIDED: what you decided that should constrain later turns (required, non-empty)\n"
+    "NEXT: what the following turn should do (optional)\n"
+    "OPEN: what is unresolved or blocked (optional)\n"
+    f"{_intent_sentinels('<this-round-nonce>')[1]}\n\n"
+    "Use THIS round's nonce, shown in the action grammar above. If you genuinely decided\n"
+    "nothing that should bind a later turn, reply again without the block and the turn ends;\n"
+    "this notice will not repeat."
+)
+
+
 def _claims_sentinels(nonce: str) -> tuple[str, str]:
     return (f"--- BEGIN CLAIMS {nonce} ---", f"--- END CLAIMS {nonce} ---")
 
@@ -738,16 +820,21 @@ def parse_claims(text: str, nonce: str) -> list[str]:
         --- END CLAIMS <nonce> ---
     A path is confined to ONE line, matching parse_write_requests' rule for the same reason.
     Lines that are not CLAIMED: are ignored, so the leader may write prose inside the block.
-    Returns [] when there is no block -- which is NOT the same as a verified empty claim, and
-    the caller must keep the two apart.
+    Returns None when there is NO BLOCK, and a list (possibly EMPTY) when a block is present.
+    THE DISTINCTION IS LOAD-BEARING and was added after codex raised it in dialogue: with a
+    bare list, an empty block is indistinguishable from no block, so a leader CANNOT RETRACT.
+    A turn that declared `a.py` and then, having learned the write was blocked, emitted an
+    empty CLAIMS block to withdraw the claim would have had that withdrawal read as silence
+    and the stale claim kept. Absent means "said nothing"; empty means "declares nothing",
+    and only the second may overwrite an earlier declaration.
     """
     begin, end = _claims_sentinels(nonce)
     i = text.find(begin)
     if i < 0:
-        return []
+        return None
     j = text.find(end, i + len(begin))
     if j < 0:
-        return []
+        return None
     seen, out = set(), []
     for line in text[i + len(begin):j].splitlines():
         m = _CLAIM_LINE_RE.match(line)
@@ -956,12 +1043,14 @@ class TurnRecord:
     writes: dict = field(default_factory=dict)
     claims: tuple = ()
     traces: tuple = ()
+    intent: dict | None = None
 
 
 def _action_grammar_instructions(nonce: str) -> str:
     a_begin, a_end = _actions_sentinels(nonce)
     c_begin, c_end = _write_sentinels(nonce)
     k_begin, k_end = _claims_sentinels(nonce)
+    i_begin, i_end = _intent_sentinels(nonce)
     return (
         "# HOW TO ACT\n\n"
         "To use tools, emit ONE actions block EXACTLY like the template below, using this\n"
@@ -991,6 +1080,20 @@ def _action_grammar_instructions(nonce: str) -> str:
         "if you changed nothing, and a path the council BLOCKED is expected to come back as\n"
         "contradicted -- say so in your prose rather than claiming it. The block exists so a\n"
         "reader downstream can tell a verified change from an unverified sentence about one."
+        "\n\n"
+        "# AND DECLARE WHAT YOU DECIDED\n\n"
+        "Your final answer should also carry an intent block. The next turn of this\n"
+        "conversation receives a record of what was READ, RUN and WRITTEN -- and a record\n"
+        "cannot carry a DECISION. If you chose an approach, rejected one, or established a\n"
+        "constraint that should bind later turns, declare it here or it is lost.\n\n"
+        f"{i_begin}\n"
+        "DECIDED: what should constrain later turns (REQUIRED, must not be empty)\n"
+        "NEXT: what the following turn should do (optional)\n"
+        "OPEN: what is unresolved or blocked (optional)\n"
+        "SUPERSEDES: turn <N> -- what changed and why (optional, repeatable)\n"
+        f"{i_end}\n\n"
+        "DECIDED is the one field a record cannot reconstruct, which is why it is required.\n"
+        "If you truly decided nothing that should bind a later turn, omit the block."
     )
 
 
@@ -1165,6 +1268,10 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
     reprompted = False      # the zero-write notice has already fired; it never fires twice
     notice = ""             # queued for the NEXT round's prompt, then cleared
     claims: tuple = ()      # verified CLAIMS from the final answer; () when none was emitted
+    intent: dict | None = None   # declared INTENT; None means "none declared", not "empty"
+    seen_claims: list = []       # CLAIMS declared at ANY candidate-final answer this turn
+    intent_reprompted = False    # the intent notice has fired; like the zero-write one it
+    #                              never fires twice, and never on the last round
     traces: list = []       # per-round bounded stderr from the leader subprocess. HELD IN
     #                         MEMORY ONLY -- it carries the prompt echo, so a caller persists
     #                         it only when turn_has_discrepancy() says something is wrong.
@@ -1210,6 +1317,23 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
             # STRUCTURAL, NOT SEMANTIC: the trigger is the absence of a parsed WRITE, never a
             # keyword hunt through the prose. A phrase list would miss paraphrase and would
             # fire on a leader that merely quotes the skill file back.
+            # CAPTURE DECLARATIONS BEFORE ANY BRANCH THAT CAN `continue`. codex caught this
+            # in dialogue: the capture used to sit BELOW the zero-write re-prompt, so a leader
+            # that declared INTENT or CLAIMS in the very answer that triggered that re-prompt
+            # had the declaration thrown away. It is the same defect as the dropped envelope
+            # and the re-prompt-discards-claims bug -- three times now, the harness losing
+            # something the leader correctly emitted, each time because the capture sat behind
+            # a control-flow branch rather than in front of it.
+            # A PRESENT BLOCK WINS, EVEN AN EMPTY ONE -- that is how a leader RETRACTS. Only a
+            # genuinely ABSENT block (None) leaves an earlier declaration standing. `or` would
+            # have collapsed those two cases and made retraction impossible.
+            declared = parse_claims(text, nonce)
+            if declared is not None:
+                seen_claims = declared
+            # INTENT has no retraction case: a block with an empty DECIDED is REJECTED by
+            # parse_intent (it returns None), so there is no "declares nothing" state to
+            # distinguish -- an intent block either carries a decision or it does not exist.
+            intent = parse_intent(text, nonce) or intent
             if not wrote and not reprompted and i < max_rounds - 1:
                 reprompted = True
                 notice = ZERO_WRITE_REPROMPT
@@ -1219,12 +1343,34 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
                                "leader_chars": len(text)})
                 event("leader_reprompt", round=i)
                 continue
+            # DECLARED BLOCKS ARE KEPT AS SOON AS THEY APPEAR, not read off whichever
+            # answer happens to be last. THIS WAS A REAL DEFECT, caught by this project's own
+            # NO SECOND CAPTURE HERE. An earlier version re-parsed CLAIMS at this point with
+            # `parse_claims(...) or seen_claims`, left behind when the capture moved above the
+            # zero-write branch. It was harmless only by accident -- the site above had
+            # already run in the same iteration -- and it contradicted the absent/empty
+            # contract, since `or` collapses [] into None and would have silently undone a
+            # retraction the moment the two sites diverged. Found by a layer-2 inspector after
+            # all six voting seats passed over it.
+            # THE INTENT RE-PROMPT, checked AFTER the zero-write one so a turn that never
+            # acted is asked about its actions before it is asked about its intentions.
+            # Structural: it fires on an ABSENT or DECIDED-less block, never on what was said.
+            parsed_intent = intent
+            if parsed_intent is None and not intent_reprompted and i < max_rounds - 1:
+                intent_reprompted = True
+                notice = INTENT_REPROMPT
+                rounds.append({"round": i,
+                               "notes": ("NOTICE: no INTENT declared; re-prompted once",),
+                               "leader_chars": len(text)})
+                event("leader_reprompt", round=i)
+                continue
+            intent = parsed_intent
             final_text = text
             # THE CLAIMS BLOCK IS READ HERE AND NOWHERE ELSE: it belongs to the FINAL answer,
             # and it is scoped by THIS round's nonce, so a block echoed from an earlier round
             # cannot replay. An absent block yields () -- which the record must never render
             # as "verified", only as "none declared".
-            claims = verify_claims(parse_claims(text, nonce), all_results, workdir)
+            claims = verify_claims(seen_claims, all_results, workdir)
             stop_reason = ("final answer (no actions, after zero-write re-prompt)"
                            if reprompted else "final answer (no actions)")
             rounds.append({"round": i, "notes": (), "leader_chars": len(text)})
@@ -1264,7 +1410,7 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
         all_results.extend(results)
     return TurnRecord(leader.name, tuple(rounds), final_text, stop_reason,
                       tuple(all_results), str(scratch) if scratch else "", reprompted,
-                      reconcile_writes(all_results), claims, tuple(traces))
+                      reconcile_writes(all_results), claims, tuple(traces), intent)
 
 
 _HANDOFF_PANEL_INSTRUCTIONS = (
