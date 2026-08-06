@@ -536,6 +536,11 @@ class ActionResult:
     note: str
     target: str = ""
     sha256: str = ""
+    # EXEC ONLY: the command's structural exit status, straight from run_exec_sandbox's info.
+    # Carried so a turn-end reconciliation can compare what a leader SAID about a command
+    # against what it DID, without parsing the human-facing note -- a substring test on prose
+    # is a hypothesis, and a command that PRINTS "exit 0" would satisfy one.
+    exit_status: int | None = None
 
 
 # Per-CALL tool bounds for the leader, borrowed from the member-side caps so the leader is
@@ -564,7 +569,7 @@ def run_leader_actions(actions, workdir: Path, leader: "cc.Member", *,
                        exfil_context: str = "", review=_council_review, read=None,
                        fetch=None, run_exec=None, apply_write=None,
                        budget=None, profile=None, scratch: Path | None = None,
-                       on_action=None) -> list[ActionResult]:
+                       on_action=None, should_abort=None) -> list[ActionResult]:
     """Execute parsed leader actions IN ORDER, returning one ActionResult each.
 
     Order is the caller-supplied order, so a WRITE followed by an EXEC of what it wrote runs
@@ -654,6 +659,7 @@ def run_leader_actions(actions, workdir: Path, leader: "cc.Member", *,
             continue
         cap_n, cap_b = caps[k]
         label = _note_label(k, a.arg)
+        exec_info: dict = {}      # populated by the exec branch only; stays {} for read/fetch
         if counts[k] > cap_n:
             results.append(emit(ActionResult(k, a.arg, False, "",
                 f"{label}: DENIED: {k} cap {cap_n} exceeded")))
@@ -679,7 +685,34 @@ def run_leader_actions(actions, workdir: Path, leader: "cc.Member", *,
                 kw["profile"] = profile
             if scratch is not None:
                 kw["scratch"] = scratch
-            content, note = run_exec(a.arg, workdir, **kw)[:2]
+            # PASSED TO EXEC AND NOWHERE ELSE. The write path stays uninterruptible, which is
+            # what keeps the applier wall atomic: an abort must never land between the
+            # council's verdict and `_atomic_write` (council_leader.py:390, called at :512).
+            # EXEC is the only action that can run for hours, so it is the only one where an
+            # operator would reach for a stop button mid-action.
+            # PASSED CONDITIONALLY, like profile and scratch, so an injected test stub with
+            # the older (command, workdir) signature keeps working.
+            if should_abort is not None:
+                kw["should_abort"] = should_abort
+            out = run_exec(a.arg, workdir, **kw)
+            content, note = out[0], out[1]
+            # THE ABORT IS READ FROM THE STRUCTURED INFO, never by matching the note's prose.
+            # The note happens to say "ABORTED BY OPERATOR", but a substring test on a
+            # human-facing string is a hypothesis, not a fact -- and a command that PRINTED
+            # that phrase would trip it. Stubs return a 2-tuple, so absence means "not
+            # aborted" rather than an IndexError.
+            info = out[2] if len(out) > 2 and isinstance(out[2], dict) else {}
+            exec_info = info
+            if info.get("aborted"):
+                results.append(emit(ActionResult(k, a.arg, False, content or "", note)))
+                # STOP THE WHOLE BATCH. Actions run IN ORDER, so a later WRITE would otherwise
+                # still execute after the operator had said stop -- the abort would kill one
+                # command and then apply a change nobody was watching for. The sentinel tells
+                # run_leader_turn to end the turn rather than continue to the next round.
+                results.append(emit(ActionResult("aborted", a.arg, False, "",
+                                                 "ABORTED BY OPERATOR: remaining actions in "
+                                                 "this envelope were not run")))
+                break
         if content is None:
             results.append(emit(ActionResult(k, a.arg, False, "", f"{label}: DENIED {note}")))
             continue
@@ -689,7 +722,9 @@ def run_leader_actions(actions, workdir: Path, leader: "cc.Member", *,
                 f"{label}: DENIED: {k} byte budget exhausted")))
             continue
         used[k] += nbytes
-        results.append(emit(ActionResult(k, a.arg, True, content, f"{label}: {note}")))
+        results.append(emit(ActionResult(
+            k, a.arg, True, content, f"{label}: {note}",
+            exit_status=(exec_info.get("exit_status") if k == "exec" else None))))
     return results
 
 
@@ -745,6 +780,25 @@ async def await_or_interrupt(coro, interrupt, poll: float = INTERRUPT_POLL_S):
         deferred.append(sig)
 
 
+def _abort_or_buffer(interrupt, buffer: list) -> bool:
+    """True iff the operator sent ABORT. Anything else is appended to `buffer`.
+
+    THE INTERRUPT CHANNEL CONSUMES. Reading it is a `readline()`, so a signal this predicate
+    inspects and discards is GONE -- and the operator was told it was delivered. So a STEER
+    seen while an action is running is kept here and drained into the next prompt by the turn
+    loop, rather than being thrown away or, worse, treated as a reason to kill the command.
+    """
+    if interrupt is None:
+        return False
+    sig = interrupt()
+    if not sig:
+        return False
+    if sig[0] == INTERRUPT_ABORT:
+        return True
+    buffer.append(sig)
+    return False
+
+
 def turn_has_discrepancy(record: "TurnRecord") -> tuple:
     """Reasons this turn's record does not reconcile, or () when it does.
 
@@ -764,6 +818,14 @@ def turn_has_discrepancy(record: "TurnRecord") -> tuple:
         why.append(f"{len(record.writes['unapplied'])} requested write(s) did not apply")
     if record.writes.get("altered"):
         why.append(f"{len(record.writes['altered'])} applied write(s) no longer match on disk")
+    # A COMMAND THAT DID NOT SUCCEED IS A DISCREPANCY WORTH THE TRACE. The turn that
+    # motivated this reported a wall-killed command as "completed successfully with exit code
+    # 0", so the exec trace is exactly what a reader needs when the prose and the record
+    # disagree. A non-zero exit is NOT itself dishonesty -- a failing test run is ordinary
+    # work -- which is why this gates the TRACE and never renders as an accusation.
+    if record.writes.get("failed_execs"):
+        why.append(f"{len(record.writes['failed_execs'])} command(s) exited non-zero or were "
+                   "killed (co-occurrence only; no relation to any claim is established)")
     bad = [c for c in record.claims
            if c["status"] in (CLAIM_CONTRADICTED, CLAIM_ALTERED)]
     if bad:
@@ -1009,7 +1071,7 @@ def verify_claims(claims, results, workdir: Path) -> tuple:
 def reconcile_writes(results) -> dict:
     """Reconcile what a turn ASKED to write against what is ON DISK at turn end.
 
-    Returns {"requested", "applied", "unapplied", "altered"}. `requested` is every WRITE
+    Returns {"requested", "applied", "unapplied", "altered", "failed_execs"}. `requested` is every WRITE
     action that parsed; `applied` those that reached disk (resolved target); `unapplied` the
     rest, each carrying the note that says WHY (verdict + reason); `altered` the applied ones
     whose bytes no longer match what was written.
@@ -1032,6 +1094,20 @@ def reconcile_writes(results) -> dict:
     A MISSING file is reported under `altered` with sha "" so a consumer reading one key sees
     both ways an applied write can fail to be there.
     """
+    # EXEC OUTCOMES ARE RECONCILED TOO, and this exists because a live run produced the first
+    # genuine false completion claim this project has measured (2026-08-05). The harness
+    # recorded `EXEC sleep 30: exit -9 (WALL-TIMEOUT, group killed)` and the leader reported
+    # "`sleep 30` completed successfully with exit code 0 and no output" -- then wrote that
+    # into its INTENT block, where the DECIDED ledger would have carried the falsehood
+    # VERBATIM into every later turn of the conversation.
+    # THE HARNESS ALREADY KNEW. The exit status was in hand and simply had no consumer: every
+    # verification built before this bound to WRITE paths, so a claim about a COMMAND had
+    # nothing to contradict it. This is a derivation, not new capture.
+    # NON-ZERO INCLUDES KILLED: a group-killed process reports a negative status (-9 for
+    # SIGKILL), so "not zero" is the right test rather than "greater than zero".
+    failed_execs = [{"command": r.arg, "exit_status": r.exit_status, "note": r.note}
+                    for r in results
+                    if r.kind == "exec" and r.ok and r.exit_status not in (None, 0)]
     requested, applied, unapplied = [], [], []
     last_hash: dict = {}
     for r in results:
@@ -1067,7 +1143,8 @@ def reconcile_writes(results) -> dict:
         if got != want:
             altered.append({"target": target, "expected": want, "found": got})
     return {"requested": tuple(requested), "applied": tuple(applied),
-            "unapplied": tuple(unapplied), "altered": tuple(altered)}
+            "unapplied": tuple(unapplied), "altered": tuple(altered),
+            "failed_execs": tuple(failed_execs)}
 
 
 LEADER_MAX_ROUNDS_PER_TURN = 8   # provisional: max act->observe cycles within one turn,
@@ -1353,6 +1430,14 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
     seen_claims: list = []       # CLAIMS declared at ANY candidate-final answer this turn
     interrupted = False          # the operator ABORTed this turn
     steered = False              # the operator sent a STEER that reached a prompt
+    mid_action_steers: list = []  # steers seen while an ACTION was running; drained per round
+    # EVERY operator message that has been READ but not yet CARRIED BY A PROMPT. The channel's
+    # read consumes, so a message living only in `notice` is lost the moment the turn ends
+    # without assembling another prompt -- which is exactly what an ABORT does. Cleared when a
+    # prompt is built; dumped into the round record, labelled undelivered, if the turn ends
+    # first. `steered` is set from THIS, at the point of delivery, so it never claims a
+    # message reached a prompt that was never assembled.
+    pending_ops: list = []
     intent_reprompted = False    # the intent notice has fired; like the zero-write one it
     #                              never fires twice, and never on the last round
     traces: list = []       # per-round bounded stderr from the leader subprocess. HELD IN
@@ -1373,12 +1458,17 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
             # the channel had reported it read.
             notice = (notice + "\n\n# OPERATOR MESSAGE (delivered mid-turn; this is the "
                       "human, not the harness)\n\n" + (sig[1] or "")).strip()
-            steered = True
+            pending_ops.append(sig[1] or "")
             event("leader_steer", round=i)
         nonce = nonce_fn()
         event("leader_round", round=i)
         prompt = _assemble_leader_prompt(ground_rules, prior_handoff, task, rounds,
                                          all_results, nonce, notice)
+        # DELIVERED. The prompt above carried `notice`, so every pending operator message is
+        # now in front of the leader -- and only here is `steered` true by its own definition.
+        if pending_ops:
+            steered = True
+            pending_ops.clear()
         notice = ""
         # RACED AGAINST THE INTERRUPT, because the model call is the LONG wait -- measured in
         # this project at a ~36s median and a 173s maximum, which is exactly the window in
@@ -1388,6 +1478,14 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
         resp, sig, deferred = await await_or_interrupt(
             call_leader(leader, prompt, workdir), interrupt)
         if sig:
+            # SAME RULE AS THE ACTION-ABORT PATH: a steer buffered during this very call was
+            # read off the channel and is about to be discarded with the turn, so it goes into
+            # the record labelled undelivered rather than vanishing.
+            undelivered = [d[1] or "" for d in deferred]
+            if undelivered:
+                rounds.append({"round": i, "notes": tuple(
+                    f"OPERATOR MESSAGE NOT DELIVERED (aborted before another prompt was "
+                    f"assembled): {t}" for t in undelivered), "leader_chars": 0})
             stop_reason = (f"aborted by operator (during a leader call, round {i}; the "
                            "in-flight response was abandoned)")
             interrupted = True
@@ -1399,7 +1497,7 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
             notice = (notice + "\n\n# OPERATOR MESSAGE (delivered mid-turn; this is the "
                       "human, not the harness)\n\n"
                       + "\n".join(d[1] or "" for d in deferred)).strip()
-            steered = True
+            pending_ops.extend(d[1] or "" for d in deferred)
             event("leader_steer", round=i)
         if not resp.get("ok"):
             stop_reason = f"leader call failed: {resp.get('error') or 'unknown'}"
@@ -1490,7 +1588,15 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
             # THE INTENT RE-PROMPT, checked AFTER the zero-write one so a turn that never
             # acted is asked about its actions before it is asked about its intentions.
             # Structural: it fires on an ABSENT or DECIDED-less block, never on what was said.
-            if intent is None and not intent_reprompted and i < max_rounds - 1:
+            # NOT AFTER A STEER. Measured live 2026-08-05: an operator steered a turn to
+            # "abandon the sleep, do not run any more commands, and reply with only the word
+            # DONE"; the leader complied, replying exactly DONE -- and this re-prompt then
+            # spent a round asking for bookkeeping, after which the leader resumed working and
+            # re-ran the command. THE HARNESS'S FORM REQUIREMENT UNDID THE HUMAN'S
+            # INSTRUCTION, which is the wrong precedence: the operator outranks the record.
+            # The absence is still recorded, so nothing is hidden -- only the extra round goes.
+            if (intent is None and not intent_reprompted and not steered
+                    and i < max_rounds - 1):
                 intent_reprompted = True
                 notice = (notice + "\n\n" + INTENT_REPROMPT).strip()   # appended, see above
                 rounds.append({"round": i,
@@ -1540,7 +1646,50 @@ async def run_leader_turn(leader: "cc.Member", task: str, workdir: Path, *,
             # that must not be pushed into a UI stream. format_turn_record makes the same
             # distinction for the same reason.
             on_action=lambda r, _i=i: event("leader_action", round=_i, action=r.kind,
-                                            target=r.arg, ok=r.ok, note=r.note))
+                                            target=r.arg, ok=r.ok, note=r.note),
+            # AN ABORT-ONLY PREDICATE, not the raw channel. `run_exec_sandbox` must kill a
+            # command ONLY on ABORT; a STEER is a message for the next prompt and must not
+            # destroy work in progress. Anything that is not an abort is BUFFERED here rather
+            # than swallowed -- the channel's readline CONSUMES, so returning False without
+            # keeping the steer would lose the operator's words after the channel had already
+            # reported them read. Drained into `notice` below.
+            should_abort=(lambda: _abort_or_buffer(interrupt, mid_action_steers))
+            if interrupt else None)
+        # DRAIN THE MID-ACTION STEERS. `_abort_or_buffer` kept anything that was not an abort
+        # while a command was running, because the channel's read CONSUMES and discarding it
+        # would lose the operator's words after they had been reported delivered. Appended,
+        # never assigned, so it cannot displace a notice already queued this round.
+        # THE ABORT IS CHECKED BEFORE THE DRAIN, and the order is the whole point. An aborted
+        # batch ENDS THE TURN, so no further prompt is ever assembled -- draining a steer into
+        # `notice` on this path would put the operator's words somewhere that is then thrown
+        # away, AND claim `steered`, whose definition is "reached a prompt". The channel's
+        # read already CONSUMED those words, so they exist nowhere else: they go into the
+        # ROUND RECORD instead, which is durable and is what the handoff is built from.
+        if any(r.kind == "aborted" for r in results):
+            unsent = tuple(f"OPERATOR MESSAGE NOT DELIVERED (the turn was aborted before "
+                           f"another prompt was assembled): {t}"
+                           for t in list(pending_ops) + [s[1] or "" for s in mid_action_steers])
+            pending_ops.clear()
+            mid_action_steers.clear()
+            all_results.extend(results)
+            # claim_notes AND parse.problems ride along here too, exactly as on the normal
+            # exit below. Omitting them would make a malformed-CLAIMS diagnostic vanish purely
+            # because an action happened to abort in the same round -- the diagnostic is about
+            # the leader's declaration, not about the command that was stopped.
+            rounds.append({"round": i,
+                           "notes": claim_notes + tuple(r.note for r in results)
+                           + tuple(f"PROBLEM: {p}" for p in parse.problems) + unsent,
+                           "leader_chars": len(text)})
+            stop_reason = f"aborted by operator (during an action, round {i})"
+            interrupted = True
+            break
+        if mid_action_steers:
+            notice = (notice + "\n\n# OPERATOR MESSAGE (sent while an action was running; "
+                      "this is the human, not the harness)\n\n"
+                      + "\n".join(s[1] or "" for s in mid_action_steers)).strip()
+            pending_ops.extend(s[1] or "" for s in mid_action_steers)
+            event("leader_steer", round=i)
+            mid_action_steers.clear()
         notes = claim_notes + tuple([r.note for r in results]
                                     + [f"PROBLEM: {p}" for p in parse.problems])
         rounds.append({"round": i, "notes": notes, "leader_chars": len(text)})

@@ -1,6 +1,15 @@
 {
   "PreToolUse": [
     {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/scripted_write_guard.py"
+        }
+      ]
+    },
+    {
       "matcher": "Write|Edit|MultiEdit|NotebookEdit",
       "hooks": [
         {

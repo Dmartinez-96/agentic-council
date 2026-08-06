@@ -165,7 +165,9 @@ def prior_handoff(cid: str) -> str:
 def decided_ledger(cid: str) -> list:
     """Every DECIDED line declared in this conversation, VERBATIM, oldest first.
 
-    Each entry is {"turn", "decided", "superseded_by"}. A decision a later turn superseded is
+    Each entry is {"turn", "decided", "superseded_by", "failed_execs"}. The last carries the
+    commands from THAT SAME TURN which exited non-zero or were killed, so a decision never
+    travels without the record that bears on it. A decision a later turn superseded is
     RETAINED AND MARKED, never deleted -- the same rule the brain vault applies to a
     superseded note, and for the same reason: that a decision was reversed is itself something
     the next turn needs to know.
@@ -181,7 +183,28 @@ def decided_ledger(cid: str) -> list:
             continue
         it = st.get("intent") or {}
         if it.get("decided"):
-            out.append({"turn": n, "decided": it["decided"], "superseded_by": []})
+            # THE RECORD TRAVELS WITH THE CLAIM. A DECIDED line is the leader's own words and
+            # is carried VERBATIM, which means a false one is carried faithfully too --
+            # MEASURED 2026-08-05, a leader wrote "the exact requested command completed
+            # successfully" for a command the harness had recorded as `exit -9, WALL-TIMEOUT,
+            # group killed`, and the ledger would have repeated that to every later turn.
+            # SO THE SAME TURN'S FAILED COMMANDS ARE ATTACHED. BE EXACT ABOUT WHAT THAT IS,
+            # because an earlier version of this comment called it "the contradicting fact"
+            # and codex was right to refuse that: a non-zero command in the same turn is NOT
+            # necessarily RELATED to this decision, let alone contradictory of it. A turn can
+            # run a failing test and then decide something unconnected to it.
+            # WHAT IS ESTABLISHED: this decision was made in a turn that also had commands
+            # which did not succeed. That is co-occurrence, not refutation.
+            # WHY IT IS STILL WORTH CARRYING: the ledger repeats a leader's words VERBATIM to
+            # every later turn, so without this a reader gets the assertion and none of the
+            # turn's outcomes. Nothing here reads the prose or judges the claim -- that would
+            # be a substring hypothesis about meaning, which this project has refused
+            # elsewhere and should refuse here.
+            failed = (st.get("writes") or {}).get("failed_execs") or []
+            out.append({"turn": n, "decided": it["decided"], "superseded_by": [],
+                        "failed_execs": [
+                            {"command": f.get("command"), "exit_status": f.get("exit_status")}
+                            for f in failed]})
         for s in it.get("supersedes") or []:
             # "turn <N> -- reason"; take the first integer as the target.
             digits = "".join(ch if ch.isdigit() else " " for ch in s).split()
@@ -226,6 +249,15 @@ def carried_context(cid: str) -> str:
             if e["superseded_by"]:
                 who = ", ".join(f"turn {s['turn']}" for s in e["superseded_by"])
                 mark = f"  [SUPERSEDED by {who}]"
+            # The caution rides WITH the line, not in a footnote a reader may not reach.
+            fx = e.get("failed_execs") or []
+            if fx:
+                # "ALSO IN THAT TURN", not "weigh this against that". The earlier wording
+                # presupposed the failed commands bore on the decision, which is precisely the
+                # relevance the code cannot establish -- and this is the string a later leader
+                # READS, so it matters more than any comment about it.
+                mark += ("  [ALSO IN THAT TURN, relevance not established: " + ", ".join(
+                    f"`{f['command']}` exited {f['exit_status']}" for f in fx[:3]) + "]")
             lines.append(f"- turn {e['turn']}: {e['decided']}{mark}")
         parts.append("## DECISIONS THIS CONVERSATION HAS MADE (verbatim; superseded ones are\n"
                      "## kept and marked, because a reversal is information)\n" + "\n".join(lines))

@@ -47,7 +47,7 @@ class EngineRun:
 
     def __init__(self, args: list[str], stdin_text: str = "",
                  python: str | None = None, engine: Path | None = None,
-                 control: bool = False) -> None:
+                 control: bool = False, interrupt: bool = False) -> None:
         self.args = list(args)
         self.stdin_text = stdin_text
         self.python = python or sys.executable
@@ -57,6 +57,12 @@ class EngineRun:
         # stdin carries the task and is closed immediately after, so a child reading
         # decisions there would see EOF and silently decline every write.
         self.control = control
+        # AN INTERRUPT CHANNEL is a THIRD pipe, and it is separate from `control` on purpose:
+        # control is a BLOCKING request/response the child reads expecting the answer to a
+        # specific approval, so an operator's ABORT or STEER arriving there would be consumed
+        # as that answer and silently decline a write the council had permitted.
+        self.interrupt = interrupt
+        self._interrupt_w = None
         self._control_w: int | None = None
         self.proc: subprocess.Popen | None = None
         self.returncode: int | None = None
@@ -95,6 +101,16 @@ class EngineRun:
             argv += ["--control-fd", str(cr)]
             passed.append(cr)
             self._control_w = cw
+        # A SECOND, SEPARATE PIPE for operator interrupts. NOT the control pipe: that one is a
+        # BLOCKING request/response for write approvals, and the child reads it expecting an
+        # answer to a specific question -- a steering message arriving there would be consumed
+        # as that answer and silently decline a write the council had permitted.
+        ir = iw = None
+        if self.interrupt:
+            ir, iw = os.pipe()
+            argv += ["--interrupt-fd", str(ir)]
+            passed.append(ir)
+            self._interrupt_w = iw
         try:
             self.proc = subprocess.Popen(
                 argv, stdin=subprocess.PIPE, stdout=out_f, stderr=err_f,
@@ -104,15 +120,21 @@ class EngineRun:
                 start_new_session=True)
         except OSError as e:
             os.close(r); os.close(w)
-            for fd in (cr, cw):
+            # ir/iw belong here too: a spawn failure that closed only the control pair would
+            # leak the interrupt pair for the life of the GUI, and a leaked write end also
+            # keeps a reader from ever seeing EOF.
+            for fd in (cr, cw, ir, iw):
                 if fd is not None:
                     os.close(fd)
             self._control_w = None
+            self._interrupt_w = None
             out_f.close(); err_f.close()
             self.start_error = f"could not start the engine: {e}"
             return
         if cr is not None:
             os.close(cr)                # the CHILD owns the read end now
+        if ir is not None:
+            os.close(ir)                # likewise: the CHILD owns the interrupt read end
         # The PARENT's copy of the write end must go, or the read below never sees EOF
         # when the engine exits, and the caller hangs forever.
         os.close(w)
@@ -162,6 +184,23 @@ class EngineRun:
                         pass
             self._out_f = self._err_f = None
             self._close_control()
+
+    def send_interrupt(self, line: str) -> bool:
+        """Send ABORT or 'STEER <text>'. Returns False if it could not be sent.
+
+        UNLIKE send_control THERE IS NO SAFE DEFAULT to fall back on: a control answer that
+        does not arrive means the write is declined, which errs toward doing nothing, whereas
+        an interrupt that does not arrive means the turn KEEPS RUNNING. So False here must be
+        surfaced to the operator rather than swallowed -- otherwise a stop button silently
+        does nothing.
+        """
+        if self._interrupt_w is None:
+            return False
+        try:
+            os.write(self._interrupt_w, (line.rstrip("\n") + "\n").encode())
+            return True
+        except OSError:
+            return False
 
     def send_control(self, line: str) -> bool:
         """Answer a question the child is blocking on. Returns False if it cannot be sent.

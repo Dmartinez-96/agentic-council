@@ -4848,6 +4848,11 @@ EXEC_SPILL_DIRNAME = ".council_exec_logs"   # subdir of scratch holding full spi
 #       disk. 256 MiB is a judgement call and is the one number here the user may want to move.
 EXEC_SPILL_CAP = EXEC_FSIZE_MB * 1024 * 1024
 EXEC_SPILL_DISK_RESERVE = 256 * 1024 * 1024
+# How often the exec drain loop checks the operator interrupt channel, when one is supplied.
+# It bounds the SELECT WAIT only -- never the command's wall-clock budget, which is still the
+# deadline's job. Matched to the turn loop's own poll so a stop feels the same wherever it
+# lands. Costs one extra select wakeup per interval on a job that is otherwise silent.
+EXEC_INTERRUPT_POLL_S = 0.25
 
 # ELEVATED BOUNDS ARE INHERITED FROM THE HOST, NOT INVENTED HERE, and that is the user's
 # correction: "why have caps at all and not just use the system limit caps?". An earlier
@@ -5168,7 +5173,8 @@ def spill_take(chunk_len: int, spilled: int, ceiling: int) -> tuple[int, bool]:
 
 def run_exec_sandbox(command: str, workdir: Path, *,
                      profile: ExecProfile | None = None,
-                     scratch: Path | None = None) -> tuple[str | None, str, dict | None]:
+                     scratch: Path | None = None,
+                     should_abort=None) -> tuple[str | None, str, dict | None]:
     """Run `command` via `sh -c` in a bubblewrap sandbox over a scrubbed ephemeral copy of
     workdir, bounded by `profile`. Fail-closed if bubblewrap/userns is unavailable or the
     profile cannot be honoured on this host.
@@ -5382,6 +5388,10 @@ def run_exec_sandbox(command: str, workdir: Path, *,
         spill_capped = False
         deadline = time.monotonic() + profile.wall_timeout
         timedout = False
+        # DISTINCT FROM timedout ON PURPOSE: "the operator stopped it" and "it ran too long"
+        # are different facts about the same dead process, and a reader who cannot tell them
+        # apart will draw the wrong conclusion about a command that was killed.
+        aborted = False
         fd = p.stdout.fileno()
         try:
             # Read to EOF or the wall deadline, keeping the first `head_budget` bytes and the
@@ -5395,10 +5405,32 @@ def run_exec_sandbox(command: str, workdir: Path, *,
                 if remaining <= 0:
                     timedout = True
                     break
-                r, _, _ = select.select([fd], [], [], remaining)
-                if not r:
-                    timedout = True
+                # POLLED EVERY ITERATION, NOT ONLY ON A QUIET SELECT. A command that prints
+                # continuously keeps the descriptor readable, so a select that never times out
+                # would never reach an interrupt check -- and a long, chatty job is exactly
+                # what an operator reaches for the stop button during.
+                # ABORT-ONLY PREDICATE, and the name says so. `should_abort()` must return
+                # truthy ONLY when the command should be killed. It is NOT the raw interrupt
+                # channel: that carries two verbs, and a STEER is a message for the leader's
+                # next prompt, never a reason to destroy work in progress. Discriminating here
+                # would also mislabel the kill -- an earlier version fired on any truthy
+                # signal and would have reported a steer as "ABORTED BY OPERATOR".
+                # THE CALLER OWNS THE VERB. This layer stays free of the leader's vocabulary,
+                # and the caller is responsible for buffering anything it swallows.
+                if should_abort is not None and should_abort():
+                    aborted = True
                     break
+                # THE WAIT IS BOUNDED BUT THE VERDICT IS NOT. `timedout` is set ONLY by the
+                # deadline test above; an empty select merely means nothing arrived in this
+                # slice. Treating an empty poll as a timeout -- which the previous shape did,
+                # because it waited the WHOLE remaining budget -- would kill any command that
+                # went quiet for one poll interval. A build that compiles silently for a
+                # minute is not a hung build.
+                wait = (remaining if should_abort is None
+                        else min(remaining, EXEC_INTERRUPT_POLL_S))
+                r, _, _ = select.select([fd], [], [], wait)
+                if not r:
+                    continue
                 chunk = os.read(fd, 65536)
                 if not chunk:
                     break   # EOF: the process finished writing
@@ -5468,6 +5500,7 @@ def run_exec_sandbox(command: str, workdir: Path, *,
         text = raw.decode("utf-8", errors="replace")
         note = (f"exit {p.returncode}, {total} bytes read"
                 + (" (WALL-TIMEOUT, group killed)" if timedout else "")
+                + (" (ABORTED BY OPERATOR, group killed)" if aborted else "")
                 + (f", output truncated ({discarded} bytes dropped from the MIDDLE; head and "
                    "tail kept, and the command was NOT killed for it)" if capped else "")
                 + (f"; output spilled to {spill_path} ({spilled} bytes)"
@@ -5486,7 +5519,7 @@ def run_exec_sandbox(command: str, workdir: Path, *,
                 + (f"; profile {profile.name}" if profile != default_exec_profile() else ""))
         # `note` is delivered to members and quoted in logs; `info` is the same facts in a
         # form a caller can compare.
-        info = {"exit_status": p.returncode, "timed_out": timedout,
+        info = {"exit_status": p.returncode, "timed_out": timedout, "aborted": aborted,
                 "truncated": capped, "bytes_read": total,
                 "discarded": discarded, "profile": profile.name,
                 # READ `spill_capped` BEFORE `exit_status`, for the same reason `timed_out`
@@ -6449,7 +6482,19 @@ def write_log(layer: str, tool_name: str | None, target_path: str | None,
             for r in (shadow_results or [])
         ],
     }
-    log_path.write_text(json.dumps(entry, indent=2, default=str))
+    # WRITTEN VIA tmp+os.replace, so a reader never sees a half-written entry. A plain
+    # write_text returns clean even if the process dies mid-write, and the truncated JSON then
+    # fails at ANALYSIS time -- silently, long afterwards, in whatever tool parses the corpus
+    # (council_gui_engine, stop_audit, the quorum probe).
+    # THIS IS INSURANCE, NOT A BUG FIX, and the distinction is measured: 363 of 363 existing
+    # log entries parse, so this has never once bitten. It is being done now because operator
+    # ABORT introduces a NEW way to kill a process mid-write, which is what makes a latent
+    # hazard reachable. The user ruled it lands with the interruption work.
+    # os.replace is atomic WITHIN A FILESYSTEM; the temp file is created beside the target
+    # rather than in /tmp precisely so that holds.
+    tmp = log_path.with_suffix(log_path.suffix + ".partial")
+    tmp.write_text(json.dumps(entry, indent=2, default=str))
+    os.replace(tmp, log_path)
     return log_path
 
 

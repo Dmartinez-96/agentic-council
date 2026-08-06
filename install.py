@@ -77,12 +77,19 @@ COUNCIL_FILES = [
     "council_gui_engine.py",
     "council_leader_run.py",
     "council_leader.py",
+    # council_leader_run imports this at module scope for multi-turn conversations, so an
+    # install that omits it raises ModuleNotFoundError on every leader turn -- a hard
+    # dependency, exactly like council_events.py above.
+    "council_session.py",
     "council_advisor.py",
     "council_dialogue.py",
     "council_outcome.py",
     "council_audit_writes.py",
     "council_shadow_audit.py",
     "laziness_gate.py",
+    # PreToolUse advisory on Bash. The settings template wires a hook to this path, so an
+    # install that omits it points a hook at a missing file.
+    "scripted_write_guard.py",
     "stop_audit.py",
     "session_start_probe.py",
     "session_start_directive.py",

@@ -217,10 +217,11 @@ class FireWorker(QObject):
     finished = Signal(object)
 
     def __init__(self, args: list[str], stdin_text: str = "",
-                 engine: Path | None = None, control: bool = False) -> None:
+                 engine: Path | None = None, control: bool = False,
+                 interrupt: bool = False) -> None:
         super().__init__()
         self.run = ge.EngineRun(args, stdin_text=stdin_text, engine=engine,
-                                control=control)
+                                control=control, interrupt=interrupt)
 
     def start(self) -> None:
         for rec in self.run.stream():
@@ -983,9 +984,21 @@ class LeaderTab(QWidget):
         self.go = QPushButton("Run turn"); self.go.clicked.connect(self.start)
         self.stop = QPushButton("Stop"); self.stop.clicked.connect(self.cancel)
         self.stop.setEnabled(False)
+        # ABORT AND STOP ARE DIFFERENT, and both are offered because they fail differently.
+        # STOP kills the process group: nothing is written, no handoff is authored, and a
+        # conversation loses the turn entirely. ABORT asks the turn to end: the running
+        # command is killed, remaining actions are skipped, and the record and handoff are
+        # still produced -- so a conversation keeps what the turn actually did. Stop is the
+        # hammer for a wedged process; Abort is the one to reach for first.
+        self.abort = QPushButton("Abort turn"); self.abort.clicked.connect(self.send_abort)
+        self.abort.setEnabled(False)
+        self.steer = QLineEdit(); self.steer.setPlaceholderText(
+            "steer the turn (delivered at the next prompt) -- press Enter")
+        self.steer.returnPressed.connect(self.send_steer)
+        self.steer.setEnabled(False)
         self.state = QLabel("idle")
         for w in (QLabel("mode"), self.mode, QLabel("workdir"), self.workdir, self.gpu,
-                  self.go, self.stop, self.state):
+                  self.go, self.stop, self.abort, self.steer, self.state):
             row.addWidget(w)
         lay.addLayout(row)
 
@@ -1028,20 +1041,53 @@ class LeaderTab(QWidget):
         # launch, so disabling it changes no behaviour; it stops the display from
         # contradicting the running turn. on_finished restores it on every exit path.
         self.go.setEnabled(False); self.stop.setEnabled(True); self.mode.setEnabled(False)
+        self.abort.setEnabled(True); self.steer.setEnabled(True)
         self.state.setText("running")
         args = ["--task", task, "--workdir", self.workdir.text().strip() or str(COUNCIL_ROOT),
                 "--mode", self.mode.currentText()]
         if self.gpu.isChecked():
             args.append("--gpu")
         need_control = self.mode.currentText() == "approve-each"
+        # ALWAYS an interrupt channel for a leader turn, in every mode. Stopping is not a
+        # mode-specific privilege, and a plan-only turn can still spend an hour in an EXEC.
         self.worker = FireWorker(args, engine=COUNCIL_ROOT / "council_leader_run.py",
-                                 control=need_control)
+                                 control=need_control, interrupt=True)
         self.thread = QThread()
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.start)
         self.worker.event.connect(self.on_event)
         self.worker.finished.connect(self.on_finished)
         self.thread.start()
+
+    def send_abort(self) -> None:
+        """Ask the turn to end gracefully. Unlike Stop, the record and handoff still land."""
+        if self.worker is None:
+            return
+        # A FAILED SEND IS REPORTED, NEVER SWALLOWED, and that is the difference from an
+        # approval: a control answer that goes missing DECLINES the write, erring toward doing
+        # nothing, whereas an interrupt that goes missing leaves the turn RUNNING. An operator
+        # who pressed Abort and saw nothing would reasonably conclude it had stopped.
+        if self.worker.run.send_interrupt("ABORT"):
+            self.state.setText("aborting")
+            self.out.appendPlainText("[operator] ABORT sent -- the turn will end and still "
+                                     "write its record and handoff")
+        else:
+            self.out.appendPlainText("[operator] ABORT COULD NOT BE SENT -- the turn is "
+                                     "STILL RUNNING. Use Stop to kill the process group.")
+
+    def send_steer(self) -> None:
+        """Send a message to the leader without stopping the turn."""
+        if self.worker is None:
+            return
+        msg = self.steer.text().strip()
+        if not msg:
+            return
+        if self.worker.run.send_interrupt(f"STEER {msg}"):
+            self.steer.clear()
+            self.out.appendPlainText(f"[operator] STEER queued: {msg}")
+        else:
+            self.out.appendPlainText("[operator] STEER COULD NOT BE SENT -- the leader will "
+                                     "not see it.")
 
     def cancel(self) -> None:
         if self.worker is not None:
@@ -1192,6 +1238,9 @@ class LeaderTab(QWidget):
         # shape of bug that survives testing because nothing raises. This runs on the failed,
         # cancelled and completed paths alike, since all three land here.
         self.go.setEnabled(True); self.stop.setEnabled(False); self.mode.setEnabled(True)
+        # DISABLED WITH THE REST. An Abort button live after the turn ended would write into a
+        # closed pipe and report a failure the operator cannot act on.
+        self.abort.setEnabled(False); self.steer.setEnabled(False)
         if run.start_error:
             self.state.setText("failed"); self.out.appendPlainText(run.start_error)
         elif run.cancelled:
