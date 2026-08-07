@@ -1,0 +1,17 @@
+{
+  "leader": {"name": "claude", "transport": "claude_subprocess", "model": "claude-opus-5"},
+  "members": [
+    {"name": "codex", "tier": "voting", "transport": "codex_subprocess", "model": "gpt-5.6-sol", "fallback_model": "openai/gpt-5.6-sol"},
+    {"name": "gemini", "tier": "voting", "transport": "openrouter", "model": "google/gemini-3.6-flash", "fallback_model": "google/gemini-3.5-flash"},
+    {"name": "deepseek", "tier": "voting", "transport": "openrouter", "model": "deepseek/deepseek-v4-pro", "fallback_model": "deepseek/deepseek-v4-flash"},
+    {"name": "kimi", "tier": "voting", "transport": "openrouter", "model": "moonshotai/kimi-k3", "fallback_model": "moonshotai/kimi-k2-thinking"},
+    {"name": "glm", "tier": "voting", "transport": "openrouter", "model": "z-ai/glm-5.2", "fallback_model": "z-ai/glm-5.1"},
+    {"name": "grok", "tier": "voting", "transport": "openrouter", "model": "x-ai/grok-4.5", "fallback_model": "x-ai/grok-4.3"},
+    {"name": "hunyuan", "tier": "inspector", "transport": "openrouter", "model": "tencent/hy3", "fallback_model": "tencent/hy3-preview"},
+    {"name": "qwen", "tier": "inspector", "transport": "openrouter", "model": "qwen/qwen3.8-max", "fallback_model": "qwen/qwen3.7-max"},
+    {"name": "minimax", "tier": "inspector", "transport": "openrouter", "model": "minimax/minimax-m3", "fallback_model": "minimax/minimax-m2.7"},
+    {"name": "mimo", "tier": "inspector", "transport": "openrouter", "model": "xiaomi/mimo-v2.5-pro", "fallback_model": "xiaomi/mimo-v2.5"},
+    {"name": "nemotron", "tier": "inspector", "transport": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b", "fallback_model": "nvidia/nemotron-3-super-120b-a12b"},
+    {"name": "mistral", "tier": "inspector", "transport": "openrouter", "model": "mistralai/mistral-medium-3-5", "fallback_model": "mistralai/mistral-medium-3.1"}
+  ]
+}

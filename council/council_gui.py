@@ -28,6 +28,7 @@ showing member text below therefore uses setPlainText, never rich text.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -43,7 +44,88 @@ from PySide6.QtWidgets import (
 import council_gui_engine as ge
 
 COUNCIL_ROOT = Path(__file__).resolve().parent
-ROSTER_PATH = COUNCIL_ROOT / "roster.json"
+
+
+def _roster_path() -> Path:
+    """The roster file THIS PROCESS will read and write.
+
+    The override is read HERE FIRST rather than only via the engine. A first version
+    asked the engine and fell back to a bare `roster.json`, and the council caught the
+    hole: `except Exception` is much broader than "cannot be imported" -- it also swallows
+    an import-time error or an AttributeError -- so with COUNCIL_ROSTER_PATH SET and the
+    import failing for any reason, the fallback silently ignored the override and
+    disagreed with the engine. Reading the variable directly makes the override survive
+    every failure mode; the engine is still asked for the no-override answer so the
+    default lives in one place.
+    """
+    override = os.environ.get("COUNCIL_ROSTER_PATH")
+    if override:
+        p = Path(override).expanduser()
+        return p if p.is_absolute() else COUNCIL_ROOT / p
+    try:
+        import consult_council as cc
+        return cc.ROSTER_PATH
+    except Exception:
+        return COUNCIL_ROOT / "roster.json"
+
+
+def hook_roster_path(harness: str | None = None) -> Path:
+    """The roster a HOOK-DRIVEN fire will read, which is NOT necessarily this GUI's.
+
+    THE BUG THIS EXISTS FOR IS STILL OPEN, and the honest statement is that this function
+    REPORTS it rather than fixing it. `hook_env.sh` exports
+    COUNCIL_ROSTER_PATH=roster.<harness>-led.json and every hook runs through that
+    wrapper, but THE GUI DOES NOT: `vscode-extension/src/extension.ts` `launchGui()`
+    spawns `cp.spawn(python, [script])` on council_gui.py directly, with no wrapper.
+    A GUI LAUNCHED THAT WAY RESOLVES `roster.json`, AND BOTH ROUTES THROUGH _roster_path()
+    AGREE ON IT -- which is the part a reviewer rightly asked to be sourced rather than
+    asserted. With COUNCIL_ROSTER_PATH unset, consult_council.py's else-branch sets
+    `ROSTER_PATH = COUNCIL_ROOT / "roster.json"`, so the engine-import route returns
+    roster.json; and the `except` fallback returns the same literal. The claim therefore
+    holds in the NORMAL case, not merely the degraded one. Meanwhile the hooks read
+    `roster.<harness>-led.json`, so a bench edited and saved here is not the bench the
+    next fire uses.
+    A CORRECTION KEPT ON PURPOSE: an earlier draft of this docstring said "no launcher
+    script and no .desktop entry references council_gui.py" and called it measured. That
+    was FALSE -- the extension above is exactly such a launcher, and the council caught
+    it. The conclusion did not change (that launcher spawns bare, so the mismatch is real
+    and is now sourced rather than assumed), but the evidence behind it was wrong, which
+    is the more dangerous half.
+
+    WHY THIS ONLY WARNS AND DOES NOT REDIRECT THE SAVE: choosing which file the GUI writes
+    is a configuration decision with real consequences either way, not a defect with one
+    correct answer. Silently switching the destination would surprise anyone who has been
+    editing roster.json on purpose. So the mismatch is SURFACED, matching the ruling
+    already made for the family-overlap banner: announce loudly, block nothing.
+
+    This DOES duplicate hook_env.sh's naming rule, which is the drift engine_rules()
+    warns about, and the duplication is deliberate and bounded: the GUI cannot ask a shell
+    wrapper it never invokes. If that naming changes in hook_env.sh, change it here too.
+    """
+    # RESOLVED FROM THE ENVIRONMENT, not hardcoded. hook_env.sh exports COUNCIL_HARNESS
+    # alongside COUNCIL_ROSTER_PATH, so when this GUI was launched through the wrapper the
+    # harness is KNOWN. A hardcoded "claude" compared a codex-led install against
+    # roster.claude-led.json and would have raised a FALSE mismatch -- caught by a layer-2
+    # inspector, and it matters here because codex-led is an active configuration in this
+    # project, not a hypothetical one.
+    # ON A BARE LAUNCH THE HARNESS IS NOT KNOWABLE: no hook has run and nothing records
+    # which one will. "claude" is hook_env.sh's own default, so the two agree wherever an
+    # answer exists at all -- but a bare-launched GUI on a codex-only install can still
+    # name the wrong file, and that is a real limit of warning from outside the wrapper.
+    # PRESERVE-IF-SET COMES FIRST, mirroring the wrapper: hook_env.sh only assigns the
+    # harness-led default when COUNCIL_ROSTER_PATH is EMPTY, so an explicitly exported
+    # value is what the hooks actually read. Without this the helper cried wolf in the one
+    # case where the user had already made the GUI and the hooks agree -- a false alarm in
+    # the function whose entire job is to prevent one. Caught by the council.
+    override = os.environ.get("COUNCIL_ROSTER_PATH")
+    if override:
+        p = Path(override).expanduser()
+        return p if p.is_absolute() else COUNCIL_ROOT / p
+    harness = harness or os.environ.get("COUNCIL_HARNESS") or "claude"
+    return COUNCIL_ROOT / f"roster.{harness}-led.json"
+
+
+ROSTER_PATH = _roster_path()
 BRAIN_DIR = COUNCIL_ROOT / "_brain"
 
 # Only these marker files may be toggled -- a whitelist, so no code path here can create
@@ -92,7 +174,7 @@ PRESET_LAYOUTS = {
     "Claude leads": ("claude", ["codex", "gemini", "deepseek", "kimi", "grok", "glm"]),
     "Codex leads": ("codex", ["claude", "gemini", "deepseek", "kimi", "grok", "glm"]),
 }
-PRESET_INSPECTORS = ["muse", "qwen", "minimax", "mimo", "nemotron", "mistral"]
+PRESET_INSPECTORS = ["hunyuan", "qwen", "minimax", "mimo", "nemotron", "mistral"]
 
 
 def preset_roster(label: str) -> dict | None:
@@ -283,6 +365,20 @@ class ConfigTab(QWidget):
         self.leader_transport.currentIndexChanged.connect(
             lambda _i: self._leader_cascade())
         lay.addWidget(leader_box)
+
+        # FAMILY-OVERLAP BANNER. The user's ruling of 2026-08-05: a single-family bench is
+        # a LEGITIMATE configuration (someone may genuinely want a council of claudes), so
+        # this warns LOUDLY and blocks NOTHING. Hidden entirely when there is nothing to
+        # say, because a banner that is always present is a banner nobody reads.
+        # The text is built from the ENGINE's structured overlap field, never from a
+        # second family rule computed here -- a duplicated rule is the drift this file's
+        # own engine_rules() docstring records being bitten by twice.
+        self.overlap_banner = QLabel("")
+        self.overlap_banner.setWordWrap(True)
+        self.overlap_banner.setStyleSheet(
+            "background:#8a4b00; color:#ffffff; padding:6px; border-radius:4px;")
+        self.overlap_banner.hide()
+        lay.addWidget(self.overlap_banner)
 
         # RETRIEVAL BUDGET. The user's ruling of 2026-08-03: 128k is the right default, but the
         # user must be able to raise it per install. The value, its default and its bounds all
@@ -571,6 +667,59 @@ class ConfigTab(QWidget):
         # change signal when it was already 0, and the harness case still has to disable
         # the two fields.
         self._leader_cascade()
+        # FAMILY OVERLAP, rendered from the engine's structured field. Nothing here
+        # recomputes what a family is; if the field is absent (an older engine) the banner
+        # simply stays hidden rather than guessing.
+        ov = data.get("leader_family_overlap") or {}
+        parts = []
+        if ov.get("voting"):
+            parts.append(f"VOTING seats share the leader's family ({ov.get('family')}): "
+                         f"{', '.join(ov['voting'])} -- these vote on the leader's own "
+                         f"writes")
+        if ov.get("inspector"):
+            parts.append(f"inspector seats in the same family: "
+                         f"{', '.join(ov['inspector'])} (advisory, changes no verdict)")
+        if ov.get("undetermined"):
+            parts.append(f"family UNDETERMINED for {', '.join(ov['undetermined'])} -- not "
+                         f"a clean bill of health, these could not be compared at all")
+        notices = []
+        if parts:
+            notices.append(
+                "LEADER/MEMBER FAMILY OVERLAP -- allowed, nothing is blocked; shown so "
+                "the result is not mistaken for independent review. " + "; ".join(parts)
+                + ".")
+        # ROSTER DESTINATION MISMATCH. Not a family question at all, but the same class of
+        # hazard and so it shares the banner: a configuration that does not mean what the
+        # user thinks. Raised whenever the two paths DIFFER -- see the note below for why
+        # existence is deliberately not part of the test.
+        hookp = hook_roster_path()
+        if hookp != ROSTER_PATH:
+            # NO exists() GATE, and its removal is a fix rather than a tightening. An
+            # earlier version warned only when hookp ALREADY existed, reasoning that a
+            # fresh install has "no divergence to warn about". That is backwards: on a
+            # fresh install the hooks route to hookp on their FIRST fire, so edits saved
+            # here are lost from the very beginning -- the gate hid the case where the
+            # warning was most useful. The honest test is whether the two paths DIFFER,
+            # not whether one of them happens to exist yet.
+            # AND THE TEXT HEDGES WHAT IT CANNOT KNOW. Without COUNCIL_HARNESS this window
+            # was not launched through the wrapper, so which harness will run is genuinely
+            # unknowable from here and "claude" is only hook_env.sh's default. Stating the
+            # filename flatly would name the wrong file on a codex-led install -- the code
+            # knew it might be wrong while the user saw a definitive claim.
+            assumed = "" if os.environ.get("COUNCIL_HARNESS") else (
+                " -- assuming the 'claude' harness, since this window was not launched "
+                "through hook_env.sh and which harness will run cannot be known from here")
+            notices.append(
+                f"ROSTER MISMATCH: this window edits and saves {ROSTER_PATH.name}, but "
+                f"hooks run through hook_env.sh and would read {hookp.name}{assumed}. A "
+                f"bench saved here is NOT the bench your next PostToolUse review uses. To "
+                f"edit that one, launch this GUI through hook_env.sh (or export "
+                f"COUNCIL_ROSTER_PATH).")
+        if notices:
+            self.overlap_banner.setText("  ||  ".join(notices))
+            self.overlap_banner.show()
+        else:
+            self.overlap_banner.hide()
         # RETRIEVAL BUDGET, seeded from the engine. Bounds first, then the value: setValue
         # CLAMPS to the current range, so seeding a 128,000 default into a spin box still
         # holding Qt's stock 0..99 maximum would silently store 99. Signals are blocked
@@ -1022,10 +1171,42 @@ class LeaderTab(QWidget):
                 f"leader: {leader.get('name')} ({leader.get('transport')} "
                 f"{leader.get('model') or ''}) -- writes go through the council wall")
         else:
-            self.leader_label.setText(
-                "No council-native leader is configured. The Claude Code harness leads by "
-                "default and this tab cannot drive it -- set a leader in the Config tab "
-                "(roster.json's top-level `leader` key) to run turns from here.")
+            # THREE DIFFERENT CAUSES, and the old single message covered all of them
+            # badly. Since DEFAULT_LEADER shipped, an ABSENT roster.json yields a leader,
+            # so arriving here means one of: the ENGINE could not be read at all, the
+            # roster was REJECTED, or the roster deliberately omits `leader`. Each needs a
+            # different action, and all three are distinguishable from the payload:
+            # `error` (engine unreadable), then `errors` (roster rejected), then the
+            # residual case where neither is present and no leader transport was returned.
+            if (data or {}).get("error"):
+                # THE ENGINE FAILED: ge.print_roster returns {"error": ...} on a launch
+                # failure, timeout or non-zero exit, and refresh_leader (unlike
+                # ConfigTab.reload, which guards at its top) has no such guard. Nothing
+                # about roster.json is KNOWN on this path, so say that.
+                # PROVENANCE, checkable rather than asserted: a draft of this branch
+                # claimed "no top-level `leader`" on the engine-failure path -- a false
+                # claim about a file that had never been read. Both layers flagged it in
+                # logs/2026-08-06/20260806T124309Z-6fe7c77c.json.
+                self.leader_label.setText(
+                    f"Could not read the roster from the engine: {data['error']}. "
+                    "Whether a leader is configured is UNKNOWN -- this is not a statement "
+                    "about roster.json's contents.")
+                return
+            errs = (data or {}).get("errors") or []
+            if errs:
+                self.leader_label.setText(
+                    "roster.json was REJECTED, so no leader is active and this tab cannot "
+                    f"run turns. First error: {errs[0]} -- fix it in the Config tab. The "
+                    "council falls back to the built-in default bench, so fires still "
+                    "run on the panel the engine chose rather than the one you configured.")
+            else:
+                self.leader_label.setText(
+                    "This roster.json has no top-level `leader`, so the Claude Code "
+                    "harness leads and this tab cannot drive it. To run turns from here, "
+                    "set one in the Config tab -- transport `claude_subprocess` with name "
+                    "`claude` is the leader shipped by default when there is no "
+                    "roster.json at all. This says nothing about whether the hooks are "
+                    "active; a leader and the PostToolUse review are separate paths.")
 
     def start(self) -> None:
         task = self.task.toPlainText().strip()
@@ -1137,6 +1318,28 @@ class LeaderTab(QWidget):
             text = str(rec.get("text") or "").rstrip()
             if text:
                 self.out.appendPlainText(text)
+        elif ev == "leader_family_overlap":
+            # Announced ONCE, at seat time, before any round. Never blocking: a
+            # single-family bench is a legitimate configuration. Rendered here so an
+            # operator watching a turn scroll past sees WHY the verdicts that follow may
+            # not be independent -- the Config tab's banner is only seen by someone who
+            # went looking at the roster.
+            voting = rec.get("voting") or []
+            inspector = rec.get("inspector") or []
+            undet = rec.get("undetermined") or []
+            bits = []
+            if voting:
+                bits.append(f"VOTING: {', '.join(voting)}")
+            if inspector:
+                bits.append(f"inspectors: {', '.join(inspector)}")
+            if undet:
+                bits.append(f"UNDETERMINED: {', '.join(undet)}")
+            self.out.appendPlainText(
+                f"[leader family overlap] {rec.get('leader')} is family "
+                f"{rec.get('family') or '?'}; same family on its own review panel -- "
+                + "; ".join(bits)
+                + ". Allowed and not blocked; shown so the result is not mistaken for "
+                  "independent review.")
         elif ev == "leader_reprompt":
             # The turn tried to END here with no WRITE ever emitted, and the harness sent it
             # back once. Shown because the alternative is a round that reads, in the live

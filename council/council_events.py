@@ -88,6 +88,12 @@ from typing import Any, Callable
 #   final_verdict    verdict, log_path
 #   dropped          n -- records lost while the consumer was behind (emitted by us)
 #   note             text -- free-form diagnostics
+#   leader_family_overlap  leader, family, voting[], inspector[], undetermined[] -- the
+#                    seated leader shares a model FAMILY with seats on its own review
+#                    panel. ADVISORY AND NEVER BLOCKING (a single-family bench is a valid
+#                    configuration); it exists so the result is not mistaken for
+#                    independent review. `undetermined` lists seats whose family could not
+#                    be resolved, which a consumer must NOT render as "no overlap"
 # THIS LIST HAD GONE STALE, which is worth stating rather than quietly correcting: it is
 # referenced by nothing (grep: this line is its only occurrence), so it is documentation and
 # unenforced documentation at that. SIX names were missing when this was written --
@@ -103,6 +109,7 @@ EVENT_NAMES = (
     "member_corrected", "round_finished", "tool_request", "leader_action",
     "leader_round", "leader_text", "leader_problem", "leader_reprompt", "leader_steer",
     "leader_action_final", "approval_request", "final_verdict", "dropped", "note",
+    "leader_family_overlap",
 )
 
 FIELD_MAX = 4000            # chars per string field before truncation

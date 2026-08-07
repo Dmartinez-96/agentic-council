@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -580,6 +581,292 @@ def target_path_for_log(tool_name: str, tool_input: dict) -> str:
     return ""
 
 
+# --- PENDING-REVIEW MARKERS: making a LOST review distinguishable from a PASS -
+#
+# THE DEFECT THIS EXISTS FOR, measured 2026-08-06 and not inferred. Comparing every
+# successful Write/Edit in two session transcripts against the fires in logs/:
+#     Noumad session  250 successful writes -> 162 council fires   (35% lost)
+#     Council session 522 successful writes -> 376 council fires   (27% lost)
+# `evidence_logger.py` sits on the IDENTICAL PostToolUse matcher and recorded 252 of 252
+# writes for the first session, so the hook system fires reliably and it is THIS script
+# that goes missing. And because a PASS returns 0 in silence (see below), a review that
+# never happened is byte-identical, from the agent's side, to a review that approved.
+# That is the project's own rule-12 hazard arriving structurally rather than through a
+# scripted write: absence of a verdict reads as approval.
+#
+# WHAT THIS DOES: write a marker BEFORE the council subprocess starts and delete it after
+# the subprocess returns -- by ANY route, including a timeout or a non-zero exit. A marker
+# that outlives its process therefore means exactly one thing: THIS PROCESS DIED BETWEEN
+# THOSE TWO POINTS, taking an unfinished review with it. Nothing else produces one.
+#
+# WHY DELETE-ON-EVERY-RETURN AND NOT ONLY ON SUCCESS. The question a marker answers is
+# "did the review COMPLETE", not "did it pass". A wrapper that exits 3 completed and said
+# so, and its notice already reaches the agent; leaving a marker for it would report a
+# second, phantom failure for an event the agent was already told about.
+#
+# WHY A KILL LEAVES ONE BEHIND, which is the whole mechanism: SIGKILL runs no handlers at
+# all, and Python's default SIGTERM disposition terminates without unwinding, so neither
+# runs a `finally`. The marker survives precisely in the cases that are otherwise silent.
+# It is written with fsync BEFORE the subprocess launches so a kill cannot lose it to
+# buffering.
+#
+# WHAT A MARKER DOES NOT ESTABLISH: why the process died. It proves a review was started
+# and did not finish; it names no cause. The leading hypothesis is that the harness kills
+# long-running hooks (hook-driven fires show a p99 of 579s and only one above 600s, while
+# manual runs reach 1459s), but that is UNCONFIRMED and this instrument is deliberately
+# agnostic to it -- it measures the loss, whatever causes it.
+PENDING_DIRNAME = "pending-review"
+# An orphan younger than this may simply be a fire still running in a concurrent hook --
+# concurrency SERIALIZES fires rather than dropping them (measured: 4 concurrent advisors
+# all logged, but wall time went 81s -> 326s), so a live sibling is expected and must not
+# be reported as a loss. 900s matches the wrapper timeout above: past it, no live fire of
+# ours can still be running, because subprocess.run would already have raised.
+ORPHAN_MIN_AGE_S = 900
+
+
+def _pending_dir(session_id: str) -> Path:
+    """Directory holding this session's in-flight review markers.
+
+    Sessions are kept apart so one session's reconciliation never reports another's live
+    fire as a loss -- with parallel sessions the norm on this machine, a shared directory
+    would make every concurrent fire look like an orphan to whichever session looked first.
+    """
+    return EVIDENCE_STATE_ROOT / (session_id or "_no_session") / PENDING_DIRNAME
+
+
+def write_pending_marker(session_id: str, tool_name: str, target: str,
+                         tool_use_id: str = "") -> Path | None:
+    """Record that a review is STARTING. Returns the marker path, or None if it could not
+    be written -- never raises, because failing to instrument a review must not also
+    prevent it."""
+    try:
+        d = _pending_dir(session_id)
+        d.mkdir(parents=True, exist_ok=True)
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", tool_use_id) or uuid.uuid4().hex
+        path = d / f"{name}.json"
+        payload = {
+            "started": datetime.now(timezone.utc).isoformat(),
+            "started_monotonic_pid": os.getpid(),
+            "tool_name": tool_name,
+            "target_path": target,
+            "tool_use_id": tool_use_id,
+            "session_id": session_id,
+        }
+        # fsync before the council starts: a marker lost to a page cache on a killed
+        # process would defeat the entire mechanism.
+        with open(path, "w") as fh:
+            json.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return path
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------- heartbeats
+# WHAT A PLAIN MARKER CANNOT TELL YOU: WHEN the advisor died, or what else was running
+# when it did. It records a start and then either vanishes or does not. That is enough to
+# COUNT losses -- it is what measured ~30% -- but not to diagnose them, because every
+# hypothesis about the cause is a hypothesis about a TIME (a ceiling at some duration) or
+# about LOAD (concurrent fires). A marker holds neither.
+#
+# SO EACH FIRE NOW BEATS INTO A SIDECAR WHILE IT WAITS. A stranded marker's last beat is
+# the moment the advisor stopped breathing, +/- one interval, and every beat carries the
+# number of fires in flight across ALL sessions on this host. A killed review therefore
+# leaves behind both its time of death and the load at that instant.
+#
+# A SIDECAR, NOT THE MARKER ITSELF, AND THE REASON IS LOAD-BEARING: orphan_markers() ages
+# a marker by its MTIME. Beating into the marker would refresh that mtime every interval,
+# silently redefining "age" from time-since-start to time-since-death and shifting when a
+# loss is allowed to surface. The existing detector is validated and measured; this
+# instrument is strictly additive and must not perturb it. `*.beats` also falls outside
+# that function's `*.json` glob, so it cannot be mistaken for a marker.
+#
+# THE THREAD IS A DAEMON AND EVERY OPERATION SWALLOWS ITS ERRORS. An instrument that can
+# delay or break the hook it measures is worse than no instrument: this hook already sits
+# in the path of every edit the agent makes.
+BEAT_INTERVAL_S = 5.0
+
+
+def _beats_path(marker: Path) -> Path:
+    """Sidecar for a marker. Built by APPENDING, not Path.with_suffix -- a tool_use_id may
+    contain dots (the sanitiser permits them), and with_suffix would replace from the last
+    dot and could collide two markers onto one sidecar."""
+    return Path(str(marker) + ".beats")
+
+
+def count_inflight() -> int:
+    """Fires in flight across EVERY session on this host, not just ours.
+
+    Host-wide on purpose: the load that could kill a fire is produced by all sessions
+    together, and this project routinely runs several at once. Counts `*.json` only, so
+    already-reported `.json.reported` markers are excluded."""
+    try:
+        return sum(1 for _ in EVIDENCE_STATE_ROOT.glob(f"*/{PENDING_DIRNAME}/*.json"))
+    except OSError:
+        return -1          # unknown, and said so rather than reported as zero
+
+
+def start_heartbeat(marker: Path | None) -> tuple[threading.Event, threading.Thread] | None:
+    """Beat into `marker`'s sidecar until the returned Event is set. None if not started.
+
+    Returns the THREAD as well as the Event because stopping has to be able to JOIN it --
+    see stop_heartbeat. Each beat is one JSON line, flushed and fsync'd: a kill must not
+    take the last beats with it, which is the same reason the marker itself is fsync'd."""
+    if marker is None:
+        return None
+    stop = threading.Event()
+    beats = _beats_path(marker)
+
+    def _loop() -> None:
+        started = datetime.now(timezone.utc)
+        while True:
+            # Checked immediately before the write, not only at the bottom of the loop: a
+            # beat that lands after clear_pending_marker has unlinked the sidecar would
+            # RECREATE it, leaving a stray file for a review that actually succeeded.
+            if stop.is_set():
+                return
+            try:
+                now = datetime.now(timezone.utc)
+                rec = {
+                    "t": now.isoformat(),
+                    "elapsed_s": round((now - started).total_seconds(), 1),
+                    "inflight": count_inflight(),
+                    "pid": os.getpid(),
+                }
+                with open(beats, "a") as fh:
+                    fh.write(json.dumps(rec) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except (OSError, ValueError):
+                pass       # a failed beat must never end the review
+            if stop.wait(BEAT_INTERVAL_S):
+                return
+
+    t = threading.Thread(target=_loop, name="council-heartbeat", daemon=True)
+    try:
+        t.start()
+    except RuntimeError:
+        return None        # cannot spawn a thread: proceed uninstrumented, never fail
+    return stop, t
+
+
+def stop_heartbeat(handle: tuple[threading.Event, threading.Thread] | None) -> None:
+    """Stop beating and WAIT for the beat to actually stop. Idempotent.
+
+    THE JOIN IS THE POINT, and the first version omitted it. Setting the Event without
+    joining leaves the thread free to complete one more write AFTER the caller has deleted
+    the sidecar, resurrecting a file for a review that succeeded. The thread sleeps on
+    stop.wait(), so it wakes as soon as the Event is set rather than finishing its interval;
+    the timeout exists only so a beat wedged in fsync on a stuck filesystem cannot hold the
+    hook open. It stays a daemon so that a thread outliving that timeout still cannot keep
+    the process alive -- which is a statement about PROCESS EXIT, not about the race below.
+
+    THIS NARROWS THE RACE; IT DOES NOT ELIMINATE IT, and saying otherwise would be the
+    overclaim the council caught in the previous draft. On the timeout path the thread is
+    still alive, and even the top-of-loop stop.is_set() check can pass and then be
+    preempted, so one write can still land after the unlink.
+    WHY THAT IS TOLERABLE rather than merely admitted: a loss is identified by a MARKER, and
+    the readers of this directory were AUDITED rather than assumed -- orphan_markers() below
+    and count_inflight() above both glob `*.json`, stop_audit.py reads only through
+    orphan_markers(), and the two suites match `*.json`/`*.reported`. (codex_hook.py's
+    _pending_dirs() looks adjacent in a grep and is NOT a reader of this directory: it walks
+    `<state>/pending`, a different tree of 64-hex snapshot keys.) So a sidecar whose marker
+    is gone is litter, not a false loss -- it cannot make a completed review look lost,
+    which is the only failure that would matter. If a future reader globs `*` here, that
+    reader has to skip `.beats` itself, and this paragraph stops being true."""
+    if handle is None:
+        return
+    stop, thread = handle
+    stop.set()
+    try:
+        thread.join(timeout=2.0)
+    except RuntimeError:
+        pass
+
+
+def clear_pending_marker(path: Path | None) -> None:
+    """Mark this review COMPLETE by removing its marker and its beat sidecar. Idempotent
+    and never raises.
+
+    THE SIDECAR GOES TOO. Beats are diagnostic evidence about a review that DIED; for one
+    that finished, the log entry is the record and a leftover sidecar would just accumulate
+    a file per successful fire forever. A marker that gets ARCHIVED rather than cleared
+    keeps its beats, which is the case the evidence is actually for."""
+    if path is None:
+        return
+    for p in (path, _beats_path(path)):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def archive_pending_marker(path: Path | None) -> None:
+    """Retire a marker that has been REPORTED, without destroying the evidence of it.
+
+    Renamed rather than deleted: the notice must fire once (a re-report on every later
+    fire would be noise the agent learns to skip), but the record of which edits went
+    unreviewed is the only durable trace of the loss and later analysis needs it. The
+    suffix takes it out of orphan_markers' `*.json` glob, which is what makes it retired.
+    """
+    if path is None:
+        return
+    try:
+        path.rename(path.with_suffix(".json.reported"))
+    except OSError:
+        pass
+
+
+def orphan_markers(session_id: str, min_age_s: float = ORPHAN_MIN_AGE_S) -> list[dict]:
+    """Markers old enough that no live fire could still own them: PROVEN lost reviews.
+
+    Age is taken from the file's mtime rather than its `started` field, because a clock
+    change would corrupt the second and not the first, and this is the one instrument that
+    must not be able to invent a loss.
+    """
+    out: list[dict] = []
+    d = _pending_dir(session_id)
+    if not d.is_dir():
+        return out
+    now = datetime.now(timezone.utc).timestamp()
+    try:
+        entries = sorted(d.glob("*.json"))
+    except OSError:
+        return out
+    for p in entries:
+        try:
+            age = now - p.stat().st_mtime
+            if age < min_age_s:
+                continue
+            rec = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        rec["age_s"] = round(age)
+        rec["marker_path"] = str(p)
+        out.append(rec)
+    return out
+
+
+def format_orphan_notice(orphans: list[dict]) -> str:
+    """The loud half. A lost review is reported as a LOSS, never as a pass."""
+    n = len(orphans)
+    lines = [
+        f"COUNCIL REVIEWS LOST: {n} review{'' if n == 1 else 's'} in this session STARTED "
+        f"AND NEVER FINISHED. The edits below were applied and are UNREVIEWED -- no "
+        f"verdict exists for them, which is NOT the same as a passing one.",
+    ]
+    for o in orphans[:10]:
+        lines.append(f"  - {o.get('tool_name')} on {o.get('target_path')} "
+                     f"(started {o.get('started')}, {o.get('age_s')}s ago)")
+    if n > 10:
+        lines.append(f"  ... and {n - 10} more")
+    lines.append("Re-review them explicitly, or treat them as unreviewed. This notice "
+                 "fires even when the CURRENT review passed, because a silent PASS is "
+                 "exactly what a lost review would otherwise look like.")
+    return "\n".join(lines)
+
+
 def emit_warning(text: str) -> int:
     """Exit 0 with structured JSON containing additionalContext."""
     output = {
@@ -749,6 +1036,16 @@ def main() -> int:
             cmd.extend(["--evidence-file", str(evidence_file)])
     if transcript_path:
         cmd.extend(["--transcript-path", transcript_path])
+    # Collected BEFORE this fire's own marker is written, so a fire can never appear in
+    # its own orphan report.
+    prior_orphans = orphan_markers(session_id)
+    marker = write_pending_marker(session_id, tool_name, target_for_log,
+                                  payload.get("tool_use_id") or "")
+    # Beats start BEFORE the subprocess and stop on every route out, exactly mirroring the
+    # marker. If this fire is killed, the sidecar's last line dates the death and records
+    # how many fires were in flight at that moment -- the two things a bare marker cannot
+    # say and that every hypothesis about the cause needs.
+    beat = start_heartbeat(marker)
     try:
         proc = subprocess.run(
             cmd,
@@ -759,18 +1056,44 @@ def main() -> int:
             timeout=900,
         )
     except subprocess.TimeoutExpired:
+        # A timeout COMPLETED the attempt and says so to the agent below, so it is not a
+        # silent loss and must not leave a marker behind.
+        stop_heartbeat(beat)
+        clear_pending_marker(marker)
         return emit_warning(
             f"Council timed out (>900s) reviewing {tool_name} on "
             f"{target_for_log}. The action already proceeded; this notice "
             f"is just to flag that the council did not complete."
         )
+    stop_heartbeat(beat)
+    clear_pending_marker(marker)
 
     wrapper_stdout = proc.stdout
     wrapper_stderr = proc.stderr
     rc = proc.returncode
 
     if rc == 0:
-        # Wrapper returned PASS. Stay silent; nothing surfaces to Claude.
+        # Wrapper returned PASS. Silent -- EXCEPT when earlier reviews in this session
+        # were lost, which is the one case where silence is the bug rather than the
+        # design. A lost review and a passing one are indistinguishable from the agent's
+        # side, so the loss is reported on the next fire that finishes, and the markers
+        # are archived rather than deleted so the notice fires ONCE and the evidence
+        # still survives for later analysis.
+        if prior_orphans:
+            # EMIT FIRST, ARCHIVE SECOND, AND FLUSH BETWEEN THEM. Archiving is what takes
+            # a marker out of orphan_markers, so doing it first means a kill in this
+            # window retires the evidence for a notice that was never delivered -- the
+            # loss then becomes permanently invisible to both this path and stop_audit.
+            # That is strictly worse than no instrument at all. A layer-2 inspector caught
+            # this exact inversion here after the council caught its twin in stop_audit.
+            rc_out = emit_warning(format_orphan_notice(prior_orphans))
+            try:
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
+            for o in prior_orphans:
+                archive_pending_marker(Path(o["marker_path"]))
+            return rc_out
         return 0
 
     if rc == 1:

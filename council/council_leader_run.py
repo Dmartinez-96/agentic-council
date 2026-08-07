@@ -117,6 +117,21 @@ def main() -> int:
               "drive.", file=sys.stderr)
         events.emit("note", text="no council-native leader configured")
         return 2
+    # FAMILY OVERLAP, announced at SEAT TIME -- the moment a leader is actually about to
+    # act, which is why it lives here and not in the council fire. In a Claude Code
+    # session a leader may be CONFIGURED without acting at all, so announcing it on every
+    # PostToolUse fire would be noise on every edit. Never blocks: the user's ruling is
+    # that a single-family bench is a legitimate configuration, so this is surfaced and
+    # the run proceeds.
+    overlap = cc.leader_family_overlap(leader)
+    banner = cc.format_family_overlap_banner(overlap)
+    if banner:
+        print(banner, file=sys.stderr)
+        events.emit("leader_family_overlap", leader=overlap["leader"],
+                    family=overlap["family"] or "", voting=overlap["voting"],
+                    inspector=overlap["inspector"],
+                    undetermined=overlap["undetermined"])
+
     if not args.workdir.is_dir():
         print(f"workdir is not a directory: {args.workdir}", file=sys.stderr)
         return 2

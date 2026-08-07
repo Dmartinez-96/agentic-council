@@ -637,8 +637,18 @@ async def reformat_unparseable(results: list[dict], cwd: Path) -> list[dict]:
         rec = member_by_name(name)
         fb = getattr(rec, "fallback_model", None) if rec is not None else None
         if not fb:
-            # codex and muse have none. Skipped explicitly and recorded with the
-            # reason, never silently, and never by substituting another seat's model.
+            # This seat has no fallback configured IN THE ACTIVE ROSTER -- member_by_name
+            # reads REGISTRY, not DEFAULT_REGISTRY, so reaching here is a property of the
+            # roster in force, not of any fixed seat. Skipped explicitly and recorded with
+            # the reason, never silently, and never by substituting another seat's model.
+            # NO SEAT NAMES HERE, DELIBERATELY. This comment used to read "codex and muse
+            # have none" and was wrong on BOTH counts: codex carries
+            # fallback_model=CODEX_OPENROUTER_FALLBACK ('openai/gpt-5.6-sol') and so has
+            # never reached this branch, and muse was replaced on 2026-08-06 by hunyuan,
+            # which HAS a fallback. Measured 2026-08-06 against the loaded REGISTRY: muse
+            # was the only seat that hit this, and after that swap NO seat in
+            # DEFAULT_REGISTRY does. A transcribed list beside a condition drifts from it;
+            # the condition is the documentation.
             r["fallback_unavailable"] = True
             return
         try:
@@ -1893,7 +1903,14 @@ def _ensure_nogit_stub() -> Path:
 # Scrubbed HERE rather than via a per-call drop_env because this is the single place every
 # member subprocess passes through; drop_env is threaded to exactly one call site, so a
 # credential filtered there would still reach all the others.
-MEMBER_SCRUB_ENV = ("CLAUDE_CODE_OAUTH_TOKEN",)
+MEMBER_SCRUB_ENV = (
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    # A subprocess member may itself load global Claude/Codex hooks. The parent
+    # fire's harness profile describes the parent actor, not that nested CLI.
+    "COUNCIL_HARNESS",
+    "COUNCIL_ROSTER_PATH",
+    "COUNCIL_STATE_ROOT",
+)
 
 
 def _member_env() -> dict:
@@ -2335,6 +2352,12 @@ def leader_trace_slice(stderr: str) -> str:
 # fails CLOSED, since a tool added to the CLI later is absent from this list by default.
 # The capability block still describes the seat truthfully, but the PROMPT is not the
 # boundary; this list is.
+# A Claude member must not inherit the operator's global Claude hooks. In the
+# Codex-led profile that would wrap a critic in a second SessionStart/Stop
+# lifecycle and could make a Stop audit steer the critic. `--safe-mode` keeps
+# authentication/model selection but disables hooks and other customizations;
+# the Council supplies its own complete prompt and explicit read-only tools.
+CLAUDE_RUNTIME_GUARD = ("--safe-mode",)
 CLAUDE_TOOL_GUARD = ("--tools", "Read,Glob,Grep")
 
 
@@ -2342,7 +2365,8 @@ def claude_cmd() -> list[str]:
     """Argv for one claude review. The prompt arrives on STDIN, verified above, so it is
     never an argv element -- a council prompt runs to tens of kilobytes and argv is
     bounded. CLAUDE_TOOL_GUARD is what keeps this seat non-mutating; see above."""
-    return ["claude", "-p", "--model", CLAUDE_MODEL, *CLAUDE_TOOL_GUARD]
+    return ["claude", "-p", "--model", CLAUDE_MODEL,
+            *CLAUDE_RUNTIME_GUARD, *CLAUDE_TOOL_GUARD]
 
 
 async def run_claude(pitch: str, system_prompt: str, cwd: Path,
@@ -3103,8 +3127,8 @@ class Member:
 
 
 # THE DEFAULT ROSTER (user-set 2026-07-25): SIX voting -- codex, gemini, deepseek,
-# kimi, glm, grok -- and SIX inspecting: muse, qwen, minimax, mimo, nemotron,
-# mistral. kimi/glm/grok were PROMOTED from inspector to voting that day, and the
+# kimi, glm, grok -- and SIX inspecting: hunyuan, qwen, minimax, mimo, nemotron,
+# mistral (hunyuan REPLACED muse on 2026-08-06; see its row below). kimi/glm/grok were PROMOTED from inspector to voting that day, and the
 # six inspectors are new seats, making this the 6+6 bench (plus the leader role,
 # which is not a members-list record -- see _validate_leader).
 # Per the 2026-07-18 billing directive, non-subscription members run through the
@@ -3117,9 +3141,17 @@ class Member:
 # OpenRouter member that HAS a sibling in its family carries a [primary, fallback]
 # `models` array: OpenRouter fails the primary over to the fallback on downtime,
 # rate-limits, moderation refusals, or context-length errors, walking the list once
-# in order (OpenRouter Model Fallbacks docs, checked 2026-07-18). muse is the one
-# exception -- the catalog listed no sibling for it -- so it runs single-slug and a
-# route failure drops that seat for the fire rather than falling back.
+# in order (OpenRouter Model Fallbacks docs, checked 2026-07-18). EVERY OPENROUTER SEAT now
+# carries a pair: muse was the sole single-slug exception (the catalog listed no sibling for
+# it) and it was replaced on 2026-08-06 by hunyuan, which has one. So an OpenRouter route
+# failure falls back rather than dropping the seat, on every openrouter row.
+# CODEX IS NOT ONE OF THOSE ROWS, and the distinction is not pedantic: it runs
+# codex_subprocess, so its fallback_model is consumed by the TRANSPORT-level retry
+# (FALLBACK_CAPABLE_TRANSPORTS) and never by OpenRouter's models-array walk. Both mechanisms
+# end in "the seat still votes", but only the openrouter one is what this paragraph
+# describes. An earlier draft of this comment said "EVERY seat ... on every row" and the
+# council flagged it: true under a loose reading, imprecise under the one the paragraph sets
+# up, and imprecision beside a mechanism description is how the wrong mechanism gets cited.
 # WHAT WAS VERIFIED about these slugs, and what was NOT: every primary and fallback
 # below was confirmed PRESENT in OpenRouter's public catalog (GET
 # openrouter.ai/api/v1/models, 345 models, fetched 2026-07-25), and each primary is
@@ -3155,9 +3187,26 @@ DEFAULT_REGISTRY: tuple[Member, ...] = (
     Member("grok",     VOTING, "openrouter",
            "x-ai/grok-4.5", "x-ai/grok-4.3", capabilities=_DEFAULT_CAPS),
     # --- LAYER 2: non-voting inspectors (6) ---
-    # muse runs single-slug: the catalog listed no sibling to fall back to.
-    Member("muse",     INSPECTOR, "openrouter",
-           "meta/muse-spark-1.1", capabilities=_DEFAULT_CAPS),
+    # hunyuan REPLACED muse on 2026-08-06. meta/muse-spark-1.1 AND -1.2 both return
+    # HTTP 403 `user_blocked` ("access has been restricted due to repeated policy
+    # violations") from provider Meta. MEASURED, not inferred: the same key returns 200 for
+    # qwen/qwen3.7-max and for meta-llama/llama-3.3-70b-instruct in the same minute, so it
+    # is the Meta first-party route that is closed, not the account and not OpenRouter.
+    # The logs date it: muse was clean through 2026-08-04, failed 76 of 139 seatings on
+    # 2026-08-05, and 41 of 41 on 2026-08-06. The exact cutover time is NOT established.
+    # WHY THIS SEAT IS A RENAME AND NOT A MODEL SWAP: 545 logged fires carry `role: "muse"`
+    # meaning a Meta model. Pointing that name at Tencent would silently pool two different
+    # instruments in every analysis that splits on seat name.
+    # WHY tencent/hy3 over kwaipilot/kat-coder-pro-v2, the other candidate: BOTH cleared the
+    # bar (each returned a parseable `VERDICT: WARN` first line on a probe where the council
+    # was wrong), so the probe did not separate them. The tiebreak is bench composition --
+    # kat-coder is a coding specialist and layer 1 already holds four strong coders, while
+    # the inspector layer's one demonstrated save was reasoning about HARNESS SEMANTICS.
+    # Unlike muse this seat HAS a sibling, so it is the first time this row carries a
+    # fallback. The stable model leads and the preview is the fallback, not the reverse:
+    # a `-preview` slug can change under us, and this project pins models for that reason.
+    Member("hunyuan",  INSPECTOR, "openrouter",
+           "tencent/hy3", "tencent/hy3-preview", capabilities=_DEFAULT_CAPS),
     Member("qwen",     INSPECTOR, "openrouter",
            "qwen/qwen3.7-max", "qwen/qwen3.7-plus", capabilities=_DEFAULT_CAPS),
     Member("minimax",  INSPECTOR, "openrouter",
@@ -3179,7 +3228,13 @@ DEFAULT_REGISTRY: tuple[Member, ...] = (
 # That hazard is mitigated the same way depth was -- the active roster is recorded
 # per fire in the log (write_log "roster") and announced in emit_output, so a
 # roster change is never silent in the corpus.
-ROSTER_PATH = COUNCIL_ROOT / "roster.json"
+_roster_override = os.environ.get("COUNCIL_ROSTER_PATH")
+if _roster_override:
+    ROSTER_PATH = Path(_roster_override).expanduser()
+    if not ROSTER_PATH.is_absolute():
+        ROSTER_PATH = COUNCIL_ROOT / ROSTER_PATH
+else:
+    ROSTER_PATH = COUNCIL_ROOT / "roster.json"
 
 VALID_TIERS = {VOTING, INSPECTOR}
 VALID_TRANSPORTS = {"codex_subprocess", "claude_subprocess", "gemini_rest",
@@ -3217,6 +3272,142 @@ DIRECT_TRANSPORT_MODELS = {
 # one -- the roster was rejected with "nothing reads it there" about a path that did read
 # it. Adding a fallback leg to a transport means adding it here in the same edit.
 FALLBACK_CAPABLE_TRANSPORTS = ("codex_subprocess", "claude_subprocess")
+
+# --- MODEL FAMILY, for leader/member overlap ---------------------------------
+#
+# A FAMILY is the vendor that trained the model, not the seat name. It exists for one
+# question: does the seated leader share a model family with a seat that reviews its
+# writes? `_council_review` does NOT exclude the leader, so with `leader: codex` and a
+# `codex` voting member, codex reviews itself.
+#
+# THAT CONFIGURATION IS LEGITIMATE AND IS NEVER BLOCKED -- the user's ruling of 2026-08-05:
+# a council of one family is a bench somebody may genuinely want. It is only ANNOUNCED.
+#
+# WHY FAMILY AND NOT NAME. Keying on the seat name catches `codex` reviewing `codex` and
+# MISSES a `claude` leader sitting among `anthropic/...` members -- the same defect with a
+# different seat name. Name equality is a special case of family equality, not a substitute.
+#
+# DERIVED, NOT TRANSCRIBED, because this module has been bitten twice by a rule written in
+# two places. An openrouter slug already carries its vendor as the prefix
+# (`anthropic/claude-opus-5` -> `anthropic`). A direct-vendor transport does NOT: its model
+# constant is the provider-native id with no prefix (`claude-opus-5`). So a direct
+# transport's family is read off the OpenRouter slug for THE SAME MODEL that this module
+# already declares -- there is no second place where "anthropic" is typed, and a transport
+# missing from this map is reported UNDETERMINED rather than silently matching nothing.
+DIRECT_TRANSPORT_FAMILY_SLUG = {
+    "codex_subprocess": CODEX_OPENROUTER_FALLBACK,      # openai/...
+    "claude_subprocess": CLAUDE_OPENROUTER_FALLBACK,    # anthropic/...
+    "gemini_rest": GEMINI_OPENROUTER_MODEL,             # google/...
+    "deepseek_https": DEEPSEEK_OPENROUTER_MODEL,        # deepseek/...
+}
+
+
+def model_family(transport: str, model: str) -> str | None:
+    """The vendor family of one seat, or None when it cannot be determined.
+
+    None IS A REAL ANSWER and callers must render it as UNDETERMINED, never as a family
+    that happens to match nothing. Two things produce it: an openrouter `model` with no
+    "/" (malformed, not family-less), and a transport absent from
+    DIRECT_TRANSPORT_FAMILY_SLUG. Treating either as "no overlap" would be a silent false
+    negative in the one function whose job is to warn.
+    """
+    if transport == "openrouter":
+        vendor, sep, _rest = (model or "").partition("/")
+        if not sep:
+            return None
+        return vendor.strip().lower() or None
+    slug = DIRECT_TRANSPORT_FAMILY_SLUG.get(transport)
+    if not slug:
+        return None
+    return slug.partition("/")[0].strip().lower() or None
+
+
+def leader_family_overlap(leader: "Member | None" = None,
+                          members: "tuple[Member, ...] | None" = None) -> dict | None:
+    """Which seats share a model FAMILY with the seated leader.
+
+    Returns None when there is no leader (nothing to overlap with). Otherwise a dict with
+    keys: leader, family, voting, inspector, undetermined, overlaps.
+
+    VOTING AND INSPECTOR ARE REPORTED SEPARATELY, and that is the finding rather than
+    presentation: only voting seats are counted by block_quorum, so only a voting overlap
+    puts the leader on the panel that can veto -- or decline to veto -- its own write. An
+    inspector overlap affects commentary that changes no verdict.
+
+    `undetermined` names seats model_family() could not resolve. A caller must not read
+    `overlaps is False` as "no overlap" while `undetermined` is non-empty: that is "no
+    overlap among the seats I could resolve", which is what the banner says.
+
+    Defaults read the live LEADER_MEMBER and REGISTRY; both are injectable so the
+    behaviour can be exercised against a constructed bench. Those globals are resolved at
+    CALL time, which is why this function may be defined above them.
+    """
+    leader = leader if leader is not None else LEADER_MEMBER
+    if leader is None:
+        return None
+    members = members if members is not None else REGISTRY
+    fam = model_family(leader.transport, leader.model)
+    voting: list[str] = []
+    inspector: list[str] = []
+    undetermined: list[str] = []
+    for m in members:
+        mf = model_family(m.transport, m.model)
+        if mf is None:
+            undetermined.append(m.name)
+            continue
+        if fam is not None and mf == fam:
+            (voting if m.tier == VOTING else inspector).append(m.name)
+    if fam is None:
+        # The LEADER's own family is unknown, so NO comparison was possible. Say that
+        # rather than reporting an empty overlap, which would read as a clean bench.
+        undetermined = [leader.name] + [n for n in undetermined if n != leader.name]
+    return {"leader": leader.name, "family": fam, "voting": voting,
+            "inspector": inspector, "undetermined": undetermined,
+            "overlaps": bool(voting or inspector)}
+
+
+def format_family_overlap_banner(overlap: dict | None) -> str | None:
+    """The LOUD, NON-BLOCKING notice for a leader sharing a family with its reviewers.
+
+    Returns None when there is nothing to say. The user's ruling: this configuration is
+    legitimate and is never blocked, only announced -- so the wording states the
+    consequence and stops, rather than telling the user to change anything.
+    UNDETERMINED seats are reported too: "I could not resolve this seat" is not "this seat
+    is fine", and dropping them silently would be the same absence-reads-as-approval
+    failure this project has already paid for elsewhere.
+    """
+    if not overlap:
+        return None
+    voting = overlap.get("voting") or []
+    inspector = overlap.get("inspector") or []
+    undet = overlap.get("undetermined") or []
+    if not (voting or inspector or undet):
+        return None
+    fam, lead = overlap.get("family"), overlap.get("leader")
+    lines = ["=" * 72]
+    if voting or inspector:
+        lines.append(f"LEADER/MEMBER FAMILY OVERLAP: leader {lead!r} is family {fam!r}, "
+                     f"and so are seats")
+        lines.append("on its own review panel.")
+    else:
+        lines.append(f"LEADER/MEMBER FAMILY CHECK INCOMPLETE for leader {lead!r}.")
+    if voting:
+        lines.append(f"  VOTING seats in the same family : {', '.join(voting)}")
+        lines.append("    These seats VOTE on the leader's writes and the applier wall "
+                     "does not exclude")
+        lines.append("    the leader, so a model family is reviewing its own work.")
+    if inspector:
+        lines.append(f"  INSPECTOR seats (non-voting)    : {', '.join(inspector)}")
+        lines.append("    Advisory only -- these change no verdict.")
+    if undet:
+        lines.append(f"  UNDETERMINED family             : {', '.join(undet)}")
+        lines.append("    NOT a clean bill of health: these seats could not be compared "
+                     "at all.")
+    lines.append("ALLOWED, and nothing is blocked -- a single-family council is a valid "
+                 "bench. This is")
+    lines.append("announced so the result is never mistaken for independent review.")
+    lines.append("=" * 72)
+    return "\n".join(lines)
 
 
 def _validate_transport_model(rec: dict, name: str, where: str,
@@ -3446,6 +3637,30 @@ def _validate_leader(raw: dict, errors: list[str],
                   capabilities=LEADER_CAPS)
 
 
+# THE SHIPPED DEFAULT LEADER (the user's ruling, 2026-08-05). Before this, a fresh install
+# had NO leader at all: the GUI's Leader tab was dead and its error named the missing
+# roster key without shipping anything that would fill it. claude is the default because
+# the installer wires into the Claude Code hooks, so it is the one transport an install is
+# already known to have.
+#
+# SCOPE, AND IT IS NARROW ON PURPOSE -- it applies ONLY when roster.json is ABSENT:
+#   - roster.json missing            -> this leader (a fresh install, nothing configured)
+#   - roster.json present, no leader -> None. The user built a bench and deliberately left
+#                                       the leader out; overriding that would be the tool
+#                                       second-guessing an explicit configuration.
+#   - roster.json rejected           -> None, so ROSTER_ERRORS still distinguishes
+#                                       "intentionally leaderless" from "your file is
+#                                       broken". A broken file must not silently GAIN a
+#                                       capability it never had.
+# WHAT THIS DOES NOT CHANGE, and it is the thing most likely to be misread: `active_leader`
+# is read ONLY by council_leader_run.py. A Claude Code session is unaffected -- the hooks
+# review the actor's edits whether or not a council-native leader is configured.
+# It creates no family overlap with the shipped bench: DEFAULT_REGISTRY has no anthropic
+# seat, which leader_family_overlap() confirms rather than assumes.
+DEFAULT_LEADER = Member("claude", LEADER, "claude_subprocess", CLAUDE_MODEL,
+                        CLAUDE_OPENROUTER_FALLBACK, capabilities=LEADER_CAPS)
+
+
 def load_registry() -> tuple[tuple[Member, ...], "Member | None", str,
                              list[str], list[str], int]:
     """The active roster: roster.json when present and valid, else the default.
@@ -3464,7 +3679,10 @@ def load_registry() -> tuple[tuple[Member, ...], "Member | None", str,
     edits entirely unreviewed until someone noticed the hook failing.
     """
     if not ROSTER_PATH.exists():
-        return (DEFAULT_REGISTRY, None, "default", [], [],
+        # No roster file at all: a fresh install. Ships DEFAULT_LEADER so the Leader tab
+        # works out of the box. The two REJECTION branches below deliberately keep None --
+        # see DEFAULT_LEADER for why a broken roster must not gain a leader it never had.
+        return (DEFAULT_REGISTRY, DEFAULT_LEADER, "default", [], [],
                 RETRIEVAL_PER_FILE_CAP_DEFAULT)
     try:
         raw = json.loads(ROSTER_PATH.read_text())
@@ -3502,10 +3720,16 @@ def member_by_name(name: str) -> Member | None:
 
 
 def active_leader() -> "Member | None":
-    """The configured council-native leader Member, or None when the Claude Code
-    harness leads by default. None covers BOTH the intentional case (no roster.json
-    "leader" object) and roster rejection (a malformed roster falls back to the
-    default panel with no leader); check ROSTER_ERRORS to tell them apart."""
+    """The council-native leader Member, or None when the Claude Code harness leads.
+
+    THREE CASES, and they are no longer all None (DEFAULT_LEADER shipped 2026-08-06):
+      - roster.json ABSENT            -> DEFAULT_LEADER (claude). A fresh install leads.
+      - roster.json present, NO leader-> None. The user configured a bench and left the
+                                         leader out on purpose; that is respected.
+      - roster.json REJECTED          -> None, with ROSTER_ERRORS populated. Check
+                                         ROSTER_ERRORS to tell this from the case above.
+    So None still means "the Claude Code harness leads", but it no longer means "nothing
+    was configured" -- an absent roster now yields a leader rather than None."""
     return LEADER_MEMBER
 
 
@@ -3984,7 +4208,8 @@ def _brain_module():
     a note and serve it naked, which is the dangerous direction.
     """
     here = Path(__file__).resolve().parent
-    for cand in (here.parent / "brain",                        # package layout
+    for cand in (here / "brain",                               # installed flat layout
+                 here.parent / "brain",                        # package layout
                  here.parent / "agentic-council" / "brain"):   # live tree
         if (cand / "validate_brain.py").is_file():
             if str(cand) not in sys.path:
@@ -5947,7 +6172,8 @@ def claude_leader_cmd() -> list[str]:
     arrives on STDIN, never as an argv element: a leader prompt carries the ground rules, the
     prior handoff and every tool result so far, and argv is bounded (codex hit Errno 7 this
     way once already)."""
-    return ["claude", "-p", "--model", CLAUDE_MODEL, *CLAUDE_LEADER_TOOL_GUARD]
+    return ["claude", "-p", "--model", CLAUDE_MODEL,
+            *CLAUDE_RUNTIME_GUARD, *CLAUDE_LEADER_TOOL_GUARD]
 
 
 # The transports a LEADER may use: a STRICT SUBSET of VALID_TRANSPORTS, because the
@@ -6769,6 +6995,12 @@ async def main() -> int:
                    "retrieval_per_file_cap_min": RETRIEVAL_PER_FILE_CAP_MIN,
                    "retrieval_per_file_cap_max": RETRIEVAL_PER_FILE_CAP_MAX,
                    "leader": leader_out,
+                   # STRUCTURED, NOT A RENDERED BANNER: this stream is JSON that the GUI
+                   # parses, so text here would corrupt it. Consumers render their own
+                   # notice from these fields (consult_council.format_family_overlap_banner
+                   # is the shared renderer for the ones that want plain text). None when
+                   # no leader is seated -- there is then nothing to overlap with.
+                   "leader_family_overlap": leader_family_overlap(),
                    "members": [{"name": m.name, "tier": m.tier,
                                 "transport": m.transport, "model": m.model,
                                 "fallback_model": m.fallback_model,

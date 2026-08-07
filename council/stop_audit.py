@@ -281,7 +281,46 @@ def main() -> int:
     transcript_path = payload.get("transcript_path", "")
     cwd = payload.get("cwd", "")
 
+    # LOST REVIEWS -- checked BEFORE the transcript guard below, deliberately. A turn with
+    # no transcript path still made edits, and a review that never finished is the one
+    # finding that must not be suppressed by an unrelated early return. The advisor
+    # reports orphans only on its next PASSING fire; a turn whose remaining fires all WARN
+    # would otherwise never surface them, so this is the catch-all.
+    # IMPORTED, NOT REIMPLEMENTED: a second copy of this rule would drift from the first,
+    # which is a failure this codebase has already paid for twice.
+    lost_notice = ""
+    lost_orphans: list = []
+    try:
+        import council_advisor as _ca
+        lost_orphans = _ca.orphan_markers(session_id)
+        if lost_orphans:
+            lost_notice = _ca.format_orphan_notice(lost_orphans)
+    except Exception:  # noqa: BLE001
+        # Never let the instrument break the hook it instruments.
+        lost_notice = ""
+        lost_orphans = []
+
+    def _retire_lost() -> None:
+        """Archive the orphans -- ONLY on a path that actually surfaces their notice.
+
+        ORDER IS LOAD-BEARING AND A FIRST DRAFT GOT IT WRONG: archiving at detection time
+        retires the marker even when the notice is then dropped, and since archiving is
+        what removes it from `orphan_markers`, neither this hook nor the advisor's
+        next-PASS path could ever report it again. That turns a loud loss into a
+        permanent silent one -- strictly worse than not instrumenting at all.
+        """
+        try:
+            import council_advisor as _ca2
+            for _o in lost_orphans:
+                _ca2.archive_pending_marker(Path(_o["marker_path"]))
+        except Exception:  # noqa: BLE001
+            pass
+
     if not transcript_path:
+        # Still report a loss: it does not depend on the transcript in any way.
+        if lost_notice:
+            _retire_lost()
+            return emit_block_decision(lost_notice)
         return 0
 
     text = last_assistant_text(Path(transcript_path))
@@ -325,9 +364,16 @@ def main() -> int:
         aggregated_warn_messages.append("\n\n".join(body_parts))
         any_warn = True
 
+    # The catch-all, on the MAIN path. Without these two lines the notice computed above
+    # is discarded on every turn that has a transcript -- which is every normal turn.
+    if lost_notice:
+        aggregated_warn_messages.append(lost_notice)
+        any_warn = True
+
     if not any_warn:
         return 0
 
+    _retire_lost()
     surface_text = (
         "Stop-hook council audit found concerns in your last "
         "message. Address each finding with verification or revision "
