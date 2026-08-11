@@ -7127,7 +7127,13 @@ async def main() -> int:
               file=sys.stderr)
     events.emit("run_started", layer=args.layer, tool_name=args.tool_name,
                 target_path=args.target_path, voting=list(members),
-                inspectors=list(shadow_roles), fast_mode=FAST_PATH.exists())
+                # fast_mode(), NOT FAST_PATH.exists(). This line used to re-read the file, which
+                # defeats the whole reason fast_mode() freezes a per-process snapshot: if the flag
+                # is touched or removed MID-fire, a fresh read here reports one depth while the
+                # members already running were sent another. fast_mode()'s own docstring names
+                # that hazard -- "a report that can disagree with what actually ran is worse than
+                # no report" -- and this event is a report.
+                inspectors=list(shadow_roles), fast_mode=fast_mode())
 
     async def _seat(name: str, tier: str, rnd: int, coro):
         """Report a seat as it starts and as it lands, without changing what it returns.

@@ -138,7 +138,15 @@ def main() -> int:
 
     events.emit("run_started", layer="leader_turn", tool_name=args.mode,
                 target_path=str(args.workdir), voting=[leader.name], inspectors=[],
-                fast_mode=False)
+                # THE SWITCH STATE, not a hardcoded False. This was `fast_mode=False`
+                # unconditionally, so a leader turn started with FAST armed reported full depth
+                # and at least one consumer -- council_gui's FAST badge, `rec.get("fast_mode")` --
+                # could not show it. Other consumers of the event stream were not traced.
+                # WHAT IT DOES AND DOES NOT MEAN HERE: FAST governs MEMBER effort through
+                # effort_for(), and this path runs no members, so the flag records that the switch
+                # is ARMED for this install rather than that anything in this turn ran reduced.
+                # Read it as the switch, not as an applied depth.
+                fast_mode=cc.fast_mode())
 
     pending = {"n": 0}
     control = None

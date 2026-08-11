@@ -1146,6 +1146,9 @@ def unresolvable_pointers(new_text: str, base: Path,
 
 SCAN_SUFFIXES = (".py", ".md", ".sh", ".json", ".ts", ".js", ".txt", ".toml", ".yaml", ".yml")
 SKIP_DIRS = {".git", "node_modules", "__pycache__", "logs", ".venv", "venv", "_brain"}
+# Basenames of append-only historical records. Consumed by cross_file_survivors(), whose walk
+# explains what the exemption is and is not; keep the rationale there rather than duplicating it.
+ARCHIVAL_BASENAMES = {"HANDOFF.md"}
 
 
 def scan_root_for(path: Path, cwd: str) -> Path | None:
@@ -1175,7 +1178,8 @@ def cross_file_survivors(root: Path | None, edited: Path,
     finishing with exactly cap files and stopping at cap are different events that a count
     alone cannot distinguish."""
     out: dict[str, list[str]] = {}
-    stats = {"scanned": 0, "skipped_unreadable": 0, "skipped_large": 0, "truncated": False}
+    stats = {"scanned": 0, "skipped_unreadable": 0, "skipped_large": 0, "truncated": False,
+             "skipped_archival": 0}
     if not atoms or root is None:
         return out, stats
     try:
@@ -1187,6 +1191,24 @@ def cross_file_survivors(root: Path | None, edited: Path,
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
         for fn in filenames:
             if not fn.endswith(SCAN_SUFFIXES):
+                continue
+            # APPEND-ONLY HISTORICAL RECORDS ARE SKIPPED HERE AND NOWHERE ELSE. The distinction
+            # is between a document whose old values should PROPAGATE when they change and one
+            # whose old values ARE the content. In code, an atom that moved in one file and
+            # survived in another is the staleness this gate exists to catch; in a dated log of
+            # past sessions, every superseded figure is deliberately kept, and "correcting" them
+            # would destroy the record.
+            # THE CASE THAT PRODUCED THIS, 2026-08-11: appending a section to HANDOFF.md became
+            # impossible. 20 of its lines carried atoms -- past dates, a quoted replay result --
+            # rewritten elsewhere in the same session, so every APPEND was denied over history
+            # that was correct. The per-line `stale-ok:` escape does not fit: it marks
+            # exceptions, and here the whole file is the exception.
+            # THIS IS THE OTHER-FILES WALK ONLY. The same-file stale-sibling check runs elsewhere
+            # and is untouched, so rewriting an atom in HANDOFF.md while leaving its sibling two
+            # lines down is still caught. And the skip is COUNTED, because a sweep that quietly
+            # declined to read a file would report coverage it does not have.
+            if fn in ARCHIVAL_BASENAMES:
+                stats["skipped_archival"] += 1
                 continue
             if stats["scanned"] >= MAX_CROSS_FILES:
                 stats["truncated"] = True
@@ -1566,6 +1588,17 @@ def main() -> int:
         except OSError:
             key = str(path)
         entry = reg.get(key) or []
+        # THE ARCHIVAL EXEMPTION APPLIES IN BOTH DIRECTIONS, and this is the one that matters for
+        # an append-only record. The walk in cross_file_survivors() skips these files when looking
+        # for survivors ELSEWHERE; this check is the reverse -- atoms rewritten elsewhere earlier
+        # that survive HERE -- and it is the direction that made HANDOFF.md unappendable: a dated
+        # log accumulates other files' superseded values BY DESIGN, so every APPEND was denied
+        # over history that was correct.
+        # STILL FULLY CHECKED: the same-file stale-sibling rule, which is what catches an edit
+        # that rewrites an atom in this file while leaving its sibling two lines down.
+        if path.name in ARCHIVAL_BASENAMES:
+            entry = []
+            _log(session_id, {"event": "archival_cross_file_exempt", "file": str(path)})
         still = [a for a in entry if survivors_in(after, {a})]
         if still and date_only(set(still)):
             # Same rule as the same-file check above, and it matters MORE here for a reason
@@ -1634,8 +1667,12 @@ def main() -> int:
             reg.update(pending_register)
             _log(session_id, {"event": "registered", "from": str(path),
                               "files": pending_register, "stats": stats})
+        # `skipped_archival` belongs in this condition for the same reason the other three do:
+        # a sweep that deliberately skipped a file has not checked it, and a deliberate skip is
+        # still a gap in coverage. Announcing it is what keeps "no survivors found" from meaning
+        # "no survivors found in the files I felt like reading".
         if stats.get("truncated") or stats.get("skipped_unreadable") \
-                or stats.get("skipped_large"):
+                or stats.get("skipped_large") or stats.get("skipped_archival"):
             _log(session_id, {"event": "sweep_incomplete", "stats": stats})
             print(f"tier0_gate: cross-file sweep incomplete ({stats}); staleness outside "
                   f"what was scanned has NOT been checked.", file=sys.stderr)
