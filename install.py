@@ -15,7 +15,11 @@ Usage:
     python3 install.py --uninstall     # remove the council (keeps roster.json + logs)
 
 Prerequisites the script verifies:
-    Python 3.10+         (the council scripts use 3.10+ type syntax)
+    Python 3.12+         (check_python below is what enforces it; keep the two in step.
+                          The scripts' own type syntax only needs 3.10 -- the higher
+                          floor is the operator's ruling of 2026-08-11, 3.12 being an
+                          ordinary "recent" version to ask of an installer, and it also
+                          buys headroom for newer regex features in the gate.)
     codex CLI on PATH    (authenticated; gpt-5.6-sol model accessible)
     OPENROUTER_API_KEY   (gemini + deepseek voting members AND the layer-2
                           inspectors kimi/glm/grok all route through OpenRouter)
@@ -205,8 +209,8 @@ def council_module(rep: Reporter):
 
 def check_python(rep: Reporter) -> bool:
     v = sys.version_info
-    if (v.major, v.minor) < (3, 10):
-        rep.err(f"Python 3.10+ required; found {v.major}.{v.minor}.{v.micro}")
+    if (v.major, v.minor) < (3, 12):
+        rep.err(f"Python 3.12+ required; found {v.major}.{v.minor}.{v.micro}")
         return False
     rep.ok(f"Python version OK: {v.major}.{v.minor}.{v.micro}")
     return True

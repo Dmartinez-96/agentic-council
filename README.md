@@ -251,10 +251,18 @@ the leader's write.** It is on by default (`AUTO_REVERT_ON_BLOCK` in
 near your files.
 
 The council reviews at PostToolUse, which is AFTER the write lands, so a `BLOCK`
-could historically only ASK the leader to revert -- and the leader could ignore it. The
-PreToolUse gate, the only layer that can deny a write outright, is a regex and
-catches only the literal trigger phrases. Auto-revert is what makes a quorum
-`BLOCK` mean something.
+could historically only ASK the leader to revert -- and the leader could ignore it.
+Auto-revert is what makes a quorum `BLOCK` mean something.
+
+Two PreToolUse layers CAN deny a write outright, and neither is a substitute for the
+council: `laziness_gate.py` matches literal trigger phrases ("out of scope", "GPU
+required", and similar) against the session's probe markers, and `tier0_gate.py` is
+deterministic rather than phrase-based -- it denies a stale sibling (an edit that rewrites
+an atom such as a number, date, hash or path in one place while an identical one survives
+in the same file), a source pointer like `file.py:123` that does not resolve, and an
+incomplete cross-file sweep. It also calls the doorman, a single cheap model whose
+objection is advisory but arrives BEFORE the write, and whose deny is returned through the
+gate. All of that is cheap and narrow by design; the council is what reads for meaning.
 
 Two guarantees, both implemented and tested:
 
@@ -413,7 +421,11 @@ the installer instead REINSTALLS. (`--dry-run` previews the removal.)
 
 ### Prerequisites
 
-- **Python 3.10+**.
+- **Python 3.12+**. `install.py` refuses to proceed below it. The scripts' own type
+  syntax needs only the older floor this replaced -- audited, and no 3.11-or-later
+  language feature appears in them -- but `council/tier0_gate.py` uses an atomic regex
+  group `(?>...)`, which the CPython `re` documentation marks "Added in version 3.11"
+  (fetched 2026-08-11), and 3.12 is where the project settled.
 - **codex CLI**, authenticated -- the one voting member that is a subprocess. An
   older CLI may not know `gpt-5.6-sol`, and a rejection can also come from your
   account tier rather than the CLI version.
@@ -446,6 +458,64 @@ warnings:
   review depth for EVERY concurrent session that shares this install, not just yours.
   Treat a FAST PASS as "no objection at reduced depth", not a clean bill of health.
 - It changes only the reasoning effort each member is sent, not which models run.
+
+## Testing
+
+The suites ship. Run them:
+
+```
+python3 council/tests/run_tests.py     # the engine suites
+python3 tests/test_install_codex.py    # the Codex-led installer's falsifier
+```
+
+**No suite makes a live model call.** The two that exercise cache accounting replace
+`urllib.request.urlopen` with a stub for the duration. One suite, `test_retrieval.py`,
+declares `# requires: openrouter` and so needs `OPENROUTER_API_KEY` to be *present* -- not
+valid, and not billed: it drives a real `main()`, and `main()` drops every OpenRouter member
+when the key is unset, so without one the stubs it installs are never reached and the suite
+would pass vacuously. Two suites need `bwrap`.
+
+**Expect at least one SKIP on a fresh tree, and more depending on your host.**
+`test_rules_stack.py` exercises base/overlay rules resolution against the real files, and
+those are the ones you create yourself (step 5). Without them it prints the exact paths it
+wanted, skips that group, and exits with the runner's skip code. Measured on this repo at
+2026-08-11T07:06:09Z, against a package tree with no rules files created:
+
+```
+34/35 passed, 0 failed, 1 skipped in 24.7s
+SKIPPED (a missing prerequisite is not a failure):
+  test_rules_stack.py  (resolution group not run, 3 operator-created file(s) absent ...)
+```
+
+That host had `bwrap` and a key. Without `bwrap` you will see two more skips; without a key,
+one more. Nothing is wrong in either case.
+
+To run the resolution group too, create all three of these -- **directories alone are not
+enough, the files themselves have to exist**:
+
+```
+<council_root>/council_ground_rules.md              # step 5
+<council_root>/overlays/models/claude-opus-5.md     # any content
+<council_root>/overlays/roles/leader.md             # must contain "LEAD WORKER"
+```
+
+**A skip is never silent, and that is deliberate.** Three conventions hold it up:
+a suite declares its own prerequisites in a `# requires:` comment and the runner skips it
+when the host cannot meet them; a suite that discovers at RUNTIME that it cannot fully run
+exits 77 and the runner reports it as skipped, using the suite's own last line as the
+reason; and a requirement name the runner does not recognise is a FAILURE, not a skip,
+because a typo in a `# requires:` line would otherwise disable a suite silently and still
+exit 0.
+The third convention is the one to understand if you add a suite of your own: exit 77 is a
+claim the SUITE makes about itself and the runner takes it at face value, so a suite
+returning 77 while something in it had actually failed would hide that failure. The suites
+here return 77 only after confirming nothing failed. Yours should too.
+
+**One suite is deliberately not here.** `test_dialogue_tooling.py` requests the development
+tree's own handoff document through the council's mediated-file path and then asserts on
+what came back -- its check is named "pass-2 prompt carries REAL HANDOFF.md content". That
+document is not shipped, so the suite cannot pass anywhere but the tree it was written in.
+It stays there rather than shipping a suite that fails for a reason you cannot fix.
 
 ## What this costs you
 
@@ -557,20 +627,34 @@ agentic-council/
     council_shadow_audit.py           # vets the layer-2 inspectors
     council_audit_writes.py           # audits writes that bypassed review
     forward_refs.py                   # advisory: prose naming symbols a file does not bind
-    laziness_gate.py                  # PreToolUse hook -> the only layer that can DENY
+    laziness_gate.py                  # PreToolUse hook -> denies on literal trigger phrases
+    tier0_gate.py                     # PreToolUse hook -> deterministic denies; calls the doorman
+    doorman.py                        # one cheap model, consulted BY the gate (not a hook)
+    codex_hook.py                     # Codex CLI lifecycle handler (Codex as leader)
+    brain_index.py                    # imported by codex_hook at module scope
     stop_audit.py                     # Stop hook
     evidence_logger.py                # PostToolUse hook -> the evidence file
     session_start_probe.py            # SessionStart hook -> environment probes
     session_start_directive.py        # SessionStart hook -> research directive
+    hook_env.sh                       # wrapper every hook is invoked through (loads keys)
+    roster.claude-led.json            # roster profile: Claude as leader
+    roster.codex-led.json             # roster profile: Codex as leader
     council_system_prompt.md          # THE QUALITY BAR
     council_dialogue_prompt.md
     council_layer2_prompt.md          # the layer-2 inspector prompt
     council_ground_rules.md           # BASE rules layer -- you create this (step 5)
     overlays/models/<exact-slug>.md   # per-model accrued history (optional)
     overlays/roles/<tier>.md          # per-role authority bounds (optional)
+    tests/                            # the suites + run_tests.py (see "Testing" above)
   vscode-extension/                   # thin GUI panel for the engine (see its README)
   claude-code/
     settings.hooks.template.json
     commands/council.template.md      # the /council slash command
+  codex/
+    hooks.template.json               # the Codex-led hook registration
+  install_codex.py                    # registers the Codex-led lifecycle in ~/.codex
+  tests/
+    test_install_codex.py             # falsifier for install_codex.py's config merge
+  brain/                              # Obsidian-vault scaffolding and templates
   starter-prompts/
 ```

@@ -29,7 +29,8 @@
       "hooks": [
         {
           "type": "command",
-          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/council_advisor.py"
+          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/council_advisor.py",
+          "timeout": 1800
         },
         {
           "type": "command",
@@ -52,7 +53,8 @@
       "hooks": [
         {
           "type": "command",
-          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/stop_audit.py"
+          "command": "{{COUNCIL_ROOT}}/hook_env.sh {{COUNCIL_ROOT}}/stop_audit.py",
+          "timeout": 1800
         }
       ]
     }

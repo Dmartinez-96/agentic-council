@@ -162,7 +162,63 @@ STALE_OK_RE = re.compile(r"stale-ok\s*:", re.IGNORECASE)
 # registry made it worse, latching onto common atoms and blocking every later edit in those
 # files. A check nobody can act on is worse than no check.
 ATOM_RE = re.compile(
-    r"(?<![\w.])(?:"
+    # THE ALTERNATION IS EFFECTIVELY ATOMIC, VIA `(?=(...))\1`, AND THAT IS A BUG FIX.
+    # Yesterday's fix below cured the TRAILING-PERIOD case of a defect whose root cause it named
+    # but did not remove: when a long alternative matches and the trailing lookahead then rejects
+    # it, the regex BACKTRACKS INTO A SHORTER ALTERNATIVE at the same start position, and the
+    # shorter one passes. A period was one trigger. ANY word character is another, and that half
+    # survived.
+    # MEASURED 2026-08-11, and the date class was inconsistent with every other class:
+    #   `2026-08-11T` -> ['2026']      `2026-08-11_v2` -> ['2026']    `2026-08-119` -> ['119','2026']
+    # while the same trailing-word-char condition already yielded [] for versions (`1.2.3x`),
+    # hashes (`17c5983x`) and IPs (`192.168.1.1x`). It also still TRUNCATED a grouped number:
+    # `1,234,567x` -> ['1,234'], which is the same truncation the comment below records fixing
+    # for a trailing period. A truncated atom is worse than none: it is a different, less
+    # specific atom that matches more things.
+    # HOW IT WAS FOUND, because the route matters more than the bug: a malformed timestamp typed
+    # into HANDOFF prose (`2026-08-11T06:5xZ`) yielded a bare `2026`, and THE GATE DENIED THAT
+    # EDIT for leaving the file's other bare `2026`s unswept. The false positive reported itself.
+    # `(?>` IS AN ATOMIC GROUP: once one of the alternatives inside it matches, the engine will not
+    # go back and try a different one. So when the trailing lookahead rejects that match, the
+    # attempt at this start position DIES rather than falling through to something shorter.
+    # IT NEEDS PYTHON 3.11 -- the CPython `re` documentation marks `(?>...)` "Added in version
+    # 3.11" (fetched 2026-08-11) -- AND THIS PROJECT'S FLOOR IS 3.12: install.py's check_python
+    # errors below `(3, 12)` and README declares it. IF THAT FLOOR IS EVER LOWERED BELOW 3.11,
+    # THIS PATTERN MUST GO BACK to the `(?=(X))\1` form it briefly used (a lookahead captures one
+    # alternative, a backreference re-consumes it, needing nothing newer than a backreference) or
+    # the gate will not import at all and every PreToolUse will fail.
+    # WHAT WAS NEVER VERIFIED BY RUNNING IT: that `(?>` actually raises below 3.11. Only
+    # /usr/bin/python3.14 exists on this host, so the docs and the enforced floor are the
+    # evidence, not an observed failure.
+    # THE ATOMIC FORM IS ALSO SIMPLER THAN WHAT IT REPLACED, and the emulation's cost is worth
+    # recording because it was easy to miss: that form needed a CAPTURE GROUP, and `extract_atoms`
+    # calls `ATOM_RE.findall`, which returns GROUPS rather than whole matches the moment a pattern
+    # has any -- so it worked only while exactly one group spanned the whole match. This form has
+    # none, and A1d asserts `ATOM_RE.groups == 0` to keep it that way.
+    # EITHER WAY, a date followed by a word character now matches NOTHING -- consistent with
+    # `a2026-08-06` and `v1.2026`, which already matched nothing at the leading edge.
+    # MEASURED ON THE REAL CORPUS, by the counterfactual this file's comment demands. Three arms of
+    # `gate_replay.py` at 2026-08-11T18:07:16Z, 544 reconstructed edits of 1277 Edit fires, with
+    # the ATOMIC form as the live arm and each arm's blocks enumerated rather than counted:
+    #   pre-yesterday (non-atomic, old lookahead) -> 4: ['398']  grading-contract-design.md,
+    #                                                  ['2026'] training-scorer-design.md,
+    #                                                  ['2026'] HANDOFF.md,
+    #                                                  ['3.10'] install.py
+    #   yesterday     (non-atomic, new lookahead) -> 3: drops the training-scorer ['2026']
+    #   live          (this atomic group)         -> 2: drops the HANDOFF ['2026'] too
+    # So each fix removed exactly one real block, and both removed were BARE-YEAR stale-sibling
+    # false positives on dated prose -- the class these fixes exist for. The two that SURVIVE all
+    # three arms are not dates: ['398'] and ['3.10']. They are the control, and they are why the
+    # remaining count is 2 rather than 0.
+    # AND THE CORPUS IS NOT AN INDEPENDENT SAMPLE, which is the caveat worth carrying forward:
+    # `gate_replay` reconstructs edits from the council logs, so it contains the edits made WHILE
+    # diagnosing this bug -- the HANDOFF ['2026'] block is one of them, and the install.py ['3.10']
+    # block is this session's own incomplete version-floor sweep, caught for real. Read a moved
+    # figure here as a demonstration that the shape occurs on real prose, never as an unbiased
+    # rate. The corpus also MOVES between runs -- it grows as fires land and shrinks as edits are
+    # superseded, per the note further down this block -- so these figures are a snapshot rather
+    # than constants. Observed here: 524 eight hours before it was 544.
+    r"(?<![\w.])(?>"
     r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?)?"   # date +opt HH:MM[:SS][.f][Z]
     r"|\d{1,3}(?:,\d{3})+"          # 18,419
     r"|\d+\.\d+(?:\.\d+)+"          # 2.1.223 -- dotted versions of three or more parts
