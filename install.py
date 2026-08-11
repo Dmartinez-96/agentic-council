@@ -90,10 +90,51 @@ COUNCIL_FILES = [
     # PreToolUse advisory on Bash. The settings template wires a hook to this path, so an
     # install that omits it points a hook at a missing file.
     "scripted_write_guard.py",
+    # THE DETERMINISTIC PreToolUse GATE, and the pre-landing seat it calls. Added 2026-08-10.
+    # THEY INSTALL TOGETHER because the dependency is one-directional and was checked, not
+    # assumed. `grep -n "^\s*import doorman\|doorman\.review" tier0_gate.py` returned two
+    # lines -- an `import doorman` and a `doorman.review(payload)` call -- while searching the
+    # hook registries for "doorman" returned zero occurrences. So doorman.py is NOT a hook:
+    # the gate calls it. A gate installed without it has an unreachable seat, and a doorman
+    # installed alone is code nothing invokes.
+    # ONLY THE GATE NEEDS ITS MODE BIT, and the distinction is worth keeping straight:
+    # EXECUTABLE_FILES below chmods every `.py` here to 0755, but that bit is load-bearing only
+    # for a script the template EXECS. The template invokes `hook_env.sh <path>` and hook_env
+    # ends in `exec "$@"`, so a non-executable gate never runs at all -- measured 2026-08-10
+    # against a `-rw-rw-r--` file: `hook_env.sh ./doorman.py` -> rc=126, and the same command
+    # with `python3` inserted -> rc=0. WHAT THAT ESTABLISHES is that the gate's checks do not
+    # execute; what the harness then does with a hook that failed to exec is NOT established
+    # here and is deliberately not asserted. Either way the protection is absent while the
+    # configuration still looks correct, which is why the mode bit belongs to the installer
+    # rather than to whoever remembers to set it.
+    # doorman.py is IMPORTED, never exec'd, so its own bit is inert; it gets one only because
+    # this list does not special-case extensions.
+    "tier0_gate.py",
+    "doorman.py",
     "stop_audit.py",
     "session_start_probe.py",
     "session_start_directive.py",
     "evidence_logger.py",
+    # THE CODEX-LED LIFECYCLE. Added 2026-08-10; without these an install cannot run a
+    # Codex-led session at all. codex_hook.py is the Codex CLI's
+    # SessionStart/PreToolUse/PostToolUse/Stop handler, and its line 32 is a module-scope
+    # `import brain_index`, so brain_index.py is a hard dependency exactly like
+    # council_events.py above -- omitting it raises ModuleNotFoundError on every invocation.
+    "codex_hook.py",
+    "brain_index.py",
+    # BOTH PROFILES, and the asymmetry is why neither is optional. hook_env.sh points
+    # COUNCIL_ROSTER_PATH at `roster.<harness>-led.json`, so a missing file is a missing
+    # profile -- and the two harnesses answer that very differently.
+    # MEASURED 2026-08-10 against an absent path: consult_council's loader returns its built-in
+    # DEFAULT_REGISTRY (its own comment names the case, "No roster file at all: a fresh
+    # install"), so a CLAUDE-led council still fires. codex_hook does not: _profile_error()
+    # returned "Codex council profile unreadable: [Errno 2] No such file or directory", and
+    # codex_hook.py:794-796 reads `profile_error = _profile_error()` / `if profile_error:` /
+    # `return emit_pre_deny(...)` -- so every apply_patch is denied.
+    # An install missing these therefore leaves Claude-led working and Codex-led unable to edit
+    # anything, which is the worse half of the pair to discover from a blocked session.
+    "roster.claude-led.json",
+    "roster.codex-led.json",
     # Every hook is invoked THROUGH this wrapper (see the hooks template), so an install
     # that omits it leaves every configured hook pointing at a file that is not there.
     # It loads OPENROUTER_API_KEY when the launching environment did not carry it, which

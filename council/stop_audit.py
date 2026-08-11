@@ -40,6 +40,7 @@ correctly whether or not the field is present.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -210,6 +211,47 @@ def write_draft_tempfile(session_id: str, content: str) -> Path:
     return path
 
 
+def _stop_heartbeat_quietly(handle, probe_path: Path | None = None) -> None:
+    """Stop a probe heartbeat and RECORD THAT IT STOPPED CLEANLY. Swallows everything.
+
+    Its own function rather than an inline call because the handle is produced inside a
+    try block whose import may have failed, so the module alias is not reliably bound at
+    the call sites. Re-importing here is cheap (sys.modules hit) and cannot raise past
+    this frame. An instrument that can break the Stop hook is worse than no instrument:
+    this hook runs at the end of every turn.
+
+    WHY THE TERMINAL RECORD EXISTS, found by running the probe rather than by reading it:
+    without it the sidecar CANNOT ANSWER THE QUESTION IT WAS BUILT FOR. A Stop hook that
+    finishes normally simply stops beating, and so does one that is killed -- both leave a
+    file whose last beat is merely old. council_advisor does not have this problem because
+    deleting its marker is the success signal; the probe writes no marker, so it needs an
+    explicit one. A sidecar whose final line has `"end": "clean"` SURVIVED; a sidecar
+    without one was killed mid-audit, and its last beat dates the kill.
+
+    The record is appended AFTER the join, so it cannot interleave with a live beat."""
+    if handle is None:
+        return
+    try:
+        import council_advisor as _ca_hb
+        _ca_hb.stop_heartbeat(handle)
+    except Exception:  # noqa: BLE001
+        pass
+    if probe_path is None:
+        return
+    try:
+        beats = Path(str(probe_path) + ".beats")
+        if beats.exists():
+            with open(beats, "a") as fh:
+                fh.write(json.dumps({
+                    "t": datetime.now(timezone.utc).isoformat(),
+                    "end": "clean",
+                }) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def audit_one_block(content: str, session_id: str, cwd: str) -> tuple[int, str, str]:
     """Run the council wrapper on a single tagged block.
 
@@ -232,6 +274,33 @@ def audit_one_block(content: str, session_id: str, cwd: str) -> tuple[int, str, 
         f"{content}\n"
         f"--- Tagged outward-prose block end ---\n"
     )
+    # DOES THE STOP HOOK HAVE A KILL DEADLINE OF ITS OWN? PostToolUse fires were measured
+    # dying in a 0.2s window near 596s elapsed, and the natural fix for that -- letting the
+    # Stop hook wait at end of turn for reviews still in flight -- is only safe if the Stop
+    # hook is not killed the same way. THAT IS UNKNOWN, so measure it before designing
+    # around it rather than assuming either answer.
+    #
+    # Same heartbeat mechanism as council_advisor, deliberately: a sidecar whose last beat
+    # dates the death. A SEPARATE DIRECTORY, `stop-probe/`, NOT `pending-review/`, because
+    # orphan_markers() globs `*.json` there and loss_analysis globs `*.beats` there -- a
+    # probe left in that directory would be reported as a lost REVIEW, which it is not, and
+    # would contaminate the death table this probe exists to extend.
+    #
+    # NO MARKER FILE IS WRITTEN, only beats. There is nothing here to reconcile: the audit's
+    # outcome already reaches the agent through this function's return value.
+    beat = None
+    probe_path = None
+    try:
+        import council_advisor as _ca_hb
+        probe_dir = (_ca_hb.EVIDENCE_STATE_ROOT
+                     / (session_id or "_no_session") / "stop-probe")
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        probe_path = probe_dir / f"{stamp}.stopprobe"
+        beat = _ca_hb.start_heartbeat(probe_path)
+    except Exception:  # noqa: BLE001  instrumentation must never break the hook
+        beat = None
+        probe_path = None
     try:
         proc = subprocess.run(
             cmd,
@@ -242,11 +311,13 @@ def audit_one_block(content: str, session_id: str, cwd: str) -> tuple[int, str, 
             timeout=900,
         )
     except subprocess.TimeoutExpired:
+        _stop_heartbeat_quietly(beat, probe_path)
         return 2, "", (
             f"stop-audit: council timed out (>900s) auditing draft "
             f"at {draft_path}. Stopping anyway, but the audit did not "
             f"complete."
         )
+    _stop_heartbeat_quietly(beat)
     return proc.returncode, proc.stdout, proc.stderr
 
 

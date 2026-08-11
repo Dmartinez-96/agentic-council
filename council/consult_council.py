@@ -2006,6 +2006,25 @@ async def _run_subprocess(cmd: list[str], cwd: Path, role: str,
     }
 
 
+# A NESTED CODEX RUN MUST NOT INHERIT THE OPERATOR'S CODEX HOOKS -- the same requirement
+# CLAUDE_RUNTIME_GUARD's `--safe-mode` meets for the claude seat, and it was NOT met here.
+# MEASURED 2026-08-10 on an idle machine, same argv both times: without this flag a member-shaped
+# `codex exec` printed four `hook: ` lines (SessionStart, SessionStart Completed, Stop, Stop
+# Completed) and grew ~/.codex/state by two files; with `--disable hooks` it printed ZERO hook
+# lines and still answered, rc=0 both ways. So the council's own codex_hook.py was firing inside
+# every codex seat: a SessionStart doing profile/probe/brain work per member call, and a Stop
+# AUDIT running against a critic -- which is exactly the "could make a Stop audit steer the
+# critic" hazard CLAUDE_RUNTIME_GUARD's comment names.
+# WHAT THIS DOES NOT CLAIM: that the missing flag caused the review timeouts being investigated
+# when it was found. It did not -- with hooks active a member-shaped run still returned in 6s.
+# This is a correctness and independence fix, not a performance one.
+# BAKED IN RATHER THAN PASSED BY CALLERS, matching claude_cmd: both call sites (run_codex for a
+# member, _call_leader for a subprocess leader) are nested inside a council process, so neither
+# should run the operator's lifecycle. A future caller that genuinely needs hooks has to say so
+# explicitly rather than getting them by forgetting.
+CODEX_RUNTIME_GUARD = ("--disable", "hooks")
+
+
 def codex_cmd(out_path: Path, json_events: bool = False) -> list[str]:
     # The prompt is delivered on stdin (the trailing "-" tells codex to
     # read instructions from stdin, per `codex exec --help`), not as an
@@ -2020,6 +2039,7 @@ def codex_cmd(out_path: Path, json_events: bool = False) -> list[str]:
         "--skip-git-repo-check",
         "--sandbox", "read-only",
         "--color", "never",
+        *CODEX_RUNTIME_GUARD,
         "--output-last-message", str(out_path),
         "-c", f'model="{CODEX_MODEL}"',
         "-c", f'model_reasoning_effort="{effort_for("codex")}"',

@@ -1,0 +1,59 @@
+{
+  "description": "Agentic Council lifecycle integration for Codex CLI.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{COUNCIL_ROOT}}/hook_env.sh --harness codex python3 {{COUNCIL_ROOT}}/codex_hook.py session-start",
+            "timeout": 180,
+            "statusMessage": "Loading Council profile, probes, and Brain index",
+            "additionalContextLimit": 20000
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{COUNCIL_ROOT}}/hook_env.sh --harness codex python3 {{COUNCIL_ROOT}}/codex_hook.py pre-tool",
+            "timeout": 7200,
+            "statusMessage": "Preparing Council snapshot or reconciling a prior patch",
+            "additionalContextLimit": 20000
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{COUNCIL_ROOT}}/hook_env.sh --harness codex python3 {{COUNCIL_ROOT}}/codex_hook.py post-tool",
+            "timeout": 7200,
+            "statusMessage": "Running the complete-patch Council review",
+            "additionalContextLimit": 20000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{COUNCIL_ROOT}}/hook_env.sh --harness codex python3 {{COUNCIL_ROOT}}/codex_hook.py stop",
+            "timeout": 7200,
+            "statusMessage": "Running the Council stop audit"
+          }
+        ]
+      }
+    ]
+  }
+}

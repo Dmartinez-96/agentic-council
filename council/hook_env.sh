@@ -66,6 +66,25 @@ if [ -r "$HOME/.config/council/env" ]; then
     . "$HOME/.config/council/env"
 fi
 if [ -n "$_council_saved_openrouter" ]; then
+    # CALLER PRECEDENCE IS DELIBERATE -- it allows a per-invocation override -- but it has a
+    # failure mode that is silent by construction: a session inherits the key present when it
+    # STARTED, so one launched before a key change keeps the dead key for its whole life, no
+    # matter what the file says. The only symptom is HTTP 401 "User not found" buried in
+    # per-member stderr while the fire still returns a verdict, which reads as the council
+    # being down rather than as one session holding a stale credential.
+    # OBSERVED 2026-08-09: a live session's /proc environ carried a key whose hash differed
+    # from the file's, and 5 of its 6 voting members 401'd on every fire while other sessions
+    # on the same machine, same minutes, same endpoint, had none.
+    # So the precedence stays and the SILENCE goes. Only the FACT of a mismatch is printed --
+    # never either value, not even a prefix.
+    if [ "$_council_saved_openrouter" != "${OPENROUTER_API_KEY:-}" ]; then
+        printf '%s\n' \
+"hook_env: OPENROUTER_API_KEY is set in the ENVIRONMENT and differs from the one in \
+~/.config/council/env. The environment's is being used (documented precedence). If council \
+fires are failing with HTTP 401 'User not found', this session is holding a key from before \
+the last change: run 'unset OPENROUTER_API_KEY' in the launching shell and restart the \
+session." >&2
+    fi
     OPENROUTER_API_KEY=$_council_saved_openrouter
     export OPENROUTER_API_KEY
 fi
