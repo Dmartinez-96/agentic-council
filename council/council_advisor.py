@@ -616,12 +616,41 @@ def target_path_for_log(tool_name: str, tool_input: dict) -> str:
 # manual runs reach 1459s), but that is UNCONFIRMED and this instrument is deliberately
 # agnostic to it -- it measures the loss, whatever causes it.
 PENDING_DIRNAME = "pending-review"
+
+# HOW LONG THIS WRAPPER LETS A FIRE RUN. ONE constant, used BOTH as the subprocess timeout
+# and as the orphan age below, because those two are the same fact. They were previously two
+# literals, and the old comment on ORPHAN_MIN_AGE_S asserted "900s matches the wrapper
+# timeout above" -- exactly the sentence a later edit to one literal silently falsifies.
+# Deriving one from the other removes the possibility rather than documenting it.
+#
+# WHY 1500 AND NOT 900. The engine's per-member cap is PER_CRITIC_TIMEOUT_S = 600
+# (consult_council.py:310) and its phases are SEQUENTIAL -- voting round 1, then round 2,
+# then the inspector pass -- so a fire behaving exactly as designed can need up to 1800s. A
+# 900s wrapper cap therefore killed fires at half their sanctioned budget.
+# MEASURED over the full-depth corpus, re-run against logs/ when this line was written.
+# floor = the sum over phases of that phase's slowest usable member, which is a LOWER bound
+# on a fire because it excludes the doorman, dialogue, prompt assembly and I/O:
+#     n = 1533 fires with a rankable floor
+#     >600s: 55    >900s: 12    >1200s: 4    >1500s: 0    max floor 1445.8s
+# So the 900s cap was demonstrably cutting into real fires, and 1500 clears every floor in
+# the corpus. WHAT THAT DOES NOT ESTABLISH: that 1500 is sufficient in general -- the sample
+# is right-censored BY the old 900s cap, so fires that would have run longer were killed
+# before they could be measured, and the salvage path below exists precisely because a cap
+# can still be hit.
+#
+# 1500 SITS BETWEEN TWO WALLS AND MUST STAY THERE. Below: PER_CRITIC_TIMEOUT_S x 3 = 1800 is
+# what the engine may legitimately want. Above: the Claude Code hook `timeout` is 1800
+# (claude-code/settings.hooks.template.json), and this wrapper needs headroom UNDER that wall
+# to notice its own timeout and still deliver a report -- a cap of 1800 here would be
+# cancelled by the harness mid-report and salvage nothing.
+FIRE_TIMEOUT_S = 1500
+
 # An orphan younger than this may simply be a fire still running in a concurrent hook --
 # concurrency SERIALIZES fires rather than dropping them (measured: 4 concurrent advisors
 # all logged, but wall time went 81s -> 326s), so a live sibling is expected and must not
-# be reported as a loss. 900s matches the wrapper timeout above: past it, no live fire of
-# ours can still be running, because subprocess.run would already have raised.
-ORPHAN_MIN_AGE_S = 900
+# be reported as a loss. Past FIRE_TIMEOUT_S no live fire of OURS can still be running,
+# because subprocess.run would already have raised.
+ORPHAN_MIN_AGE_S = FIRE_TIMEOUT_S
 
 
 def _pending_dir(session_id: str) -> Path:
@@ -635,10 +664,18 @@ def _pending_dir(session_id: str) -> Path:
 
 
 def write_pending_marker(session_id: str, tool_name: str, target: str,
-                         tool_use_id: str = "") -> Path | None:
+                         tool_use_id: str = "", cwd: str = "") -> Path | None:
     """Record that a review is STARTING. Returns the marker path, or None if it could not
     be written -- never raises, because failing to instrument a review must not also
-    prevent it."""
+    prevent it.
+
+    `cwd` IS FOR NAMING THE SESSION TO A HUMAN. A watcher showing several concurrent fires
+    has to label the rows, and a session id is a 36-character hash that identifies nothing to
+    a reader. The working directory is what an operator actually recognises. It is recorded
+    here rather than derived from `target` because a target path names the FILE being edited,
+    whose parent directory is often a subdirectory several levels below the tree the session
+    is working in.
+    """
     try:
         d = _pending_dir(session_id)
         d.mkdir(parents=True, exist_ok=True)
@@ -651,6 +688,9 @@ def write_pending_marker(session_id: str, tool_name: str, target: str,
             "target_path": target,
             "tool_use_id": tool_use_id,
             "session_id": session_id,
+            # Absent on markers written before this field existed; a reader must treat a
+            # missing value as UNKNOWN and fall back to the session id rather than to "".
+            "cwd": cwd,
         }
         # fsync before the council starts: a marker lost to a page cache on a killed
         # process would defeat the entire mechanism.
@@ -785,17 +825,82 @@ def stop_heartbeat(handle: tuple[threading.Event, threading.Thread] | None) -> N
         pass
 
 
+def _events_path(marker: Path) -> Path:
+    """Sidecar holding the engine's NDJSON progress stream for this fire.
+
+    APPENDED, not Path.with_suffix, for the same reason as _beats_path above: a tool_use_id
+    may contain dots and with_suffix would replace from the last one, collapsing two markers
+    onto one sidecar.
+
+    IT MUST NOT LOOK LIKE A MARKER. Both readers of this directory glob `*.json` --
+    count_inflight() at the module level and orphan_markers() below -- and a name ending
+    `.json.events` does not match that pattern, while a real `<id>.json` marker still does.
+    Re-checked with fnmatch against both patterns and a positive control when this was added,
+    because a third sidecar that DID match would inflate the in-flight count and manufacture
+    phantom lost reviews."""
+    return Path(str(marker) + ".events")
+
+
+def marker_is_live(marker: Path) -> bool:
+    """True when this marker could still belong to a RUNNING fire.
+
+    IT LIVES HERE BECAUSE THIS MODULE OWNS THE MARKERS. Two readers need the rule -- the
+    statusline and council_watch's --follow -- and a copy in each would be a third definition
+    of "live" free to drift from the writers above.
+
+    A MARKER'S PRESENCE IS NOT LIVENESS. A marker is removed when its fire returns by any
+    route, so a surviving one is either a fire still running or a fire that died without
+    cleaning up, and only evidence beyond existence separates them. Two gates, cheapest
+    first:
+      AGE, from mtime, which keeps meaning "when this started" because the heartbeat beats
+      into a sidecar rather than the marker. Past FIRE_TIMEOUT_S the subprocess.run that owns
+      the fire would already have raised, so nothing of ours is still under it.
+      THE PID, `os.getpid()` recorded by write_pending_marker above, i.e. this process. If
+      that pid is gone the fire is not running, whatever the age says.
+
+    WHAT IT DOES NOT ESTABLISH: that the fire IS running. A pid can be REUSED, and a live
+    advisor is not proof its engine still works. The claim is bounded to "could be", which is
+    what a progress view needs. The asymmetry is why the pid gate earns its place: reuse can
+    only manufacture a false LIVE, and only inside the age window that already gated it,
+    whereas dropping the gate lets every marker that outlives its fire read as live for the
+    whole of FIRE_TIMEOUT_S.
+
+    ACCEPTS BOTH PID FIELD NAMES: the review marker written above carries
+    `started_monotonic_pid`; the tier-0 gate's doorman marker carries `pid`. One rule, two
+    writers.
+    """
+    try:
+        if (datetime.now(timezone.utc).timestamp() - marker.stat().st_mtime
+                >= FIRE_TIMEOUT_S):
+            return False
+    except OSError:
+        return False
+    try:
+        rec = json.loads(marker.read_text())
+        pid = rec.get("started_monotonic_pid", rec.get("pid"))
+    except (OSError, ValueError):
+        return True      # unreadable mid-write: the age gate above already passed
+    if not isinstance(pid, int):
+        return True      # predates the pid field; age is all there is
+    return Path(f"/proc/{pid}").exists()
+
+
 def clear_pending_marker(path: Path | None) -> None:
-    """Mark this review COMPLETE by removing its marker and its beat sidecar. Idempotent
+    """Mark this review COMPLETE by removing its marker and its sidecars. Idempotent
     and never raises.
 
-    THE SIDECAR GOES TOO. Beats are diagnostic evidence about a review that DIED; for one
-    that finished, the log entry is the record and a leftover sidecar would just accumulate
-    a file per successful fire forever. A marker that gets ARCHIVED rather than cleared
-    keeps its beats, which is the case the evidence is actually for."""
+    THE SIDECARS GO TOO. Beats and events are diagnostic evidence about a review that DIED;
+    for one that finished, the log entry is the record and leftover sidecars would just
+    accumulate files per successful fire forever. A marker that gets ARCHIVED rather than
+    cleared keeps them, which is the case the evidence is actually for.
+
+    CONSTRAINT ON ANY CALLER THAT WANTS THE EVENTS SIDECAR: take it FIRST. On a route where
+    the engine produced no log -- a killed fire -- that sidecar is the only surviving record
+    of the seat-rounds that did finish, and this function deletes it like any other. Copy or
+    rename it before calling, or it is gone."""
     if path is None:
         return
-    for p in (path, _beats_path(path)):
+    for p in (path, _beats_path(path), _events_path(path)):
         try:
             p.unlink()
         except OSError:
@@ -948,6 +1053,230 @@ def batch_probe(payload: dict, tool_input: dict) -> None:
         pass
 
 
+# --- SALVAGE: what survives when a fire is killed before it can report -------------
+#
+# THE LOSS THIS ADDRESSES. When this wrapper's timeout fires, subprocess.run kills the
+# engine, and the engine writes its log entry only at the very end -- so the whole review
+# goes, including rounds that had already finished. Re-measured against logs/ when this was
+# written, for the two fires that reported timing out on 2026-08-11: emit_tty.sh has 0 log
+# entries, and member_timing.py has 4, all of which carry a final_verdict and so completed.
+# WHAT THAT DOES NOT ESTABLISH: that the kill CAUSED the absence. No cancellation was
+# observed; what is established is that a fire reported as timed out left no log behind.
+#
+# WHAT MAKES RECOVERY POSSIBLE is that the engine streams NDJSON progress records to
+# --events-fd as each seat lands, and every member_finished record carries that seat's
+# verdict AND its member_text. So the completed seat-rounds are already on disk when the
+# kill arrives; nothing new has to be computed, only read.
+PARTIAL_STORE = COUNCIL_ROOT / "partials.jsonl"
+
+# Round numbers as the engine emits them. Verified against the four _seat call sites in
+# consult_council.py rather than assumed: 7218 voting/1, 7279 voting/2, 7355 inspector/3,
+# 7383 inspector/4 -- and pass 2 is gated on `if requesters:` (7377), so round 4 covers only
+# the inspectors that asked for tooling, which is why a missing round 4 is normal.
+_ROUND_LABELS = {1: "voting r1", 2: "voting r2", 3: "inspectors", 4: "inspectors pass2"}
+
+
+def _int(value: object) -> int:
+    """Best-effort int, never raising.
+
+    ONE DAMAGED RECORD MUST NOT DEFEAT THE SALVAGE. read_events already tolerates a torn
+    line; it would be pointless for the reducer to then die on a record whose `round` is a
+    string, a dict, or absent. `int(x or 0)` -- the first version of this -- raises on all
+    three, so a single malformed event could have cost the entire partial review. 0 is
+    returned instead, which lands the record under an unknown round and keeps its verdict.
+    """
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_events(path: Path) -> list[dict]:
+    """Parse an events sidecar into records, tolerating a truncated tail.
+
+    A KILLED FIRE'S LAST LINE MAY BE HALF-WRITTEN, which is exactly the case this has to
+    survive: the emitter writes whole records but the process can die mid-write, so the final
+    line may be incomplete JSON. Each line is parsed independently and unparseable ones are
+    SKIPPED rather than aborting the read -- keeping every intact record is the whole point,
+    and a parser that gave up at the first bad line would return nothing at all.
+    """
+    out: list[dict] = []
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue          # truncated tail, or a torn write; skip it, keep the rest
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def summarise_partial(records: list[dict]) -> dict:
+    """Reduce a fire's event stream to what a partial report needs.
+
+    Returns counts per round, the seats still outstanding, and each finished seat's LATEST
+    verdict and text. "Latest" matters: a voting seat appears in round 1 and again in round
+    2, and round 2 is the one the council would have aggregated, so a later record for the
+    same seat supersedes an earlier one.
+    """
+    expected: dict[str, list[str]] = {"voting": [], "inspector": []}
+    started: dict[int, set[str]] = {}
+    finished: dict[int, set[str]] = {}
+    seats: dict[str, dict] = {}
+    corrected: list[dict] = []
+    for rec in records:
+        ev = rec.get("ev")
+        if ev == "run_started":
+            for key, field in (("voting", "voting"), ("inspector", "inspectors")):
+                names = rec.get(field)
+                if isinstance(names, list):
+                    expected[key] = [str(n) for n in names]
+        elif ev == "member_started":
+            started.setdefault(_int(rec.get("round")), set()).add(str(rec.get("member")))
+        elif ev == "member_finished":
+            rnd = _int(rec.get("round"))
+            finished.setdefault(rnd, set()).add(str(rec.get("member")))
+            seats[str(rec.get("member"))] = {
+                "round": rnd,
+                "tier": rec.get("tier"),
+                "verdict": rec.get("verdict"),
+                "text": rec.get("member_text"),
+                "duration_s": rec.get("duration_s"),
+            }
+        elif ev == "member_corrected":
+            # A seat's verdict CHANGED after it was first reported. Carried through so a
+            # partial never quotes a verdict the council itself would have superseded.
+            corrected.append(rec)
+            m = str(rec.get("member"))
+            if m in seats:
+                seats[m]["verdict"] = rec.get("verdict")
+                seats[m]["corrected_from"] = rec.get("was")
+    return {"expected": expected, "started": started, "finished": finished,
+            "seats": seats, "corrected": corrected}
+
+
+def format_partial(summary: dict, tool_name: str, target: str, elapsed_s: int) -> str:
+    """Render the partial review for the agent.
+
+    THREE THINGS THIS MUST NOT DO, each of which would turn a salvage into a hazard.
+    (1) It must never read as a PASS. A partial is not a clean bill of health, and the whole
+        pending-marker mechanism exists because absence of a verdict reads as approval.
+    (2) It must name WHO IS MISSING, not just how many, because which seats are absent is
+        the information that tells a reader how much the surviving verdicts are worth.
+    (3) It must state the SELECTION BIAS, which is measured rather than supposed: over the
+        full-depth corpus (n=1543 voting rounds of each kind), kimi and deepseek together
+        were the slowest seat in 79.3% of round 1s and 81.0% of round 2s. The seats that
+        survive a timeout are therefore the fast ones, so a partial that looks unanimous may
+        simply be missing the seats most likely to dissent.
+    """
+    exp = summary["expected"]
+    fin = summary["finished"]
+    seats = summary["seats"]
+    lines = [
+        f"COUNCIL PARTIAL REVIEW -- the fire was cut off at {elapsed_s}s reviewing "
+        f"{tool_name} on {target}. THIS IS NOT A COMPLETE REVIEW AND NOT A PASS.",
+        "",
+        "COMPLETED SEAT-ROUNDS:",
+    ]
+    for rnd in (1, 2, 3, 4):
+        done = sorted(fin.get(rnd, set()))
+        if not done and rnd == 4:
+            continue          # pass 2 runs only for inspectors that requested tooling
+        total = len(exp["inspector"] if rnd in (3, 4) else exp["voting"])
+        lines.append(f"  {_ROUND_LABELS[rnd]:<16} {len(done)}/{total or '?'}"
+                     + (f"  ({', '.join(done)})" if done else ""))
+    missing_v = [m for m in exp["voting"] if m not in fin.get(2, set())]
+    missing_i = [m for m in exp["inspector"] if m not in fin.get(3, set())]
+    if missing_v or missing_i:
+        lines += ["", "NEVER REPORTED (their round did not finish):"]
+        if missing_v:
+            lines.append(f"  voting round 2: {', '.join(missing_v)}")
+        if missing_i:
+            lines.append(f"  inspectors:     {', '.join(missing_i)}")
+    lines += [
+        "",
+        "HOW MUCH THIS IS WORTH: the seats that finish first are systematically the FAST "
+        "ones. Measured over the full-depth corpus, kimi and deepseek together were the "
+        "slowest voter in 79.3% of round 1s and 81.0% of round 2s (n=1543 each). A partial "
+        "that looks unanimous may simply be missing the seats most likely to have "
+        "dissented. Treat what follows as evidence, never as a verdict.",
+    ]
+    if summary["corrected"]:
+        lines.append(f"NOTE: {len(summary['corrected'])} seat(s) had a verdict CORRECTED "
+                     f"after first reporting; the corrected value is shown.")
+    blocked = [m for m, s in seats.items() if str(s.get("verdict")).upper() == "BLOCK"]
+    if blocked:
+        # WHY THE DOWNGRADE IS EXPLAINED PER SEAT AND NOT ONCE. The first version of this
+        # said a BLOCK "never got a round 2" -- which is false whenever the fire died during
+        # the INSPECTOR phase, since voting round 2 had already completed by then. Two
+        # different situations, two different reasons, so the seat's own round decides which
+        # sentence it gets.
+        pre_r2 = sorted(m for m in blocked if _int(seats[m].get("round")) < 2)
+        post_r2 = sorted(m for m in blocked if _int(seats[m].get("round")) >= 2)
+        lines += ["", f"A SEAT SAID BLOCK: {', '.join(sorted(blocked))}. Reported here as a "
+                      f"WARN; it does NOT trigger the revert protocol."]
+        if pre_r2:
+            lines.append(
+                f"  {', '.join(pre_r2)}: blocked in round 1, and this fire never reached the "
+                f"round 2 where peers confirm a BLOCK or talk it down. The seat has not yet "
+                f"been tested against anyone.")
+        if post_r2:
+            lines.append(
+                f"  {', '.join(post_r2)}: blocked in a round its peers DID see, so this one "
+                f"is not untested -- it is downgraded only because the panel is incomplete "
+                f"and the aggregate verdict was never computed.")
+        lines.append("  Either way: read the reasoning below and decide deliberately rather "
+                     "than treating the downgrade as a dismissal.")
+    if seats:
+        lines += ["", "VERDICTS FROM SEATS THAT FINISHED (latest round each reached):"]
+        for name in sorted(seats):
+            s = seats[name]
+            lines.append(f"  {name:<10} {str(s.get('verdict')):<12} "
+                         f"({_ROUND_LABELS.get(s.get('round'), '?')}, "
+                         f"{s.get('duration_s')}s)")
+        for name in sorted(seats):
+            body = (seats[name].get("text") or "").strip()
+            if body:
+                lines += ["", f"## {name} (partial, {seats[name].get('verdict')})", body]
+    return "\n".join(lines)
+
+
+def record_partial(summary: dict, tool_name: str, target: str, session_id: str,
+                   elapsed_s: int) -> None:
+    """Append a partial fire to its OWN store, never to logs/.
+
+    DELIBERATELY NOT logs/. Every existing consumer -- council_outcome's cohorts, the GUI's
+    depth audit, any clean-rate computation -- globs logs/*/*.json and assumes each entry is
+    a COMPLETED review. Dropping partials in there would make them count as fires, and a
+    consumer that predates the flag would read a missing `partial` key as False, which is
+    precisely the launder-a-weaker-look-as-full-strength move this project exists to stop.
+    A separate store keeps the corpus meaning what it already meant while making the timeout
+    rate computable for the first time. Never raises: salvage must not fail the hook."""
+    try:
+        rec = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_id": session_id,
+            "tool_name": tool_name,
+            "target_path": target,
+            "elapsed_s": elapsed_s,
+            "partial": True,
+            "completed": {str(k): sorted(v) for k, v in summary["finished"].items()},
+            "expected": summary["expected"],
+            "verdicts": {m: s.get("verdict") for m, s in summary["seats"].items()},
+        }
+        with PARTIAL_STORE.open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:  # noqa: BLE001  salvage must never break the hook
+        pass
+
+
 def main() -> int:
     # Kill switch: `touch <council dir>/DISABLED` silences this hook;
     # `rm` re-enables it. Checked per call, so it works mid-session.
@@ -1040,11 +1369,27 @@ def main() -> int:
     # its own orphan report.
     prior_orphans = orphan_markers(session_id)
     marker = write_pending_marker(session_id, tool_name, target_for_log,
-                                  payload.get("tool_use_id") or "")
+                                  payload.get("tool_use_id") or "", cwd)
     # Beats start BEFORE the subprocess and stop on every route out, exactly mirroring the
     # marker. If this fire is killed, the sidecar's last line dates the death and records
     # how many fires were in flight at that moment -- the two things a bare marker cannot
     # say and that every hypothesis about the cause needs.
+    # THE EVENTS SIDECAR, opened BEFORE the fire so the engine can stream into it as each
+    # seat lands. Without a marker there is nowhere to put it (the pending dir is what could
+    # not be written), and salvage degrades to the bare timeout notice rather than failing.
+    #
+    # A FILE, because the records must OUTLIVE THE PROCESS THAT WROTE THEM. That is the
+    # whole requirement here and it is enough on its own: this hook has no live reader, and
+    # whatever the engine streamed has to still be on disk after the kill.
+    events_file = _events_path(marker) if marker is not None else None
+    events_fd = None
+    if events_file is not None:
+        try:
+            events_fd = os.open(events_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        except OSError:
+            events_fd = None          # instrumenting a review must never prevent it
+    if events_fd is not None:
+        cmd.extend(["--events-fd", str(events_fd)])
     beat = start_heartbeat(marker)
     try:
         proc = subprocess.run(
@@ -1053,18 +1398,73 @@ def main() -> int:
             text=True,
             capture_output=True,
             cwd=cwd,
-            timeout=900,
+            timeout=FIRE_TIMEOUT_S,
+            # pass_fds keeps the descriptor open ACROSS the fork and clears FD_CLOEXEC on
+            # it, which is what makes the number in --events-fd mean the same thing in the
+            # child. MEASURED with a discriminating probe rather than assumed, because the
+            # whole salvage rests on it: a child handed this fd number wrote its record and
+            # the sidecar grew to 25 bytes WITH pass_fds, and raised OSError errno 9 (EBADF)
+            # leaving the sidecar at 0 bytes WITHOUT it.
+            # NOT silent, to be exact: the engine checks the fd's access mode up front and
+            # prints "--events-fd N unusable ... continuing without progress events" on
+            # stderr, then runs the review anyway. So a broken fd costs the salvage, not the
+            # review -- but it is announced, and an operator who reads stderr will see it.
+            pass_fds=(events_fd,) if events_fd is not None else (),
         )
     except subprocess.TimeoutExpired:
         # A timeout COMPLETED the attempt and says so to the agent below, so it is not a
         # silent loss and must not leave a marker behind.
+        # The duration is INTERPOLATED, never spelled out: this sentence used to read
+        # ">900s" as a literal, which is the same drift hazard the constant above exists to
+        # remove -- a cap change would have left the notice quoting the old number.
         stop_heartbeat(beat)
+        # SALVAGE BEFORE CLEARING, because clear_pending_marker deletes this sidecar along
+        # with the marker, and on a timed-out fire there may be nothing else.
+        # WHAT IS VERIFIED, and only this: an UNTRUNCATED grep for write_log across the
+        # engine returns 7 lines -- the definition (6579), five mentions in comments, and
+        # exactly ONE executable call (7431), which sits below the four seat-round calls in
+        # the same function. (The first version of this check was piped through `head`, so
+        # it could not have shown a call site it truncated; that is the pipeline-ate-the-
+        # verdict trap, caught by re-running without it.) Grep gives textual position, not
+        # an execution trace, so the claim stays narrow: a process killed before reaching
+        # that single call writes no logs/ entry.
+        # THE CORPUS AGREES, stated carefully because the raw counts invite a misreading:
+        # of the two fires that reported timing out on 2026-08-11, emit_tty.sh has 0 log
+        # entries, and member_timing.py has 4 -- but all 4 carry a final_verdict, i.e. they
+        # are the fires on that file which COMPLETED, not the one that timed out. Neither
+        # timed-out fire left an entry. The CAUSE of the absence remains unobserved.
+        salvaged = ""
+        if events_fd is not None:
+            try:
+                os.close(events_fd)
+            except OSError:
+                pass
+            events_fd = None
+        if events_file is not None:
+            summary = summarise_partial(read_events(events_file))
+            if summary["seats"]:
+                salvaged = format_partial(summary, tool_name, target_for_log,
+                                          FIRE_TIMEOUT_S)
+                record_partial(summary, tool_name, target_for_log, session_id,
+                               FIRE_TIMEOUT_S)
         clear_pending_marker(marker)
+        if salvaged:
+            return emit_warning(salvaged)
         return emit_warning(
-            f"Council timed out (>900s) reviewing {tool_name} on "
+            f"Council timed out (>{FIRE_TIMEOUT_S}s) reviewing {tool_name} on "
             f"{target_for_log}. The action already proceeded; this notice "
-            f"is just to flag that the council did not complete."
+            f"is just to flag that the council did not complete. NOTHING WAS SALVAGED: no "
+            f"completed seat-round could be RECOVERED, which is not the same as none "
+            f"having happened -- the sidecar may have been unwritable, empty, or damaged. "
+            f"Either way there is no partial result to report, and this is silence about "
+            f"the edit rather than approval of it."
         )
+    finally:
+        if events_fd is not None:
+            try:
+                os.close(events_fd)
+            except OSError:
+                pass
     stop_heartbeat(beat)
     clear_pending_marker(marker)
 

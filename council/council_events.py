@@ -21,8 +21,17 @@ FOUR PROPERTIES, each of which exists because the alternative was measured and f
    stalled GUI would therefore stall a council review. So the fd is set O_NONBLOCK,
    EAGAIN means "consumer is behind" rather than "failure", and records are dropped and
    counted rather than waited on. A lost progress record costs nothing; a stalled review
-   costs everything. Measured: 4000 records against a consumer that never reads return in
-   0.05s instead of hanging.
+   costs everything. Measured: 4000 records (stale-ok: a RECORD COUNT from this probe, not
+   FIELD_MAX, which merely shares the digits; neither value was rewritten -- both were listed
+   only because a consult_council.py comment stopped quoting FIELD_MAX verbatim) against a
+   consumer that never reads return in 0.05s instead of hanging.
+   RE-PROBED 2026-08-11 against the code as it now stands, with member_text on every record.
+   24 worst-case records, each carrying a FIELD_MAX-sized member_text:
+       regular file                  24 accepted, 0 dropped, backlog 0, 98654 bytes on disk
+       pipe, consumer never drains   24 accepted, 0 dropped, backlog 53458 bytes in-process
+   ZERO dropped on either sink, including the stalled-consumer case this drop path exists
+   for, because PENDING_MAX is 1 MiB and that worst case is ~98 KB. The drop path is real;
+   a full panel's member text does not reach it.
 
 3. THE STREAM CANNOT BE CORRUPTED. Records are buffered WHOLE and a partial write is
    retained and completed on the next emit, so a half-written line is never followed by a
@@ -38,7 +47,8 @@ FOUR PROPERTIES, each of which exists because the alternative was measured and f
    through it before serialisation. No call site can forget, and no future field can
    quietly become the one unredacted channel. The engine passes its own
    `_redact_request_lines`; this module keeps no second copy of that pattern, because two
-   copies drift.
+   copies drift. member_text is covered by it like any other field, so carrying a seat's
+   whole review here is not an exemption from that rule.
 
 A NOTE ON WHAT THIS DOES NOT FIX. A consumer typically also reads the engine's stdout, and
 a child writing there through Python's `print()` into a pipe is BLOCK-buffered: measured,
@@ -61,7 +71,22 @@ from typing import Any, Callable
 #   round_started    round
 #   member_started   member, tier, round
 #   member_finished  member, tier, round, verdict, duration_s, model_used, cost,
-#                    prompt_tokens, completion_tokens
+#                    prompt_tokens, completion_tokens, member_text -- that seat's own review
+#                    text, sent to EVERY sink and bounded by FIELD_MAX like any other field.
+#                    It may be None or "" when the seat produced no prose (a crashed or
+#                    timed-out member); a consumer reads that as "no prose", NEVER as "this
+#                    stream omits prose". It exists so a fire killed before it writes a log
+#                    still leaves its completed seat-rounds recoverable from the stream.
+#                    IT WAS BRIEFLY CONDITIONAL, on the theory that a seat's text would
+#                    overflow a pipe consumer's buffer and cost it dropped records. Measured
+#                    and refuted -- see property 2 above. Recorded so the condition is not
+#                    reinvented from the same wrong intuition.
+#                    NAMED member_text RATHER THAN `text` because `text` already means
+#                    something else on two live events -- leader_text (emitted
+#                    council_leader.py:1516, rendered council_gui.py:1314) and note (emitted
+#                    council_leader_run.py:118,178; rendered council_watch.py:125 and
+#                    council_gui.py:1400). A consumer branching on `ev` first would not
+#                    strictly collide, so this is naming clarity, not a bug avoided.
 #   member_corrected member, tier, was, verdict, why -- a seat's verdict CHANGED after it
 #                    was already reported: the formatting retry runs after the round
 #                    gather, so a seat streamed as UNPARSEABLE can end up counted as PASS.
@@ -95,10 +120,15 @@ from typing import Any, Callable
 #                    independent review. `undetermined` lists seats whose family could not
 #                    be resolved, which a consumer must NOT render as "no overlap"
 # THIS LIST HAD GONE STALE, which is worth stating rather than quietly correcting: it is
-# referenced by nothing (grep: this line is its only occurrence), so it is documentation and
-# unenforced documentation at that. SIX names were missing when this was written --
-# leader_round, leader_text, leader_problem, leader_action_final and approval_request had all
-# been emitted for some time; leader_reprompt is new in the same change as this comment.
+# referenced by nothing (re-grepped 2026-08-11 across *.py and *.ts: its own definition just
+# below is the ONLY occurrence of the name in the tree), so it is documentation and
+# unenforced documentation at that. No line number is quoted on purpose -- the first draft of
+# this sentence cited one and the very edit that added the sentence pushed the definition
+# down, staling the pointer before it was ever read.
+# SIX names were missing when this was written -- five of them (leader_round, leader_text,
+# leader_problem, leader_action_final and approval_request) had all been emitted for some
+# time; the sixth, leader_reprompt, was new in the same change as this comment. That
+# enumeration is inherited from the original note and was NOT re-derived from history here.
 # Nothing broke, because the contract is that a consumer IGNORES an unknown `ev`. The cost is
 # narrower than a bug and worth naming exactly: a reader asking "what does the engine emit?"
 # and answering from this tuple got a wrong answer. That is NOT what caused the GUI to drop
@@ -112,7 +142,7 @@ EVENT_NAMES = (
     "leader_family_overlap",
 )
 
-FIELD_MAX = 4000            # chars per string field before truncation
+FIELD_MAX = 4000            # chars/field before truncation. stale-ok: the LIVE value, never rewritten -- it only stopped being quoted verbatim in a consult_council.py comment, which is what listed it.
 PENDING_MAX = 1 << 20       # bytes of unflushed backlog before new records are dropped
 _TRUNC = "...[truncated]"
 

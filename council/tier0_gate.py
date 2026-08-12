@@ -1148,7 +1148,7 @@ SCAN_SUFFIXES = (".py", ".md", ".sh", ".json", ".ts", ".js", ".txt", ".toml", ".
 SKIP_DIRS = {".git", "node_modules", "__pycache__", "logs", ".venv", "venv", "_brain"}
 # Basenames of append-only historical records. Consumed by cross_file_survivors(), whose walk
 # explains what the exemption is and is not; keep the rationale there rather than duplicating it.
-ARCHIVAL_BASENAMES = {"HANDOFF.md"}
+ARCHIVAL_BASENAMES = {"HANDOFF.md", "Noumad-harness-todo.md"}
 
 
 def scan_root_for(path: Path, cwd: str) -> Path | None:
@@ -1647,6 +1647,43 @@ def main() -> int:
     # advisory while the gate's are not, so the binding decision should be reached first.
     # A DOORMAN DENY MUTATES NO STATE either, for exactly the reason a gate deny does not:
     # the edit is not landing, so the registry must keep describing the file as it is.
+    # A PROGRESS MARKER FOR THE DOORMAN'S TURN, because this phase was invisible. The
+    # statusline reads the PostToolUse advisor's pending-review markers, and the doorman runs
+    # HERE, in the PreToolUse gate, before any of those exist -- so while a model call is
+    # being waited on, the operator sees an idle or blank line and reads it as "nothing is
+    # happening". That is the same absence-reads-as-approval shape the advisor's markers were
+    # built to close, one phase earlier.
+    #
+    # `.doorman`, NOT `.json`, AND THE SUFFIX IS LOAD-BEARING. Every reader of that directory
+    # globs `*.json` -- council_advisor's count_inflight and orphan_markers, and the
+    # statusline's three -- so a name ending `.doorman` matches none of them, while a real
+    # `<id>.json` marker still matches. Checked with fnmatch against that pattern plus a
+    # positive control, because a file that DID match would inflate the in-flight count and
+    # be reported as a lost review.
+    #
+    # IT NEVER AFFECTS THE EDIT. Writing it is wrapped so a failure leaves `_dm` None, and
+    # removal happens in a `finally` so every route out of the review -- deny, exception,
+    # clean pass -- takes it with it. An instrument that could block the gate it measures
+    # would be worse than no instrument, and this gate sits in front of every edit.
+    _dm = None
+    try:
+        _dm = (STATE_ROOT / (session_id or "_no_session") / "pending-review"
+               / (re.sub(r"[^A-Za-z0-9_.-]", "_", payload.get("tool_use_id") or "")
+                  + ".doorman"))
+        _dm.parent.mkdir(parents=True, exist_ok=True)
+        _dm.write_text(json.dumps({
+            "started": datetime.now(timezone.utc).isoformat(),
+            "pid": os.getpid(),
+            "tool_name": payload.get("tool_name"),
+            "target_path": str(path),
+            # SAME FIELD AS THE REVIEW MARKER, so a watcher labels a doorman row the way it
+            # labels a fire row: by the directory an operator recognises rather than by a
+            # session hash. Written from the payload, which is the session's own cwd -- not
+            # from this process's, which is wherever the harness happened to launch the hook.
+            "cwd": payload.get("cwd") or "",
+        }))
+    except Exception:  # noqa: BLE001
+        _dm = None
     try:
         import doorman
         deny, _meta = doorman.review(payload)
@@ -1655,6 +1692,12 @@ def main() -> int:
         _log(session_id, {"event": "doorman_error", "err": repr(e)})
         print(f"doorman: not consulted ({type(e).__name__}: {e}); edit proceeds and the "
               f"council reviews it as usual.", file=sys.stderr)
+    finally:
+        if _dm is not None:
+            try:
+                _dm.unlink()
+            except OSError:
+                pass
     if deny:
         _log(session_id, {"event": "doorman_deny", "file": str(path)})
         return emit_deny(deny)

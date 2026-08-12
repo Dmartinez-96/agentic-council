@@ -42,6 +42,10 @@ from PySide6.QtWidgets import (
 )
 
 import council_gui_engine as ge
+# THE DEPTH RULE LIVES IN ONE PLACE. This panel reports which depth each fire ran at, and
+# reimplementing that reading here is how an audit ends up disagreeing with the engine it is
+# auditing -- so it imports the same depth_of() that council_outcome's own cohorts use.
+from council_outcome import depth_of
 
 COUNCIL_ROOT = Path(__file__).resolve().parent
 
@@ -1496,7 +1500,10 @@ class MetricsTab(QWidget):
         days = [d for d in sorted(logs.iterdir()) if d.is_dir()][-n:]
         fires = 0
         verdicts: dict[str, int] = {}
-        depth_known = depth_fast = depth_unknown = 0
+        # depth_of() returns one of five labels, so the tally is a dict rather than a pair of
+        # counters. Built empty and filled by whatever appears, so a label added later shows
+        # up here instead of being silently dropped into an "other" bucket.
+        depth_tally: dict[str, int] = {}
         priced = 0.0
         priced_seats: set[str] = set()
         unpriced_seats: set[str] = set()
@@ -1510,11 +1517,13 @@ class MetricsTab(QWidget):
                 fires += 1
                 v = str(e.get("final_verdict") or "?")
                 verdicts[v] = verdicts.get(v, 0) + 1
-                if "fast_mode" in e:
-                    depth_known += 1
-                    depth_fast += 1 if e["fast_mode"] else 0
-                else:
-                    depth_unknown += 1
+                # THREE DEPTHS, TALLIED SEPARATELY, plus the unknowns. depth_of() owns the
+                # rule -- `mode` first, `fast_mode` as the pre-modes fallback -- so this
+                # audit cannot drift from what the engine recorded. Counting on `fast_mode`
+                # alone would pool 'default' and 'deep' under one label, because the boolean
+                # is False for both, and the whole purpose of this panel is to keep depths
+                # from being read as interchangeable.
+                depth_tally[depth_of(e)] = depth_tally.get(depth_of(e), 0) + 1
                 durs = []
                 for m in list(e.get("members") or []) + list(e.get("shadow") or []):
                     durs.append(m.get("duration_s") or 0)
@@ -1546,10 +1555,14 @@ class MetricsTab(QWidget):
             "   This is NOT a total. Seats above that record no cost are missing from it,",
             "   and no figure here estimates them.",
             "",
-            f"review depth:  {depth_known} fires recorded it ({depth_fast} at reduced depth)",
-            f"               {depth_unknown} fires have NO fast_mode key -- UNKNOWN, not full",
-            "               depth. Those are excluded from the reduced-depth count rather",
-            "               than assumed to be full-depth fires.",
+            "review depth:  " + ("   ".join(f"{k}={v}" for k, v in sorted(depth_tally.items()))
+                                 or "no fires"),
+            "   fast/default/deep are the three modes; 'normal' is a PRE-MODES fire whose",
+            "   fast_mode was false, meaning the old unmarked high-effort default -- it is",
+            "   kept separate rather than merged into 'deep', which it resembles but is not.",
+            "   'unknown' fires recorded no usable depth at all. They are counted on their",
+            "   own rather than assumed to be full-depth, which is the whole point: absence",
+            "   of a depth record is not evidence of a deep review.",
         ]
         self.out.setPlainText("\n".join(lines))
 

@@ -169,12 +169,28 @@ DEPTHS = ("normal", "fast", "unknown")
 
 
 def depth_of(log_entry: dict) -> str:
-    """Which SWITCH POSITION a council run was made under: normal/fast/unknown.
+    """Which DEPTH a council run was made at. Four labels, from two different fields:
 
-    This reads `fast_mode` -- the state of the FAST switch -- and NOT the
-    `effort` map, and the difference matters. `fast_mode` says which regime was
-    in force; `effort` records the literal reasoning effort each member that ran
-    was sent, and it is the ground truth for what a member actually did.
+        'default' / 'deep'  -- only from `mode`; a pre-modes log cannot produce either.
+        'fast'              -- from `mode`, OR from a pre-modes log with `fast_mode: true`.
+                               The two are treated as the same label deliberately: FAST was
+                               the reduced setting before and after, so pooling them loses
+                               nothing a caller could act on.
+        'normal'            -- ONLY from a pre-modes log with `fast_mode: false`. That meant
+                               the unmarked high-effort default of the time, closest to
+                               today's 'deep' but not the same record, so it keeps a label of
+                               its own instead of being merged into either current depth.
+        'unknown'           -- neither field usable: no `fast_mode`, and no `mode` in the
+                               three. Note the precise order -- an UNRECOGNISED `mode` does
+                               not go straight to 'unknown'; it falls through to `fast_mode`
+                               and yields 'fast'/'normal' when that key is present. Only when
+                               the fallback is also missing is the depth genuinely unknown.
+
+    THE BODY READS `mode` FIRST and falls back to `fast_mode`, because the boolean cannot
+    express three depths: its False covers both 'default' and 'deep'. Neither field is the
+    `effort` map, and the difference matters. These say which REGIME was in force; `effort`
+    records the literal reasoning effort each member that ran was sent, and it is the ground
+    truth for what a member actually did.
 
     So a shared `fast_mode` is NECESSARY but NOT SUFFICIENT for two runs to be
     comparable: FAST_EFFORT (or the normal-mode constants) can be retuned between
@@ -192,8 +208,25 @@ def depth_of(log_entry: dict) -> str:
     fabricating provenance for 7,700+ logs, which is worse than admitting the
     gap. Missing key -> 'unknown', and it stays visible as such.
     """
+    # THREE DEPTHS NOW, AND `mode` IS THE ONLY FIELD THAT CAN NAME THEM. `fast_mode` is a
+    # boolean, so its False covers BOTH 'default' and 'deep' -- reading it alone would report a
+    # DEEP run as though it were the middle depth, pooling two different depths under one label.
+    # That is the same relabelling this function's own docstring refuses to do for pre-2026-07-14
+    # logs, one field newer.
+    #
+    # THE ORDER IS DELIBERATE: `mode` first because it is strictly more informative, `fast_mode`
+    # only as the fallback for logs written before modes existed. An unrecognised `mode` value
+    # falls through to 'unknown' rather than being guessed at -- a future fourth mode must show
+    # up as unknown here, not silently as one of these three.
+    m = log_entry.get("mode")
+    if m in ("fast", "default", "deep"):
+        return m
     if "fast_mode" not in log_entry:
         return "unknown"
+    # PRE-MODES LOG. `fast_mode: False` meant "the unmarked default", which was the HIGH-effort
+    # setting -- what is now called 'deep'. It does NOT mean today's 'default'. Reporting it as
+    # 'normal' keeps those runs in their own bucket rather than merging them with either of the
+    # two current depths they could be confused with.
     return "fast" if log_entry["fast_mode"] else "normal"
 
 

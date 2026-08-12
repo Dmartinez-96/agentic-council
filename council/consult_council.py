@@ -242,58 +242,112 @@ GEMINI_OPENROUTER_FALLBACK = "google/gemini-3.5-flash"
 # and that is the danger -- so FAST is announced in the output rather than being a
 # silent config change (see emit_output).
 FAST_PATH = COUNCIL_ROOT / "FAST"
+DEEP_PATH = COUNCIL_ROOT / "DEEP"
 
-# Lowest effort each provider accepts. Verified live before this shipped.
-FAST_EFFORT = {
-    "codex": "low",       # model_reasoning_effort
-    "gemini": "low",      # thinkingConfig.thinkingLevel
-    "deepseek": "low",    # reasoning_effort
+# THREE MODES, and the middle one is the new default. What used to be FAST (low) is now what
+# every fire gets unless told otherwise; FAST drops below that; DEEP is what used to be the
+# unmarked default (high).
+# WHY, STATED AS A DECISION RATHER THAN AS EVIDENCE: the shift is the user's ruling, taken for
+# throughput -- the old default was paid on every edit. It rests on no measurement, and the
+# paragraph above is explicit that the one seeded-defect check was a VOID check licensing
+# nothing about depth in either direction. So: whether lower effort reviews as WELL is
+# UNMEASURED, in both directions, and a fast PASS looks exactly like a slow one. That is why
+# the mode is announced in the output rather than being a silent config change (emit_output).
+MODES = ("fast", "default", "deep")
+
+# PROVIDER-SPECIFIC EFFORT, for members NOT on the openrouter transport. On the shipped roster
+# that is codex alone; gemini and deepseek are listed because a roster may put them on their
+# native APIs, and effort_for would otherwise KeyError on them.
+#
+# VERIFIED FOR CODEX, from the provider's own enumeration. Sending an unsupported value
+# returned HTTP 400 naming the full ladder: "Unsupported value: 'minimal' is not supported
+# with the '...' model. Supported values are: 'none', 'low', 'medium', 'high', 'xhigh', and
+# 'max'." So `none` is real and sits BELOW `low` -- and `minimal`, which reads like the obvious
+# name for this tier, does not exist for codex at all.
+# THE OLD COMMENT HERE WAS WRONG, and naming that is cheaper than repeating it: it called `low`
+# "lowest effort each provider accepts, verified live". `none` is lower, and accepted.
+#
+# GEMINI AND DEEPSEEK KEEP `low` IN FAST MODE, deliberately. Their NATIVE APIs
+# (thinkingConfig.thinkingLevel, reasoning_effort) were NOT probed for a value below `low`, and
+# shipping an unverified one would turn every FAST fire on such a roster into an HTTP 400.
+# `low` is the value already verified for them. Probe their ladders before lowering these.
+CORE_EFFORT = {
+    "fast":    {"codex": "none", "gemini": "low", "deepseek": "low"},
+    "default": {"codex": "low",  "gemini": "low", "deepseek": "low"},
 }
+# DEEP resolves through these, so it tracks the constants rather than pinning a copy of them.
 _FULL_EFFORT = {
     "codex": lambda: CODEX_REASONING,
     "gemini": lambda: GEMINI_THINKING_LEVEL,
     "deepseek": lambda: DEEPSEEK_REASONING,
 }
 
+# COMPAT: the old name for the FAST table. Its remaining job is as the membership guard
+# write_log uses (`if r.get("role") in FAST_EFFORT`) to keep an --external-verdict role from
+# reaching effort_for and raising KeyError mid-log.
+FAST_EFFORT = CORE_EFFORT["fast"]
 
-_FAST_SNAPSHOT: bool | None = None
+_MODE_SNAPSHOT: str | None = None
+
+
+def mode() -> str:
+    """Which of MODES this fire runs at. Resolved ONCE per fire, then frozen.
+
+    DEEP WINS A TIE. If both flag files exist the fire runs DEEP, because the two settings
+    disagree and the safe reading of an ambiguous instruction is the more thorough one: a
+    review asked for at greater depth than intended costs time, the reverse costs findings.
+
+    Deliberately NOT re-read on every call. Each fire is its own process, so touching or
+    removing a flag still takes effect on the NEXT fire without a restart, which is the whole
+    point. What the snapshot prevents is the flag changing MID-fire: members would then run at
+    one effort while the banner reported another, and the banner is the only thing telling a
+    reader that a PASS was reached at reduced depth. A report that can disagree with what
+    actually ran is worse than no report.
+    """
+    global _MODE_SNAPSHOT
+    if _MODE_SNAPSHOT is None:
+        if DEEP_PATH.exists():
+            _MODE_SNAPSHOT = "deep"
+        elif FAST_PATH.exists():
+            _MODE_SNAPSHOT = "fast"
+        else:
+            _MODE_SNAPSHOT = "default"
+    return _MODE_SNAPSHOT
 
 
 def fast_mode() -> bool:
-    """True when FAST is armed. Resolved ONCE per fire, then frozen.
+    """COMPAT SHIM: True only in the 'fast' mode.
 
-    Deliberately NOT re-read on every call. Each fire is its own process, so a
-    per-process snapshot still lets `touch FAST` / `rm FAST` take effect between
-    fires without a restart -- which is the whole point. What it prevents is the
-    file changing MID-fire: members would then run at one effort while the banner
-    reported another, and the banner is the only thing telling the reader that a
-    PASS was reached at reduced depth. A report that can disagree with what
-    actually ran is worse than no report.
+    Kept because it is read by the log schema, the GUI's depth audit, council_events'
+    run_started and council_leader_run -- and because every log written before modes existed
+    carries `fast_mode` and nothing else. It is now a projection of mode(), so the two can
+    never disagree; `mode()` is what new code should ask.
+
+    NOTE WHAT IT CANNOT SAY: False now covers BOTH 'default' and 'deep', which are different
+    depths. A consumer needing that distinction must read `mode`, and one that finds no `mode`
+    field is looking at a pre-modes log where the distinction did not exist.
     """
-    global _FAST_SNAPSHOT
-    if _FAST_SNAPSHOT is None:
-        _FAST_SNAPSHOT = FAST_PATH.exists()
-    return _FAST_SNAPSHOT
+    return mode() == "fast"
 
 
 def effort_for(member: str) -> str:
     """The reasoning effort this member should use for THIS fire.
 
-    The models are deliberately unchanged in FAST mode. Only the effort moves.
-    Transport-aware: a member whose registry record uses the openrouter transport
-    is sent OpenRouter's unified reasoning.effort (openrouter_effort(), which is
-    itself FAST-aware: FAST -> low, else high), not the provider-specific
-    constants, so this returns what that member is actually sent and FAST still
-    governs every transport. member_by_name/openrouter_effort are defined later
-    in the module; every call to this function happens at runtime, after the
-    module has loaded.
+    The models are deliberately unchanged by mode. Only the effort moves.
+
+    TRANSPORT-AWARE: a member on the openrouter transport is sent OpenRouter's unified
+    reasoning.effort (openrouter_effort()), not the provider-specific constants, so this
+    returns what that member is ACTUALLY sent and the mode governs every transport. On the
+    shipped roster that covers 11 of the 12 seats. member_by_name/openrouter_effort are
+    defined later in the module; every call here happens at runtime, after it has loaded.
     """
     rec = member_by_name(member)
     if rec is not None and rec.transport == "openrouter":
         return openrouter_effort()
-    if fast_mode():
-        return FAST_EFFORT[member]
-    return _FULL_EFFORT[member]()
+    m = mode()
+    if m == "deep":
+        return _FULL_EFFORT[member]()
+    return CORE_EFFORT[m][member]
 
 
 VERDICT_RE = re.compile(r"^VERDICT:\s*(PASS|WARN|BLOCK)\s*$", re.MULTILINE)
@@ -2665,14 +2719,33 @@ OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
 NO_SHADOW_PATH = COUNCIL_ROOT / "NO_SHADOW"
 
 
-def openrouter_effort() -> str:
-    """OpenRouter's unified reasoning effort for this fire: FAST -> low, else high.
+OPENROUTER_EFFORT = {"fast": "minimal", "default": "low", "deep": "high"}
 
-    Kept separate from FAST_EFFORT/_FULL_EFFORT, which hold the CORE members'
-    PROVIDER-SPECIFIC effort strings; OpenRouter's reasoning.effort vocabulary is its
-    own ("low"/"medium"/"high"), and merging the two would be a category error.
+
+def openrouter_effort() -> str:
+    """OpenRouter's unified reasoning effort for this fire, one value per mode.
+
+    THIS GOVERNS ALMOST THE WHOLE BENCH. On the shipped roster 11 of the 12 seats use the
+    openrouter transport, so this function -- not CORE_EFFORT -- is what the mode actually
+    means for them. It was previously BINARY (`low if fast else high`), which under three
+    modes would have collapsed default and deep onto `high` and sent FAST `low`: the new
+    default would have been no cheaper than the old one, which is the entire point of the
+    change, and FAST would not have moved at all.
+    THE VOCABULARY, from OpenRouter's own rejection of a bogus value (HTTP 400):
+    `reasoning.effort: Invalid option: expected one of "max"|"xhigh"|"high"|"medium"|"low"|
+    "minimal"|"none"`. `none`, `minimal` and `low` were each sent separately and each returned
+    HTTP 200, so the three values used here are accepted rather than merely enumerated.
+    THE OLD COMMENT CALLED THIS VOCABULARY "low"/"medium"/"high" -- it is seven values, and
+    `none` sits below all of them.
+    WHY `none` AND NOT `minimal` FOR FAST: OpenRouter accepts both, but codex does not accept
+    `minimal` at all, so `none` is the one tier name that means the same thing on both
+    transports. Keeping them aligned is worth more than one notch of granularity.
+
+    Kept separate from CORE_EFFORT/_FULL_EFFORT, which hold PROVIDER-SPECIFIC strings for the
+    native transports; merging the two vocabularies would be a category error even where the
+    words coincide.
     """
-    return "low" if fast_mode() else "high"
+    return OPENROUTER_EFFORT[mode()]
 
 
 def _cache_accounting(data: dict) -> dict:
@@ -6626,12 +6699,25 @@ def write_log(layer: str, tool_name: str | None, target_path: str | None,
         #
         # "effort" is keyed off all_results, NOT ALL_MEMBERS, because --members
         # can run a subset and ALL_MEMBERS would record an effort for a member
-        # that never ran. The `in FAST_EFFORT` guard is load-bearing, not
-        # defensive: --external-verdict NAME=PATH admits an ARBITRARY role string
-        # into all_results, and effort_for() raises KeyError on an unknown member.
-        # Without the guard an external verdict crashes write_log AFTER whichever
+        # that never ran. The guard is load-bearing, not defensive:
+        # --external-verdict NAME=PATH admits an ARBITRARY role string into
+        # all_results, and effort_for() raises KeyError on an unknown member.
+        # Without a guard an external verdict crashes write_log AFTER whichever
         # built-in members were requested have already run, losing the whole
         # review at the last step.
+        #
+        # IT USED TO BE `in FAST_EFFORT`, WHICH SILENTLY DROPPED MOST OF THE BENCH.
+        # That table holds only the members with provider-specific transports, so every
+        # OpenRouter seat was excluded -- even though openrouter_effort() is exactly
+        # what governs their depth. MEASURED over the corpus before this changed, by
+        # counting per role how many of its records had an entry in the fire's `effort`
+        # dict: 3 of 14 roles had ANY recorded effort (gemini 3658/3658, deepseek
+        # 3654/3654, codex 3578/3578), while grok, kimi, glm and every inspector
+        # (qwen, minimax, mimo, nemotron, mistral, hunyuan) had 0. So the one field that
+        # answers "how deep did this seat run" was blank for most of the bench, and
+        # three modes make that worse rather than better.
+        # The guard is now membership in the REGISTRY, which is the condition
+        # effort_for() actually needs, rather than membership in one transport's table.
         #
         # KNOWN GAP IN THE CORPUS: logs from 11:24:29Z to 11:30:13Z on 2026-07-14
         # (7 runs) were made with FAST armed but predate these fields, so their
@@ -6648,13 +6734,29 @@ def write_log(layer: str, tool_name: str | None, target_path: str | None,
         # strength" -- the exact upgrade-the-evidence move this project exists to
         # stop. Test for the key's PRESENCE before trusting either field.
         "fast_mode": fast_mode(),
+        # THE MODE NAME, alongside the compat boolean. `fast_mode` cannot express three
+        # depths: False now covers BOTH 'default' and 'deep'. A consumer that finds no
+        # `mode` key is reading a pre-modes log, where the distinction did not exist --
+        # which is UNKNOWN, not 'default'.
+        "mode": mode(),
         # A codex vote served via the OpenRouter fallback was sent
         # openrouter_effort(), not the subprocess constants -- record what was
         # actually sent, not what the primary route would have been sent.
+        # BOTH TIERS, because a layer-2 seat's depth is a fact about this fire too. all_results
+        # holds the VOTING seats, so shadow_results is concatenated here explicitly, and shadow
+        # seats are registry members so effort_for answers for them on the same terms.
+        # THIS IS A DEPTH RECORD, NOT A VERDICT AGGREGATION, and the separation that matters is
+        # kept elsewhere: the `members` and `shadow` fields below stay distinct, which is what
+        # anything computing an outcome reads. NOTHING reads this key programmatically -- the
+        # matches elsewhere in the tree are prose, and
+        # council_outcome.depth_of() states outright that it reads `fast_mode` and not `effort`.
+        # So a shadow seat appearing here cannot reach a vote tally by any path that exists
+        # today. A future reader of this field must not assume it is voting-only.
         "effort": {r["role"]: (openrouter_effort()
                                if r.get("route") == "openrouter_fallback"
                                else effort_for(r["role"]))
-                   for r in all_results if r.get("role") in FAST_EFFORT},
+                   for r in (list(all_results) + list(shadow_results or []))
+                   if member_by_name(r.get("role") or "") is not None},
 
         # MEMBERSHIP PROVENANCE, same lesson as depth provenance above: an
         # unrecorded roster change would launder a different panel's review
@@ -6770,19 +6872,33 @@ def emit_output(results: list[dict], final_verdict: str, log_path: Path,
         print("# Answer it on the merits or revert by hand; do not read the "
               "surviving file as vindication.")
 
-    if fast_mode():
-        # ANNOUNCE IT. A fast PASS is indistinguishable from a real one on the
-        # page, and that is precisely the danger of a speed switch: it converts
-        # "we looked less hard" into "we found nothing", silently. The verdict is
-        # still the verdict -- this does not downgrade it -- but nobody should be
-        # able to read a FAST PASS as full-strength assurance without being told.
-        effs = ", ".join(f"{m}={effort_for(m)}" for m in ALL_MEMBERS)
-        print(f"# FAST MODE (touch/rm {FAST_PATH} to toggle). Members ran at "
-              f"REDUCED effort: {effs}.")
+    # ANNOUNCE THE DEPTH, ALWAYS, AND NAME IT. A reduced-depth PASS is indistinguishable from
+    # a full one on the page, and that is precisely the danger of a speed switch: it converts
+    # "we looked less hard" into "we found nothing", silently. The verdict is still the verdict
+    # -- this does not downgrade it -- but nobody should be able to read one as full-strength
+    # assurance without being told which depth produced it.
+    #
+    # PRINTED FOR EVERY MODE, not only the reduced one, and that is the change. While there
+    # were two depths, silence meant "full" and could be relied on. With three, silence would
+    # be ambiguous between DEFAULT and DEEP -- so the absence of a banner would no longer carry
+    # information, and the reader would have no way to tell a mid-depth review from a deep one.
+    _mode = mode()
+    effs = ", ".join(f"{m}={effort_for(m)}" for m in ALL_MEMBERS)
+    if _mode == "fast":
+        print(f"# FAST MODE -- the LOWEST depth (rm {FAST_PATH} for the default, "
+              f"touch {DEEP_PATH} for DEEP). Members ran at: {effs}.")
         print("# Measured on deepseek only (max 97.4s -> low 42.4s on a real "
               "prompt): lower effort is FASTER. Nothing measured it to be as "
               "GOOD, for any member. Treat a FAST PASS as 'no objection at "
               "reduced depth', not as a clean bill of health.")
+    elif _mode == "deep":
+        print(f"# DEEP MODE -- the HIGHEST depth (rm {DEEP_PATH} for the default). "
+              f"Members ran at: {effs}.")
+    else:
+        print(f"# DEFAULT DEPTH (touch {FAST_PATH} for faster, {DEEP_PATH} for deeper). "
+              f"Members ran at: {effs}.")
+        print("# This is the middle of three depths, NOT the maximum. What it costs in "
+              "review quality against DEEP is unmeasured, in both directions.")
     # ROSTER PROVENANCE. A rejected roster.json is the loudest banner here: the
     # user asked for a panel and got the default instead, and silence about that
     # would hide the substitution from the one person who can fix it.
@@ -7125,6 +7241,36 @@ async def main() -> int:
         print(f"council: --events-fd {args.events_fd} unusable "
               f"({events.disabled_reason}); continuing without progress events",
               file=sys.stderr)
+    # EACH SEAT'S REVIEW TEXT RIDES THE STREAM, UNCONDITIONALLY, and the history of that
+    # decision is worth keeping because it was reversed by measurement.
+    #
+    # WHAT IT BUYS: a fire killed at the wrapper's wall clock never reaches write_log(), so
+    # nothing of the review is persisted by this engine -- including rounds that had already
+    # finished. Consistent with that, and measured by grepping 2026-08-11's logs for the
+    # target basenames of the two fires that reported timing out: emit_tty.sh has 0 logs, and
+    # member_timing.py has 4, all of which carry a final_verdict and so completed. WHAT THAT
+    # DOES NOT ESTABLISH: that the kill caused the absence -- no cancellation was observed,
+    # only the missing log. With the text in the stream, a consumer holding the events file
+    # can report the completed seat-rounds as a PARTIAL review instead of silence.
+    #
+    # THIS WAS FIRST WRITTEN AS CONDITIONAL -- text only to sinks that could "afford" it --
+    # on the theory that member text would overflow the 65536-byte pipe the GUI and
+    # council_watch read from and cost them dropped records. THE PROBE REFUTED IT. Counted
+    # from roster.claude-led.json (6 voting, 6 inspector), a full panel runs 6x2 voting
+    # seat-rounds plus 6 inspector pass-1 plus a pass-2 for whichever subset requested
+    # tooling: 18 seat-rounds minimum, 24 maximum. Emitting that worst case -- 24 records each
+    # carrying a FIELD_MAX-sized member_text -- through this module's own emitter (2026-08-11):
+    #     regular file                  24 accepted, 0 dropped, 98654 bytes on disk
+    #     pipe, consumer NEVER drains   24 accepted, 0 dropped, 53458 bytes held in-process
+    # ZERO drops on either sink, including the stalled-consumer case the drop path exists for,
+    # because PENDING_MAX is 1 MiB and the whole worst case is ~98 KB, an order of magnitude
+    # under it. The pipe's capacity is real but does not bite: the backlog waits in here.
+    #
+    # WITH THE COST MEASURED AT ZERO, THE CONDITION HAD NOTHING LEFT TO BUY. What remained was
+    # a preference for a lean stream, and a preference is not worth a branch that can withhold
+    # the ONLY surviving copy of a completed seat-round's text -- which is exactly the payload
+    # the salvage path exists to recover. A consumer that does not want the field ignores it,
+    # which is already this stream's contract for anything unrecognised.
     events.emit("run_started", layer=args.layer, tool_name=args.tool_name,
                 target_path=args.target_path, voting=list(members),
                 # fast_mode(), NOT FAST_PATH.exists(). This line used to re-read the file, which
@@ -7142,6 +7288,25 @@ async def main() -> int:
         wrapper returns the awaited value untouched, so aggregation downstream is
         unaffected. Only the reporting is new -- the round barriers still hold, because
         round 2 genuinely needs every peer's round 1.
+
+        member_text CARRIES THIS SEAT'S REVIEW, so that a consumer holding the events file has
+        the completed seat-rounds even for a fire that never produces a log entry -- fires
+        with no log are observed (see the note above the run_started emit); what killed them
+        is not established here. It goes to every sink rather than only to large ones, for the
+        reason recorded in that same note.
+
+        It is always PRESENT and may be None. SCOPED CLAIM: every `return` of a DICT LITERAL in
+        this module that carries a "verdict" key also carries a "text" key -- 9 of 9. That is
+        what was checked and it is not the same as "every possible result shape": a result
+        built incrementally, or returned from another module, is outside it. Re-run (this
+        exact line was executed, it prints "9 shapes; all carry text: True"):
+
+            python3 -c "import ast;t=ast.parse(open('consult_council.py').read());k=lambda d:[c.value for c in d.keys if isinstance(c,ast.Constant)];r=[(n.lineno,'text' in k(n.value)) for n in ast.walk(t) if isinstance(n,ast.Return) and isinstance(n.value,ast.Dict) and 'verdict' in k(n.value)];print(len(r),'shapes;','all carry text:',all(t2 for _,t2 in r))"
+
+        IT IS AN AST WALK BECAUSE A REGEX WAS TRIED AND UNDERCOUNTED: the regex version found
+        6 and missed 3 (lines 1969, 1982, 3051), being blind to a dict literal nested inside
+        another. A crashed or timed-out member sets "text" to "", so a consumer reads None or
+        "" as "this seat produced no prose", never as "this stream omits prose".
         """
         events.emit("member_started", member=name, tier=tier, round=rnd)
         res = await coro
@@ -7150,7 +7315,8 @@ async def main() -> int:
                         verdict=res.get("verdict"), duration_s=res.get("duration_s"),
                         model_used=res.get("model_used"), cost=res.get("cost"),
                         prompt_tokens=res.get("prompt_tokens"),
-                        completion_tokens=res.get("completion_tokens"))
+                        completion_tokens=res.get("completion_tokens"),
+                        member_text=res.get("text"))
         return res
 
     # Round 1: each member sees the proposal independently and emits

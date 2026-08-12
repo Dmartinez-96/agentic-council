@@ -290,17 +290,52 @@ def audit_one_block(content: str, session_id: str, cwd: str) -> tuple[int, str, 
     # outcome already reaches the agent through this function's return value.
     beat = None
     probe_path = None
+    events_file = None
+    events_fd = None
+    # ONE IMPORT FOR THE WHOLE FUNCTION, bound before anything needs it. The heartbeat, the
+    # cap and the salvage all live in council_advisor, and three separate lazy imports would
+    # each need their own "what if it failed" branch -- and a name bound only inside a `try`
+    # is a NameError waiting for the path that skipped it.
+    ca_mod = None
     try:
-        import council_advisor as _ca_hb
-        probe_dir = (_ca_hb.EVIDENCE_STATE_ROOT
+        import council_advisor as ca_mod
+    except Exception:  # noqa: BLE001  the audit must run with or without the advisor module
+        ca_mod = None
+    # THE SAME CAP AS THE PostToolUse ADVISOR, taken from it rather than repeated. Both hooks
+    # run the same engine against the same per-member limits, and this one previously carried
+    # its own literal 900 in two places -- the argument and the message a reader sees -- so a
+    # change to one could leave the other quoting a number that was no longer true.
+    cap = getattr(ca_mod, "FIRE_TIMEOUT_S", 1500)
+    try:
+        probe_dir = (ca_mod.EVIDENCE_STATE_ROOT
                      / (session_id or "_no_session") / "stop-probe")
         probe_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         probe_path = probe_dir / f"{stamp}.stopprobe"
-        beat = _ca_hb.start_heartbeat(probe_path)
+        beat = ca_mod.start_heartbeat(probe_path)
+        # THE EVENTS SIDECAR SITS BESIDE THE PROBE, in stop-probe/ and not pending-review/,
+        # for exactly the reason the probe does: nothing in this directory is a review marker,
+        # so nothing here can be mistaken for a lost review or counted as a fire in flight.
+        events_file = Path(str(probe_path) + ".events")
+        events_fd = os.open(events_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        cmd.extend(["--events-fd", str(events_fd)])
     except Exception:  # noqa: BLE001  instrumentation must never break the hook
         beat = None
         probe_path = None
+        if events_fd is not None:
+            try:
+                os.close(events_fd)
+            except OSError:
+                pass
+        events_fd = None
+        events_file = None
+    # AN EXPLICIT FLAG, NOT sys.exc_info(), decides whether the sidecar is evidence. The first
+    # version of the cleanup below asked `isinstance(sys.exc_info()[1], TimeoutExpired)`, which
+    # MEASURES AS None: once an `except` block completes -- including by returning -- the
+    # exception is no longer current, so the check read "this was not a timeout" on exactly the
+    # path that was one, and would have deleted the only surviving record of the seats that
+    # reported. Probed directly before this was rewritten.
+    timed_out = False
     try:
         proc = subprocess.run(
             cmd,
@@ -308,15 +343,60 @@ def audit_one_block(content: str, session_id: str, cwd: str) -> tuple[int, str, 
             text=True,
             capture_output=True,
             cwd=cwd or ".",
-            timeout=900,
+            timeout=cap,
+            pass_fds=(events_fd,) if events_fd is not None else (),
         )
     except subprocess.TimeoutExpired:
+        timed_out = True
         _stop_heartbeat_quietly(beat, probe_path)
+        # SALVAGE, for the same reason the advisor does it: the engine writes its log entry
+        # only at the end, so a killed fire loses every round that HAD finished. Here the
+        # loss is worse in one respect -- this hook's whole job is to check outward prose
+        # before a turn ends, and "the audit did not complete" gives the reader nothing to
+        # act on, while the seats that did report gave concrete findings.
+        salvaged = ""
+        if events_fd is not None:
+            try:
+                os.close(events_fd)
+            except OSError:
+                pass
+            events_fd = None
+        if events_file is not None and ca_mod is not None:
+            try:
+                summary = ca_mod.summarise_partial(ca_mod.read_events(events_file))
+                if summary["seats"]:
+                    salvaged = ca_mod.format_partial(summary, "StopProse",
+                                                     str(draft_path), cap)
+                    ca_mod.record_partial(summary, "StopProse", str(draft_path),
+                                          session_id, cap)
+            except Exception:  # noqa: BLE001  salvage must never break the hook
+                salvaged = ""
+        if salvaged:
+            return 2, "", (
+                f"stop-audit: council timed out (>{cap}s) auditing draft at {draft_path}, "
+                f"but the seats that finished were recovered:\n\n{salvaged}"
+            )
         return 2, "", (
-            f"stop-audit: council timed out (>900s) auditing draft "
+            f"stop-audit: council timed out (>{cap}s) auditing draft "
             f"at {draft_path}. Stopping anyway, but the audit did not "
-            f"complete."
+            f"complete, and NO completed seat-round could be recovered -- which is "
+            f"silence about this prose, not approval of it."
         )
+    finally:
+        if events_fd is not None:
+            try:
+                os.close(events_fd)
+            except OSError:
+                pass
+        # THE SIDECAR IS KEPT ONLY WHEN IT IS EVIDENCE. A completed audit reports through
+        # this function's return value, so its sidecar is litter; a killed one holds the only
+        # record of what the seats had said, and deleting that would throw away the thing the
+        # salvage path exists to preserve.
+        if events_file is not None and not timed_out:
+            try:
+                events_file.unlink()
+            except OSError:
+                pass
     _stop_heartbeat_quietly(beat)
     return proc.returncode, proc.stdout, proc.stderr
 
