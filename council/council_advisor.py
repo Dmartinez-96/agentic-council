@@ -1125,11 +1125,19 @@ def summarise_partial(records: list[dict]) -> dict:
     verdict and text. "Latest" matters: a voting seat appears in round 1 and again in round
     2, and round 2 is the one the council would have aggregated, so a later record for the
     same seat supersedes an earlier one.
+
+    `seat_rounds` KEEPS WHAT `seats` COLLAPSES: {round: {member: record}}, so a caller can
+    show round 1 and round 2 side by side instead of only the survivor. `seats` cannot serve
+    that -- its latest-wins overwrite is exactly what format_partial needs (the aggregated
+    verdict) and exactly what a per-round view must not have. Both are returned because the
+    two consumers want opposite things from the same stream, and deriving one from the other
+    after the fact is impossible in the collapsing direction.
     """
     expected: dict[str, list[str]] = {"voting": [], "inspector": []}
     started: dict[int, set[str]] = {}
     finished: dict[int, set[str]] = {}
     seats: dict[str, dict] = {}
+    seat_rounds: dict[int, dict[str, dict]] = {}
     corrected: list[dict] = []
     for rec in records:
         ev = rec.get("ev")
@@ -1143,13 +1151,20 @@ def summarise_partial(records: list[dict]) -> dict:
         elif ev == "member_finished":
             rnd = _int(rec.get("round"))
             finished.setdefault(rnd, set()).add(str(rec.get("member")))
-            seats[str(rec.get("member"))] = {
+            entry = {
                 "round": rnd,
                 "tier": rec.get("tier"),
                 "verdict": rec.get("verdict"),
                 "text": rec.get("member_text"),
                 "duration_s": rec.get("duration_s"),
             }
+            seats[str(rec.get("member"))] = entry
+            # A COPY, not the same object. `seats` is latest-wins, so for a two-round seat
+            # seats[m] would otherwise BE round 2's entry here, and the correction branch's
+            # `seats[m]["verdict"] = ...` would mutate the per-round record through the alias.
+            # Corrections DO reach seat_rounds -- deliberately, below -- and the copy is what
+            # makes that an addressed write to a chosen round rather than an aliasing accident.
+            seat_rounds.setdefault(rnd, {})[str(rec.get("member"))] = dict(entry)
         elif ev == "member_corrected":
             # A seat's verdict CHANGED after it was first reported. Carried through so a
             # partial never quotes a verdict the council itself would have superseded.
@@ -1158,8 +1173,18 @@ def summarise_partial(records: list[dict]) -> dict:
             if m in seats:
                 seats[m]["verdict"] = rec.get("verdict")
                 seats[m]["corrected_from"] = rec.get("was")
+            # Apply to the round the correction names, or to the seat's latest round when the
+            # record does not say -- a correction with no round would otherwise vanish from
+            # the per-round view while showing up in the aggregate, so the two would disagree.
+            rnd = _int(rec.get("round"))
+            if rnd not in seat_rounds or m not in seat_rounds.get(rnd, {}):
+                cand = [r for r, members in seat_rounds.items() if m in members]
+                rnd = max(cand) if cand else rnd
+            if m in seat_rounds.get(rnd, {}):
+                seat_rounds[rnd][m]["verdict"] = rec.get("verdict")
+                seat_rounds[rnd][m]["corrected_from"] = rec.get("was")
     return {"expected": expected, "started": started, "finished": finished,
-            "seats": seats, "corrected": corrected}
+            "seats": seats, "seat_rounds": seat_rounds, "corrected": corrected}
 
 
 def format_partial(summary: dict, tool_name: str, target: str, elapsed_s: int) -> str:
@@ -1363,6 +1388,13 @@ def main() -> int:
         evidence_file = EVIDENCE_STATE_ROOT / session_id / "evidence.jsonl"
         if evidence_file.exists():
             cmd.extend(["--evidence-file", str(evidence_file)])
+    # PASSED SO THE LOG CAN BE PAIRED WITH THIS EXACT EDIT. The marker is already named after
+    # this id; recording it in the log too is what lets a reader join the two without guessing
+    # from timestamps, since session + tool + target is identical across every fire aimed at
+    # one file. Sent independently of session_id: the two identify different things, and an
+    # unusual payload carrying one without the other should still record what it has.
+    if payload.get("tool_use_id"):
+        cmd.extend(["--tool-use-id", str(payload.get("tool_use_id"))])
     if transcript_path:
         cmd.extend(["--transcript-path", transcript_path])
     # Collected BEFORE this fire's own marker is written, so a fire can never appear in

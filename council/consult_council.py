@@ -2722,6 +2722,50 @@ NO_SHADOW_PATH = COUNCIL_ROOT / "NO_SHADOW"
 OPENROUTER_EFFORT = {"fast": "minimal", "default": "low", "deep": "high"}
 
 
+def _check_effort_tables() -> None:
+    """Assert at import that every mode in MODES has an effort on BOTH transport families.
+
+    WHAT IT BUYS: MODES becomes the single source of the mode names. effort_for indexes
+    CORE_EFFORT/_FULL_EFFORT and openrouter_effort indexes OPENROUTER_EFFORT, so a name added to
+    MODES without a value in all of them raises KeyError on the first FIRE that uses it -- inside
+    a hook, after the edit has landed, where a missing verdict does not read as a failure. This
+    turns that into an import error instead.
+
+    RuntimeError rather than `assert`, because `python -O` strips asserts and this must not be
+    optional.
+
+    FOUR SEPARATE RAISES, each naming the offending set so the message points at the fix:
+    OPENROUTER_EFFORT's keys, CORE_EFFORT's keys, CORE_EFFORT's per-mode member sets, and
+    _FULL_EFFORT's coverage of those members. Section I of _nogit/test_salvage.py drives all four
+    by swapping a table, and additionally adds a name to MODES with no effort value anywhere,
+    which is the case this function exists for.
+
+    `deep` is exempt from CORE_EFFORT by design -- it resolves through _FULL_EFFORT instead.
+    """
+    if set(OPENROUTER_EFFORT) != set(MODES):
+        raise RuntimeError(
+            f"OPENROUTER_EFFORT keys {sorted(OPENROUTER_EFFORT)} != MODES {sorted(MODES)}")
+    core_modes = set(MODES) - {"deep"}
+    if set(CORE_EFFORT) != core_modes:
+        raise RuntimeError(
+            f"CORE_EFFORT keys {sorted(CORE_EFFORT)} must be exactly {sorted(core_modes)}")
+    # EVERY NON-DEEP MODE MUST COVER THE SAME MEMBERS. effort_for does CORE_EFFORT[m][member],
+    # so a member present in one mode's table and missing from another raises in that mode only
+    # -- a fault that hides until someone touches the flag file.
+    rosters = {m: frozenset(t) for m, t in CORE_EFFORT.items()}
+    if len(set(rosters.values())) > 1:
+        raise RuntimeError(f"CORE_EFFORT modes cover different members: "
+                           f"{ {m: sorted(r) for m, r in rosters.items()} }")
+    # DEEP resolves through _FULL_EFFORT, so it needs the same membership.
+    missing = set(next(iter(rosters.values()), frozenset())) - set(_FULL_EFFORT)
+    if missing:
+        raise RuntimeError(f"_FULL_EFFORT is missing member(s) {sorted(missing)}, "
+                           f"so DEEP would KeyError on them")
+
+
+_check_effort_tables()
+
+
 def openrouter_effort() -> str:
     """OpenRouter's unified reasoning effort for this fire, one value per mode.
 
@@ -2733,13 +2777,34 @@ def openrouter_effort() -> str:
     change, and FAST would not have moved at all.
     THE VOCABULARY, from OpenRouter's own rejection of a bogus value (HTTP 400):
     `reasoning.effort: Invalid option: expected one of "max"|"xhigh"|"high"|"medium"|"low"|
-    "minimal"|"none"`. `none`, `minimal` and `low` were each sent separately and each returned
-    HTTP 200, so the three values used here are accepted rather than merely enumerated.
-    THE OLD COMMENT CALLED THIS VOCABULARY "low"/"medium"/"high" -- it is seven values, and
-    `none` sits below all of them.
-    WHY `none` AND NOT `minimal` FOR FAST: OpenRouter accepts both, but codex does not accept
-    `minimal` at all, so `none` is the one tier name that means the same thing on both
-    transports. Keeping them aligned is worth more than one notch of granularity.
+    "minimal"|"none"`. Seven values; `none` sits below all of them.
+    ENUMERATED IS NOT ACCEPTED, and that gap is why FAST sends `minimal` here. Measured
+    2026-08-12 by POSTing each value to every openrouter seat's primary model (max_tokens=8):
+      `minimal`  11/11 HTTP 200.
+      `none`      8/11 -- gemini, grok and qwen each returned HTTP 400 "Reasoning is mandatory
+                  for this endpoint and cannot be disabled."
+    So `minimal` is the lowest tier the WHOLE bench accepts. ONE ACCEPTING MODEL LICENSES
+    NOTHING ABOUT THE REST -- probe every seat before lowering this, because the failure is QUIET
+    rather than loud. OBSERVED, in this install's own logs: fires 20260812T082440Z-8c6628ba,
+    -082508Z-8ee182e5, -082718Z-3a688641 and -082936Z-b81453d1 each record gemini with
+    `verdict: ERROR` and `stderr: HTTPError 400 ... "Reasoning is mandatory for this endpoint"`,
+    while the other five voters reported normally and the fire returned a final verdict of WARN.
+    A rejected effort value therefore does not crash the fire -- it DROPS THAT SEAT'S VOTE and
+    the council still reports.
+    HOW FAR THAT DEGRADES, since the verdict line looks the same either way: across 1922 logs, 23
+    fires reached a final verdict with at least one ERROR voter, and in
+    20260809T183514Z-d5b33c01 five of the six voters were ERROR (401) -- codex alone reported,
+    and the fire published WARN. A one-voter council is indistinguishable from a six-voter one in
+    the verdict alone, which is the reason to probe rather than to trust a 200 from one model.
+    WHAT THAT DOES NOT ESTABLISH: the 400 names an ENDPOINT, and OpenRouter picks the provider
+    per request, so this is 11 observations of which seats accepted `none` AT THAT MOMENT, not a
+    property of the models. Re-probe before treating the set of rejecters as fixed. Mechanism
+    for the rejection: NOT established.
+    WHY THE TIER NAMES DIVERGE FROM CORE_EFFORT, where FAST sends codex `none`: alignment is
+    not available. codex rejects `minimal` outright and three seats here reject `none`, so no
+    single word names this tier on both transports. The two tables express the same INTENT --
+    the floor each transport will accept -- under necessarily different names, which is why they
+    stay separate tables rather than one shared vocabulary.
 
     Kept separate from CORE_EFFORT/_FULL_EFFORT, which hold PROVIDER-SPECIFIC strings for the
     native transports; merging the two vocabularies would be a category error even where the
@@ -6644,6 +6709,7 @@ def _bound_stderr(s: str | None, cap: int = STDERR_LOG_CAP) -> str:
 def write_log(layer: str, tool_name: str | None, target_path: str | None,
               pitch: str, all_results: list[dict], final_verdict: str,
               session_id: str = "",
+              tool_use_id: str = "",
               round1_results: list[dict] | None = None,
               shadow_results: list[dict] | None = None,
               retrieval: dict | None = None,
@@ -6669,6 +6735,13 @@ def write_log(layer: str, tool_name: str | None, target_path: str | None,
         "session_id": session_id,   # so a log can be traced to the session that
                                     # produced it; without it, deleting a session
                                     # leaves its logs orphaned and unattributable
+        # THE EDIT CALL THIS REVIEW WAS FOR. session_id + tool_name + target_path does NOT
+        # identify a fire: one session edits the same file repeatedly, so those three match
+        # many logs. tool_use_id is unique per edit call, which lets a consumer pair a review
+        # with the exact tool call rather than guessing by timestamp -- council_watch uses it to
+        # attribute a finished fire's final frame. Empty on a direct CLI run, which has no
+        # originating tool call.
+        "tool_use_id": tool_use_id,
         "layer": layer,
         "tool_name": tool_name,
         "target_path": target_path,
@@ -7067,6 +7140,14 @@ async def main() -> int:
                              "the session that produced it, so a deleted session "
                              "leaves its logs orphaned and unattributable "
                              "(council_outcome.py audit).")
+    parser.add_argument("--tool-use-id", default="",
+                        help="The hook payload's tool_use_id for the edit under review, "
+                             "recorded in the log. Unique per tool call, so it is what pairs "
+                             "a log with the exact edit that triggered it. Matching instead on "
+                             "session_id + tool_name + target_path is ambiguous: those three "
+                             "are identical across every fire a session aimed at one file, so "
+                             "several logs match and none is distinguishable. "
+                             "Empty for direct CLI runs, which have no originating tool call.")
     parser.add_argument("--workdir", type=Path, default=Path.cwd(),
                         help="Project root used as the containment jail for "
                              "member REQUEST_FILE retrieval. The advisor "
@@ -7539,6 +7620,7 @@ async def main() -> int:
     log_path = write_log(args.layer, args.tool_name, args.target_path,
                          pitch, all_results, final_verdict,
                          session_id=args.session_id,
+                         tool_use_id=args.tool_use_id,
                          round1_results=redacted_round1,
                          shadow_results=[{**r, "text": _redact_request_lines(r.get("text") or "")}
                                          for r in shadow_results],

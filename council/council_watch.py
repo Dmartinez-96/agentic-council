@@ -47,7 +47,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -211,29 +211,71 @@ def _seat_cell(render: Renderer, name: str, seat: dict | None) -> str:
 
 
 def _seat_lines(render: Renderer, summary: dict) -> list[str]:
-    """The phase-count line with its tally, then one grid row per tier.
+    """The phase-count line with its tally, then ONE GRID ROW PER ROUND.
 
-    SPLIT OUT FROM THE HEADER because the two have different lifetimes: the header is built
-    from the MARKER, and these rows are built from the EVENTS SIDECAR. Cleanup removes the
-    marker first and the sidecar last, so there is a window in which the rows can still be
-    refreshed and the header cannot -- and refreshing them is worth it, because the seat that
-    reports last is otherwise the one most likely to be missing from a fire's final frame.
+    PER ROUND, NOT PER TIER, and that is the point. A voting seat reports twice -- round 1
+    before it has seen its peers, round 2 after -- and those two verdicts are different data:
+    the whole anchoring question is whether a seat MOVED. A single row keyed by seat name can
+    only hold one of them, so round 2 overwrote round 1 in place and the r1 verdicts were
+    destroyed as they were replaced. Both rounds now get their own row.
+
+    ROUND -> ROW, from summary["seat_rounds"]: 1 and 2 are the voting rounds, 3 the inspector
+    pass, 4 the second inspector pass (which only exists when a member requested it, so its row
+    appears only when populated).
+
+    ROUND 0 IS A ROW TOO, whenever it has anything in it. It is not a phase: summarise_partial's
+    `_int` maps an absent or unparseable `round` to 0, so 0 collects the malformed records. Since
+    these rows are keyed by round rather than by tier, a seat landing there would otherwise be
+    rendered nowhere at all -- present in the tally, absent from every grid, which reads as a
+    seat that never reported. Verified reachable: a member_finished record with no `round` key
+    lands under `seat_rounds[0]`.
+
+    NO FALLBACK PATH, deliberately, and this was measured rather than assumed. Every
+    member_finished populates `seats` and `seat_rounds` together, and a bad round becomes 0
+    instead of being dropped, so "seats reported but no per-round detail" cannot occur. A branch
+    for it would be unreachable code justifying itself with an unobserved scenario.
+
+    SPLIT OUT FROM THE HEADER because the two have different lifetimes: the header is built from
+    the MARKER and these rows from the EVENTS SIDECAR, so the rows can be refreshed in a window
+    where the header can no longer be rebuilt.
     """
     exp, fin, seats = summary["expected"], summary["finished"], summary["seats"]
+    rounds = summary.get("seat_rounds") or {}
     n_v, n_i = len(exp["voting"]), len(exp["inspector"])
     phases = "  ".join([f"r1 {len(fin.get(1, set()))}/{n_v}",
                         f"r2 {len(fin.get(2, set()))}/{n_v}",
                         f"insp {len(fin.get(3, set()))}/{n_i}"]
                        + ([f"p2 {len(fin.get(4, set()))}"] if fin.get(4) else []))
+    # THE TALLY STAYS ON THE COLLAPSED MAP: it answers "where does the council stand", which is
+    # the aggregated position (round 2 for a voter that has finished both), not a sum over rows.
+    # Summing every round would double-count each voting seat and report 12 verdicts from 6.
     tally = collections.Counter(str(s.get("verdict")) for s in seats.values()
                                 if s.get("verdict"))
     tally_s = " ".join(f"{n}{_V1.get(v, '?')}" for v, n in sorted(tally.items()))
     lines = [f"  {phases}" + (f"      {tally_s}" if tally_s else "")]
-    for tier_label, names in (("vote", exp["voting"]), ("insp", exp["inspector"])):
+
+    for label, rnd, names in (("vote r1", 1, exp["voting"]),
+                              ("vote r2", 2, exp["voting"]),
+                              ("insp   ", 3, exp["inspector"]),
+                              ("insp p2", 4, exp["inspector"])):
         if not names:
             continue
-        cells = "  ".join(_seat_cell(render, n, seats.get(n)) for n in names)
-        lines.append(f"  {render._c(tier_label, _DIM)}  {cells}")
+        # Round 4 is CONDITIONAL -- it runs only when a member asks for it. An always-present
+        # row of dots would report a phase as outstanding that this fire will never run.
+        if rnd == 4 and not rounds.get(4):
+            continue
+        got = rounds.get(rnd) or {}
+        cells = "  ".join(_seat_cell(render, n, got.get(n)) for n in names)
+        lines.append(f"  {render._c(label, _DIM)}  {cells}")
+
+    # ROUND 0: the malformed-record bucket, shown only when non-empty. Listed by the names
+    # actually present rather than against an expected roster, because 0 has no roster -- it is
+    # whatever `_int` could not parse. Without this row such a seat appears in the tally and in
+    # no grid, which reads as a seat that never reported.
+    stray = rounds.get(0) or {}
+    if stray:
+        cells = "  ".join(_seat_cell(render, n, stray[n]) for n in sorted(stray))
+        lines.append(f"  {render._c('rnd ?  ', _DIM)}  {cells}")
     return lines
 
 
@@ -261,6 +303,141 @@ def _fire_block(render: Renderer, marker: Path) -> list[str]:
         state = "starting" if elapsed < 60 else "running, no roster reported"
         return [head, f"  {render._c(state, _DIM)}"]
     return [head] + _seat_lines(render, summary)
+
+
+def _find_log_for(rec: dict) -> Path | None:
+    """The completed log this marker's fire wrote, or None.
+
+    THE SIDECAR IS NOT AVAILABLE WHEN THIS IS WANTED, which is the whole reason for reading a
+    log. clear_pending_marker unlinks the marker, the beats and the events in one loop; that loop
+    measured a median 5.5 us and a max 11.2 us over 200 trials. The poll that would have to catch
+    that window is 1.0 s by default (--interval, floored at 0.2 s), i.e. at least four orders of
+    magnitude longer even at the tightest setting allowed. So the sidecar outlives the marker by
+    microseconds, a poll landing inside that window is a coincidence rather than something to
+    design around, and a re-read attempted after the marker disappears finds a deleted file. The
+    log is durable and is written before the cleanup runs.
+
+    NEWER-THAN-THE-MARKER IS REQUIRED, not merely nice. A killed fire writes NO log, and the
+    same session editing the same file earlier would otherwise match and be presented as this
+    fire's final result -- stale data wearing a completed fire's label, which is worse than the
+    dash it replaced. Both stamps are ISO-8601 UTC, so the comparison is direct.
+
+    TWO MATCHERS, AND THE EXACT ONE WINS. `tool_use_id` is unique per edit call, so when both the
+    marker and the log carry it the pairing is an identification rather than a guess, and no
+    timestamp reasoning is needed at all.
+
+    THE FALLBACK IS session_id + tool_name + target_path, EARLIEST log at or after the marker's
+    stamp. It is a heuristic: those three fields are identical across every fire a session aimed
+    at one file, so several logs match and the earliest is merely the most likely. Two fires
+    overlapping on the same session, tool and target cannot be told apart, and a finished fire's
+    final frame can then show its SIBLING's verdicts. This path exists for logs written BEFORE
+    tool_use_id was recorded, and for direct CLI runs which have no originating tool call.
+
+    Both matchers are bounded to two date directories (the started date and the day after, since a
+    fire can cross midnight), and this runs once per finished fire rather than once per poll.
+    """
+    started = str(rec.get("started") or "")
+    if not started:
+        return None
+    try:
+        t0 = datetime.fromisoformat(started)
+    except ValueError:
+        return None
+    root = getattr(ca, "COUNCIL_ROOT", None)
+    if root is None:
+        return None
+    stamp = t0.strftime("%Y%m%dT%H%M%SZ")
+    days = {t0.strftime("%Y-%m-%d"),
+            (t0 + timedelta(days=1)).strftime("%Y-%m-%d")}
+    want_id = str(rec.get("tool_use_id") or "")
+    best: tuple[str, Path] | None = None
+    for day in sorted(days):
+        for p in sorted((Path(root) / "logs" / day).glob("*.json")):
+            if p.name.split("-")[0] < stamp:
+                continue
+            try:
+                d = json.loads(p.read_text())
+            except (OSError, ValueError):
+                continue
+            # EXACT MATCH FIRST, and it RETURNS rather than competing for `best`: a tool_use_id
+            # identifies one edit call, so there is nothing to rank and no timestamp to weigh.
+            log_id = str(d.get("tool_use_id") or "")
+            if want_id and log_id:
+                if log_id == want_id:
+                    return p
+                # Both sides carry an id and they differ, so this log belongs to a DIFFERENT
+                # edit. Skipping it outright is the point of recording the id -- letting it fall
+                # through to the heuristic would let a sibling win on timestamp alone.
+                continue
+            if (str(d.get("session_id") or "") != str(rec.get("session_id") or "")
+                    or str(d.get("tool_name") or "") != str(rec.get("tool_name") or "")
+                    or str(d.get("target_path") or "") != str(rec.get("target_path") or "")):
+                continue
+            try:
+                if datetime.fromisoformat(str(d.get("timestamp"))) < t0:
+                    continue
+            except ValueError:
+                continue
+            if best is None or p.name < best[0]:
+                best = (p.name, p)
+    return best[1] if best else None
+
+
+def _summary_from_log(path: Path) -> dict | None:
+    """A finished fire's log reshaped into what _seat_lines consumes, or None.
+
+    SAME SHAPE AS summarise_partial so one renderer serves a live fire and a finished one.
+    The mapping, from the log's own fields: `round1` -> round 1, `members` -> round 2 (members
+    is the FINAL per-seat state, which for a two-round voter is its round-2 record), `shadow`
+    -> round 3.
+
+    WHAT THIS CANNOT SHOW, and it is a real limit rather than a caveat for form's sake: the log
+    stores `shadow` as ONE FLAT LIST with no pass number, so a second inspector pass cannot be
+    separated from the first and every inspector lands on round 3.
+    EVERY FIELD IS READ DEFENSIVELY, and no tally is quoted here: the corpus gains a log per
+    COMPLETED fire (a fire killed at the cap writes none), so any count would be stale almost
+    immediately. To check the shape yourself, glob `logs/*/*.json` and count the logs whose
+    `round1`, and whose `shadow`, is non-empty. `shadow` is the one that comes back absent on a
+    minority of logs; the reason is NOT established, so do not infer a roster setting from it.
+
+    EXPECTED COMES FROM THE ROSTER, not from who answered. A seat that never reported must still
+    occupy a cell -- deriving the roster from the results would silently shrink the grid to the
+    seats that happened to answer, which is exactly the information a reader needs to not lose.
+    """
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    voting, inspector = [], []
+    for m in ((d.get("roster") or {}).get("members") or []):
+        if not isinstance(m, dict):
+            continue
+        (voting if m.get("tier") == "voting" else inspector).append(str(m.get("name")))
+    rows = {1: d.get("round1"), 2: d.get("members"), 3: d.get("shadow")}
+    seat_rounds: dict[int, dict[str, dict]] = {}
+    finished: dict[int, set[str]] = {}
+    for rnd, items in rows.items():
+        if not isinstance(items, list):
+            continue
+        for m in items:
+            if not isinstance(m, dict) or not m.get("role"):
+                continue
+            role = str(m["role"])
+            seat_rounds.setdefault(rnd, {})[role] = {
+                "round": rnd, "verdict": m.get("verdict"),
+                "duration_s": m.get("duration_s"), "text": m.get("text"),
+            }
+            finished.setdefault(rnd, set()).add(role)
+    if not voting and not inspector:
+        voting = sorted(seat_rounds.get(2, {}))
+        inspector = sorted(seat_rounds.get(3, {}))
+    # The aggregate the tally reads: each voter's FINAL record plus each inspector's, which is
+    # rounds 2 and 3. Including round 1 here would count every voter twice.
+    seats = {**seat_rounds.get(2, {}), **seat_rounds.get(3, {})}
+    return {"expected": {"voting": voting, "inspector": inspector},
+            "started": {}, "finished": finished, "seats": seats,
+            "seat_rounds": seat_rounds, "corrected": [],
+            "final_verdict": d.get("final_verdict"), "log_name": path.name}
 
 
 def _doorman_block(render: Renderer, marker: Path) -> list[str]:
@@ -304,7 +481,10 @@ def follow(render: Renderer, session: str, interval: float) -> int:
     # half-finished round and there is no way to tell "it completed" from "I looked away".
     # Entries are MUTABLE lists, not tuples, because the finalise step below rewrites the block
     # and sets the done flag in place. The assignment site builds
-    # [deadline, block, header, events_path, finalised] -- five elements, matching the unpack.
+    # [deadline, block, header, events_path, finalised, marker_rec] -- six elements, matching the
+    # unpack. marker_rec is carried because finalising reads the fire's LOG, and locating that
+    # log needs the marker's session_id/tool_name/target_path/started -- by which point the
+    # marker itself has been deleted. All three sites move together or not at all.
     lingering: dict[str, list] = {}
     # Doorman turns linger separately and more briefly. They carry no sidecar to re-read, so
     # the entry is just [deadline, block].
@@ -325,9 +505,14 @@ def follow(render: Renderer, session: str, interval: float) -> int:
             for m in sorted(live, key=str):
                 seen_keys.add(str(m))
                 block = _fire_block(render, m)
-                # header and sidecar path are kept so the block can be FINALISED below.
+                try:
+                    mrec = json.loads(m.read_text())
+                except (OSError, ValueError):
+                    mrec = {}
+                # header, sidecar path and marker record are kept so the block can be FINALISED
+                # below, after the marker and its sidecar are gone.
                 lingering[str(m)] = [now + LINGER_S, block, block[0],
-                                     ca._events_path(m), False]
+                                     ca._events_path(m), False, mrec]
                 blocks.append(block)
             for m in sorted(door, key=str):
                 seen_keys.add(str(m))
@@ -335,24 +520,40 @@ def follow(render: Renderer, session: str, interval: float) -> int:
                 door_lingering[str(m)] = [now + DOORMAN_LINGER_S, block]
                 blocks.append(block)
 
-            # A FIRE THAT HAS GONE gets ONE last read before it is frozen. Cleanup unlinks the
-            # marker BEFORE the events sidecar, so at the moment this loop notices a fire has
-            # ended its final records are usually still on disk -- and the seat that reports
-            # last is exactly the one a poll-interval-stale frame is missing. The header cannot
-            # be rebuilt (it came from the marker, which is gone), so it is reused and only the
-            # rows are refreshed. Done once, flagged, and never retried: after the sidecar goes
-            # the read returns nothing and would blank rows that were correct.
+            # A FIRE THAT HAS GONE IS FINALISED FROM ITS LOG, not from its sidecar. The sidecar is
+            # unlinked in the same loop as the marker (that loop measured a median 5.5 us) while
+            # this polls at 1.0 s, so by the time a fire is noticed gone its sidecar is gone too
+            # and a re-read returns nothing -- which is why the last seat to report used to stay
+            # "-" in the frozen frame while the clearing countdown ran. The log is durable, is
+            # written before cleanup, and carries every seat plus the final verdict.
+            # THE SIDECAR IS STILL THE FALLBACK: a fire KILLED at the cap writes no log at all, and
+            # there the sidecar is the only record of the rounds that did finish.
+            # The header is reused rather than rebuilt, since it came from the now-deleted marker.
+            # Done once and flagged, because an unflagged retry would re-read the log on every
+            # poll of the linger window -- LINGER_S / interval = 20.0 / 1.0 = 20 reads per fire at
+            # the defaults.
             for key, entry in list(lingering.items()):
-                deadline, block, header, events, finalised = entry
+                deadline, block, header, events, finalised, mrec = entry
                 if key in seen_keys:
                     continue
                 if now >= deadline:
                     del lingering[key]
                     continue
                 if not finalised:
-                    fresh = ca.summarise_partial(ca.read_events(events))
-                    if fresh["seats"]:
-                        block = [header] + _seat_lines(render, fresh)
+                    fresh = None
+                    logp = _find_log_for(mrec)
+                    if logp is not None:
+                        fresh = _summary_from_log(logp)
+                    if fresh is None:
+                        cand = ca.summarise_partial(ca.read_events(events))
+                        fresh = cand if cand["seats"] else None
+                    if fresh is not None:
+                        rows = _seat_lines(render, fresh)
+                        verdict = str(fresh.get("final_verdict") or "")
+                        if verdict:
+                            rows.append(f"  final: "
+                                        f"{render._c(verdict, _C.get(verdict, ''))}")
+                        block = [header] + rows
                         entry[1] = block
                     entry[4] = True
                 blocks.append(block + [render._c(
