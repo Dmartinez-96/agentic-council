@@ -499,6 +499,134 @@ def render_hooks_template(council_root: Path) -> dict:
     return json.loads(rendered)
 
 
+BRAIN_SRC_DIR = REPO_ROOT / "brain"
+BRAIN_FILES = ("validate_brain.py", "README.md")
+BRAIN_TEMPLATES = ("checkable.md", "testimony.md")
+# The vault's template home is a DOT-directory, and that is load-bearing rather than cosmetic.
+# validate_brain.py walks the vault and prunes dot-directories in place, so `.templates/` is
+# never enumerated as notes. A plain `templates/` IS enumerated, and the two shipped templates
+# both carry the placeholder id `short-kebab-case-id` -- measured: seeding a vault with them
+# under `templates/` exits 1 with "duplicate id 'short-kebab-case-id'", while the same files
+# under `.templates/` exits 0 with "0 notes". A fresh install must not arrive already failing
+# its own integrity check.
+VAULT_TEMPLATE_DIRNAME = ".templates"
+
+
+def install_brain(rep: Reporter, council_root: Path, force: bool) -> bool:
+    """Install the brain validator and seed an empty vault with copyable templates.
+
+    WHY THIS EXISTS AS ITS OWN STEP: `brain_index.py` ships in COUNCIL_FILES and loads
+    `validate_brain.py` at runtime, but that file was never installed. brain_index probes three
+    paths for it -- `<council_root>/brain/`, `<parent>/brain/`, `<parent>/agentic-council/brain/`
+    -- so on a machine where this repo happens to sit beside the install it resolved by accident
+    and the gap stayed invisible. On a fresh install none of the three resolve, and build_index
+    returns "Council Brain index unavailable: validate_brain.py was not found." Announced, not
+    silent, but the feature is dead. Installing to the FIRST probe path closes it.
+
+    THE VAULT IS DATA AND IS NEVER OVERWRITTEN. `--force` governs the installed CODE; a vault
+    already holding notes is left exactly as found, and only missing pieces are added. The
+    uninstaller likewise preserves it -- see uninstall's docstring.
+    """
+    rep.step(f"Installing council brain to {council_root}/brain/")
+    # DRIFT IS ANNOUNCED, because the manifest is hand-written and the directory is not.
+    # BRAIN_FILES/BRAIN_TEMPLATES have to stay a static list -- uninstall removes by that list, and
+    # enumerating at uninstall time would delete files the user added after installing. The cost is
+    # that a file added to brain/ here would never ship, and nothing would say so: an install
+    # missing a dependency looks exactly like a complete one until something loads it at runtime.
+    # So compare list against directory and report the difference. NOT FATAL -- an unlisted file is
+    # a packaging oversight, not a reason to refuse an install that is otherwise correct.
+    for label, listed, src_dir in (
+            ("brain/", set(BRAIN_FILES), BRAIN_SRC_DIR),
+            ("brain/templates/", set(BRAIN_TEMPLATES), BRAIN_SRC_DIR / "templates")):
+        try:
+            present = {p.name for p in src_dir.iterdir()
+                       if p.is_file() and not p.name.startswith(".")}
+        except OSError:
+            continue                     # a missing source dir is reported per-file below
+        unlisted = sorted(present - listed)
+        if unlisted:
+            rep.warn(f"{label} contains file(s) not in this installer's manifest, so they will "
+                     f"NOT be installed: {', '.join(unlisted)}. Add them to "
+                     f"{'BRAIN_FILES' if label == 'brain/' else 'BRAIN_TEMPLATES'}.")
+    brain_dst = council_root / "brain"
+    vault = council_root / "_brain"
+    tpl_dst = vault / VAULT_TEMPLATE_DIRNAME
+    if rep.dry_run:
+        for name in BRAIN_FILES:
+            rep.info(f"  would copy: {BRAIN_SRC_DIR / name} -> {brain_dst / name}")
+        for name in BRAIN_TEMPLATES:
+            rep.info(f"  would copy: {BRAIN_SRC_DIR / 'templates' / name} -> "
+                     f"{brain_dst / 'templates' / name}")
+            rep.info(f"  would seed: {tpl_dst / name}")
+        rep.info(f"  would create vault: {vault}")
+        return True
+    for src_rel, dst in ((n, brain_dst / n) for n in BRAIN_FILES):
+        src = BRAIN_SRC_DIR / src_rel
+        if not src.exists():
+            rep.err(f"missing source file: {src}")
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() and not force:
+            rep.warn(f"{dst} exists; pass --force to overwrite. Skipping.")
+        else:
+            shutil.copy2(src, dst)
+            if dst.suffix == ".py":
+                dst.chmod(0o755)
+            rep.ok(f"installed {dst}")
+    for name in BRAIN_TEMPLATES:
+        src = BRAIN_SRC_DIR / "templates" / name
+        if not src.exists():
+            rep.err(f"missing source file: {src}")
+            return False
+        dst = brain_dst / "templates" / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() and not force:
+            rep.warn(f"{dst} exists; pass --force to overwrite. Skipping.")
+        else:
+            shutil.copy2(src, dst)
+            rep.ok(f"installed {dst}")
+        # SEEDED, NOT OVERWRITTEN: a template the user has edited in their own vault stays.
+        seeded = tpl_dst / name
+        tpl_dst.mkdir(parents=True, exist_ok=True)
+        if seeded.exists():
+            rep.info(f"  {seeded} exists; left as found (vault is data)")
+        else:
+            shutil.copy2(src, seeded)
+            rep.ok(f"seeded {seeded}")
+    if not vault.is_dir():
+        rep.err(f"vault directory was not created: {vault}")
+        return False
+    # THE LEDGER IS THE VALIDATOR'S OUTPUT, so it is materialised by RUNNING the validator rather
+    # than hand-written here. install.py does not own `.attestations.json`'s format and must not
+    # learn it: validate_brain reads the file, falls back to `{}` when absent, and writes it back
+    # at the end of a run. Measured on a fresh vault: absent before, present and `{}` after, exit 0.
+    # WHY BOTHER, when the first real run would create it anyway: without it build_index reports
+    # "no readable attestation ledger", which reads like a broken install rather than an empty
+    # brain. An empty vault should say it is empty.
+    # NEVER FATAL. A validator that fails here leaves a usable install -- the ledger simply
+    # appears on the first real run -- so this reports and continues rather than failing the
+    # install, and it is the one step whose outcome does not gate the return value.
+    ledger = vault / ".attestations.json"
+    if ledger.exists():
+        rep.info(f"  {ledger} exists; left as found (vault is data)")
+    else:
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(brain_dst / "validate_brain.py"), str(vault)],
+                capture_output=True, text=True, timeout=120)
+        except Exception as e:  # noqa: BLE001
+            rep.warn(f"could not run validate_brain to initialise the ledger ({e}); "
+                     f"it will be created on the first run.")
+        else:
+            if ledger.exists():
+                rep.ok(f"initialised {ledger}")
+            else:
+                rep.warn(f"validate_brain exited {proc.returncode} without creating "
+                         f"{ledger.name}; it will be created on the first run.")
+    rep.ok(f"vault ready at {vault}")
+    return True
+
+
 COUNCIL_SCRIPTS = frozenset(f for f in COUNCIL_FILES if f.endswith(".py"))
 
 
@@ -672,10 +800,18 @@ def uninstall(rep: Reporter, council_root: Path) -> int:
 
     Removes: the council hook handlers from ~/.claude/settings.json (other handlers
     kept, subject to is_council_handler's exact-basename residual); the /council slash
-    command (~/.claude/commands/council.md); and the installed council scripts (the
-    COUNCIL_FILES) under council_root. Preserves: roster.json, logs/, reverted/,
-    threads/, marker files and any other data under council_root, plus every
-    non-council setting in settings.json. Removing hooks takes effect live via Claude
+    command (~/.claude/commands/council.md); the installed council scripts (the
+    COUNCIL_FILES) under council_root; and the installed brain CODE under
+    council_root/brain/ -- step 3b below removes exactly the installed files UNDER brain/
+    (BRAIN_FILES plus the two templates) and rmdir's brain/templates/ then brain/, which
+    succeeds only when they are empty. install_brain also writes inside the vault
+    (_brain/.templates/* and _brain/.attestations.json); those are data and stay. Preserves: roster.json, logs/, reverted/,
+    threads/, marker files and any other data under council_root, THE BRAIN VAULT AT
+    council_root/_brain (notes and the attestation ledger are the user's, never ours to
+    delete), plus every non-council setting in settings.json.
+    REMOVAL IS BY PATHNAME, so user content written OVER a shipped path -- an edited
+    brain/README.md, say -- goes with it. What survives is anything at a path the
+    installer does not ship. Removing hooks takes effect live via Claude
     Code's settings file-watcher -- no restart. Existing settings.json .pre-*.bak
     backups are left in place. Re-running the installer REINSTALLS; only this removes.
     Returns a process exit code (0 ok; 2 on an unreadable settings.json). Honours dry-run.
@@ -737,6 +873,34 @@ def uninstall(rep: Reporter, council_root: Path) -> int:
     if not rep.dry_run:
         rep.ok(f"removed {removed} council script(s) from {council_root}")
 
+    # 3b. THE BRAIN: remove the installed CODE, never the vault. install_brain puts code under
+    # `brain/` and data under `_brain/`, and the two must be treated oppositely -- the code is
+    # ours to remove, the vault is the user's notes and their attestation ledger. Without this
+    # the code outlived the uninstall, because it is not in COUNCIL_FILES and nothing else
+    # removed it. Only the files install_brain writes are removed, and `brain/` itself only if
+    # that leaves it empty, so anything a user added there survives.
+    brain_dst = council_root / "brain"
+    brain_removed = 0
+    for rel in list(BRAIN_FILES) + [f"templates/{n}" for n in BRAIN_TEMPLATES]:
+        f = brain_dst / rel
+        if not f.exists():
+            continue
+        if rep.dry_run:
+            rep.info(f"  would remove {f}")
+        else:
+            f.unlink()
+            brain_removed += 1
+    if not rep.dry_run:
+        for d in (brain_dst / "templates", brain_dst):
+            try:
+                d.rmdir()          # only succeeds when empty; anything user-added stays
+            except OSError:
+                pass
+        rep.ok(f"removed {brain_removed} brain file(s) from {brain_dst}")
+    vault = council_root / "_brain"
+    if vault.exists():
+        rep.info(f"  PRESERVED: {vault} (your notes and attestation ledger)")
+
     rep.info("")
     if rep.dry_run:
         rep.info("Dry run: nothing was changed.")
@@ -744,8 +908,9 @@ def uninstall(rep: Reporter, council_root: Path) -> int:
         rep.info("Uninstall complete. Removing hooks takes effect live (the settings "
                  "file-watcher picks it up) -- no restart needed.")
         rep.info(f"  Left in place, yours to delete if you want: user data under "
-                 f"{council_root} (roster.json, logs/, markers) and any settings.json "
-                 f".pre-*.bak backups.")
+                 f"{council_root} (roster.json, logs/, markers), the brain vault at "
+                 f"{council_root / '_brain'} (your notes and attestation ledger), and any "
+                 f"settings.json .pre-*.bak backups.")
     return 0
 
 
@@ -814,6 +979,9 @@ def main() -> int:
             return 2
 
     if not copy_council_scripts(rep, council_root, args.force):
+        return 2
+    # AFTER the scripts, because brain_index.py is one of them and this installs what it loads.
+    if not install_brain(rep, council_root, args.force):
         return 2
     if not merge_settings(rep, council_root, args.force):
         return 2
