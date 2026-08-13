@@ -208,10 +208,13 @@ def main() -> int:
     # backtracking defect; this covers the TRAILING-WORD-CHARACTER half, which survived that fix.
     # Mechanism, and it is the same one: a long alternative matches, the trailing lookahead
     # rejects it, and a non-atomic group backtracks into a SHORTER alternative at the same start
-    # position, which then passes. The gate removes that backtrack with `(?=(X))\1`: a lookahead
-    # fixes ONE alternative into group 1, and the backreference must then consume exactly that
-    # text, so no shorter alternative can be substituted at the same start position. Those two
-    # fragments are the pointer -- no line numbers, which would stale on the next ATOM_RE edit.
+    # position, which then passes. The gate removes that backtrack with a real atomic group,
+    # `(?>...)`: once an alternative inside it matches, the engine will not re-enter the group to
+    # try a shorter one at that start. (The `(?=(X))\1` emulation reaches the same end by fixing
+    # one alternative into group 1 so a backreference must re-consume exactly that text; it is
+    # what this pattern would revert to if the project's Python floor ever dropped below 3.11,
+    # and it is NOT what ships -- see A1d, which asserts groups == 0.) Those fragments are the
+    # pointer -- no line numbers, which would stale on the next ATOM_RE edit.
     # `(?>` would say it more plainly, but the CPython `re` documentation gives atomic grouping as
     # "Added in version 3.11" (fetched 2026-08-11), and this project's declared floor is 3.10:
     # README line 424 reads "**Python 3.10+**" and install.py's check_python errors only when
