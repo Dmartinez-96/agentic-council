@@ -32,10 +32,10 @@ from pathlib import Path
 import brain_index
 import evidence_logger
 import laziness_gate
-import scripted_write_guard
 import session_start_directive
 import session_start_probe
 import stop_audit
+import tier0_gate
 
 COUNCIL_ROOT = Path(__file__).resolve().parent
 WRAPPER = COUNCIL_ROOT / "consult_council.py"
@@ -481,7 +481,7 @@ def prepare_snapshot(payload: dict, patch: str, analysis: dict) -> tuple[dict, s
             proc = subprocess.run([helper], input=analysis["rewritten"], text=True,
                                   capture_output=True, cwd=predictor, timeout=PREDICT_TIMEOUT)
             if proc.returncode != 0:
-                detail = (proc.stdout + "\n" + proc.stderr).strip()[-4000:]
+                detail = (proc.stdout + "\n" + proc.stderr).strip()[-4000:]  # stale-ok: an error-tail slice for one HookError message; unrelated to council_events.FIELD_MAX despite sharing the number, and nothing reads the two together
                 raise HookError("private apply_patch prediction failed; real patch denied: " + detail)
             for record in targets:
                 expected, _ = _identity(predictor / analysis["synthetic"][record["path"]])
@@ -787,9 +787,22 @@ def pre_tool(payload: dict) -> int:
         lower = tool_name.lower()
         if lower in {"exec_command", "unified_exec", "shell", "shell_command", "bash"}:
             command = str(tool_input.get("cmd") or tool_input.get("command") or "")
-            why = scripted_write_guard.looks_like_write(command)
-            if why and scripted_write_guard.mentions_reviewed_tree(command):
-                return emit_pre_context("COUNCIL GUARD (advisory; nothing blocked): this shell call appears to write via " + ", ".join(why) + ". Use apply_patch for reviewed changes, or explicitly fire the council on scripted results.")
+            # tier0_gate.bash_write_targets tokenises with shlex and ties each target to the
+            # construct that writes it, so a `>` unattached to a real target does not count.
+            # Probed directly:
+            #   `python3 x.py >/dev/null`            -> []
+            #   `echo hi > /tmp/scratch/notes.md`    -> []
+            #   `python3 -c "print('ok',b>a)"`       -> []      (a comparison operator)
+            #   `echo hi > notes.md`                 -> [('notes.md', 'shell redirect')]
+            # To compare candidate SCOPE boundaries over this install's real commands, run
+            # `_nogit/bash_scope_measure.py`; it prints its own corpus size, which grows with use.
+            writes = tier0_gate.bash_write_targets(command)
+            if writes:
+                detail = "; ".join(f"{tgt} [{why}]" for tgt, why in writes)
+                return emit_pre_context(
+                    "COUNCIL GUARD (advisory; nothing blocked): this shell call appears to WRITE "
+                    f"to {detail}. Use apply_patch for reviewed changes, or explicitly fire the "
+                    "council on scripted results.")
         return 0
     profile_error = _profile_error()
     if profile_error:

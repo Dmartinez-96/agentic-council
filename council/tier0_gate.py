@@ -1148,7 +1148,7 @@ SCAN_SUFFIXES = (".py", ".md", ".sh", ".json", ".ts", ".js", ".txt", ".toml", ".
 SKIP_DIRS = {".git", "node_modules", "__pycache__", "logs", ".venv", "venv", "_brain"}
 # Basenames of append-only historical records. Consumed by cross_file_survivors(), whose walk
 # explains what the exemption is and is not; keep the rationale there rather than duplicating it.
-ARCHIVAL_BASENAMES = {"HANDOFF.md", "Noumad-harness-todo.md"}
+ARCHIVAL_BASENAMES = {"HANDOFF.md", "Noumad-harness-todo.md", "harness-handoff.md"}
 
 
 def scan_root_for(path: Path, cwd: str) -> Path | None:
@@ -1394,11 +1394,13 @@ def _bash_gate_inner(session_id: str, tool_input: dict) -> int:
     # unreviewed" -- untrue on the only path that can emit it: the `_log` call directly above
     # has just ATTEMPTED a bash_deny/bash_would_deny record, and `emit_deny` below stops the
     # command outright in deny mode.
-    # TWO PRECISIONS THE COUNCIL EXTRACTED, both the same class as the defect being fixed:
-    # `_log` swallows OSError, so it attempts rather than guarantees persistence; and this is
-    # NOT the only shell-write check on the machine -- `scripted_write_guard.py` holds the
-    # Bash matcher today and warns on the same shapes. Claiming exclusivity would be true
-    # only after that guard is retired, which has not happened.
+    # ONE PRECISION TO KEEP: `_log` swallows OSError, so it ATTEMPTS rather than guarantees
+    # persistence, and this message must not promise a record that may not exist.
+    # THIS GATE NOW HOLDS THE BASH MATCHER (settings.json binds "Bash" to tier0_gate.py), and
+    # `codex_hook.py` calls bash_write_targets for the Codex harness, so both harnesses ask one
+    # implementation the same question. Confirm with `grep -n '"Bash"' -A6` on the settings file
+    # rather than trusting this line -- it points at an operator-editable file, which is the
+    # shape that goes stale.
     reason = (
         f"SHELL WRITE: this command appears to write {detail}. Standing rule 12 -- the shell "
         f"may READ and MEASURE but may not WRITE. The gap is specific: a file changed from "
@@ -1448,14 +1450,12 @@ def main() -> int:
     # routing below, so COUNCIL_TIER0=off disables ALL THREE -- the deterministic file checks,
     # the doorman, and the shell-write guard. It is a single control for THIS PROCESS, not an
     # oversight -- but it does NOT silence the PreToolUse tier, and calling it that would
-    # mislead an operator into thinking a quiet terminal meant nothing was checking. The
-    # matcher (read 2026-08-09) also registers `laziness_gate.py` on the edit tools and
-    # `scripted_write_guard.py` on Bash; both are separate processes with their own logic and
-    # neither reads this variable. What is lost here is only the ability to keep the free
-    # checks while silencing the model call.
-    # THIS ENUMERATION WENT STALE ONCE ALREADY: the Bash routing was added below this point
-    # without updating the list, so the comment named two of the three things the switch
-    # silences. Anything else routed below here belongs in this sentence too.
+    # mislead a reader into thinking a quiet terminal meant nothing was checking. The settings
+    # file also registers `laziness_gate.py` on the edit tools, a separate process with its own
+    # logic that does not read this variable. What is lost here is only the ability to keep the
+    # free checks while silencing the model call.
+    # KEEP THIS ENUMERATION IN STEP with whatever is routed below: anything added there is also
+    # silenced by this switch and belongs in the sentence above.
     switch = os.environ.get("COUNCIL_TIER0", "").strip().lower()
     if switch in ("off", "0", "disabled"):
         if not _log(session_id, {"event": "disabled", "via": "COUNCIL_TIER0",
@@ -1472,11 +1472,10 @@ def main() -> int:
     # ROUTED HERE BUT NOT MODELLED. The matcher registering THIS gate is
     # `Write|Edit|MultiEdit|NotebookEdit` (re-read 2026-08-09), so registering it there
     # routes NotebookEdit to it -- and this gate does not model a notebook's cell structure.
-    # THE SETTINGS FILE HAS MORE PreToolUse ENTRIES THAN THIS ONE, and an earlier version of
-    # this comment implied otherwise by naming only this matcher: the same read also shows a
-    # `Bash` matcher running `scripted_write_guard.py`, and `laziness_gate.py` alongside this
-    # gate on the edit tools. Re-read the file rather than trusting this sentence -- it is a
-    # pointer at an operator-editable file, which is the shape that goes stale.
+    # THIS GATE IS REGISTERED ON MORE THAN ONE MATCHER: the edit tools above, and `Bash`, which
+    # routes to bash_gate below. `laziness_gate.py` runs alongside it on the edit tools. Re-read
+    # the settings file rather than trusting this sentence -- it points at mutable configuration,
+    # which is the shape that goes stale.
     # Returning 0 quietly would make every notebook edit ungated and INDISTINGUISHABLE from
     # a clean pass, which is the exact failure this gate exists to prevent. So it announces
     # the gap instead. MultiEdit is handled the same way because the matcher NAMES it (that

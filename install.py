@@ -91,9 +91,6 @@ COUNCIL_FILES = [
     "council_audit_writes.py",
     "council_shadow_audit.py",
     "laziness_gate.py",
-    # PreToolUse advisory on Bash. The settings template wires a hook to this path, so an
-    # install that omits it points a hook at a missing file.
-    "scripted_write_guard.py",
     # THE DETERMINISTIC PreToolUse GATE, and the pre-landing seat it calls. Added 2026-08-10.
     # THEY INSTALL TOGETHER because the dependency is one-directional and was checked, not
     # assumed. `grep -n "^\s*import doorman\|doorman\.review" tier0_gate.py` returned two
