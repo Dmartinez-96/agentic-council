@@ -162,8 +162,22 @@ STALE_OK_RE = re.compile(r"stale-ok\s*:", re.IGNORECASE)
 # registry made it worse, latching onto common atoms and blocking every later edit in those
 # files. A check nobody can act on is worse than no check.
 ATOM_RE = re.compile(
-    # THE ALTERNATION IS EFFECTIVELY ATOMIC, VIA `(?=(...))\1`, AND THAT IS A BUG FIX.
-    # Yesterday's fix below cured the TRAILING-PERIOD case of a defect whose root cause it named
+    # THE ALTERNATION IS ATOMIC, VIA `(?>...)`. Check it against the object rather than this
+    # sentence: `'(?>' in ATOM_RE.pattern` -> True, `'(?=(' in ATOM_RE.pattern` -> False,
+    # `ATOM_RE.groups` -> 0. THE THREE MOVE TOGETHER, which is why all three are worth checking:
+    # `(?>...)` is non-capturing, so findall returns whole matches. The capture-group emulation
+    # `(?=(...))\1` is a DIFFERENT construction with the same effect on backtracking but not on
+    # shape -- it adds a group, making groups 1 and turning findall's return into tuples. If you
+    # find that form named anywhere as what ships, it is wrong.
+    # WHAT THE ATOMIC GROUP FIXES, STATED NARROWLY: backtracking from a REJECTED start position
+    # into a shorter alternative AT THAT SAME START. It does not stop the engine from advancing
+    # to a LATER start and matching there. `2026-08-119` shows the difference and is the case to
+    # think with -- the date alternative fails (day 119), nothing shorter wins at position 0, and
+    # `\d{3,}` then matches at the offset where `119` begins. CURRENT output is `['119']`; the
+    # pre-fix column in the block below records `['119','2026']` for the same input, so the bare
+    # year is gone and the suffix remains. Whether that suffix is a residual truncation or the
+    # right reading of a malformed date is UNSETTLED -- treat it as open, not as settled either way.
+    # The trailing-lookahead fix below cured the TRAILING-PERIOD case of a defect whose root cause it named
     # but did not remove: when a long alternative matches and the trailing lookahead then rejects
     # it, the regex BACKTRACKS INTO A SHORTER ALTERNATIVE at the same start position, and the
     # shorter one passes. A period was one trigger. ANY word character is another, and that half
@@ -298,6 +312,22 @@ _WRAPPER_VALUE_FLAGS = {
     "xargs": {"-n", "-P", "-I", "-d", "-s", "-a", "-E", "-L", "--max-args", "--replace"},
     "timeout": {"-s", "-k", "--signal", "--kill-after"},
 }
+# Filename sanitiser for the doorman marker, at MODULE SCOPE like every other regex in this file.
+# Section A5 of _nogit/test_tier0_gate.py greps this source for eight spellings of a direct
+# `re.<fn>(` call and requires zero, alongside a nonempty count of unindented `= re.compile`
+# constants so that zero is not vacuous. The invariant's purpose is to keep the tokeniser from
+# being forked into an inline copy that drifts from ATOM_RE, and it is enforced BY SPELLING, so a
+# sanitiser with nothing to do with tokenising trips it just the same.
+# THE CLASS IS DELIBERATELY THE SAME ONE council_advisor.py applies to tool_use_id when it names
+# the review marker -- there the sanitised value becomes the stem of `{name}.json` in the pending
+# dir, here it becomes the stem of `{name}.doorman` beside it, so one tool_use_id yields matching
+# filenames and a watcher can pair a doorman turn with the fire that follows it. Find it with
+# `grep -n 'A-Za-z0-9_' council_advisor.py`.
+# THE POINTER IS A GREP RATHER THAN THE PATTERN ITSELF, deliberately: this file is searched by
+# the A5 check described above, and a comment that QUOTES such a call is indistinguishable from
+# making one, so quoting it here would fail the check this comment exists to explain.
+_MARKER_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
 # A shell assignment token, e.g. `S=/tmp/scratch`. Used to resolve expansions that the same
 # command sets for itself; see _inline_env.
 _ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*)=(.*)$", re.S)
@@ -1667,7 +1697,7 @@ def main() -> int:
     _dm = None
     try:
         _dm = (STATE_ROOT / (session_id or "_no_session") / "pending-review"
-               / (re.sub(r"[^A-Za-z0-9_.-]", "_", payload.get("tool_use_id") or "")
+               / (_MARKER_NAME_RE.sub("_", payload.get("tool_use_id") or "")
                   + ".doorman"))
         _dm.parent.mkdir(parents=True, exist_ok=True)
         _dm.write_text(json.dumps({
