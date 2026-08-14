@@ -3,7 +3,7 @@
   "doorman": {"name": "doorman", "transport": "claude_subprocess", "model": "claude-sonnet-5", "fallback_model": "anthropic/claude-sonnet-5"},
   "members": [
     {"name": "codex", "tier": "voting", "transport": "codex_subprocess", "model": "gpt-5.6-sol", "fallback_model": "openai/gpt-5.6-sol"},
-    {"name": "gemini", "tier": "voting", "transport": "openrouter", "model": "google/gemini-3.6-flash", "fallback_model": "google/gemini-3.5-flash"},
+    {"name": "gemini", "tier": "voting", "transport": "openrouter", "model": "google/gemini-3.7-flash", "fallback_model": "google/gemini-3.6-flash"},
     {"name": "deepseek", "tier": "voting", "transport": "openrouter", "model": "deepseek/deepseek-v4-pro", "fallback_model": "deepseek/deepseek-v4-flash"},
     {"name": "kimi", "tier": "voting", "transport": "openrouter", "model": "moonshotai/kimi-k3", "fallback_model": "moonshotai/kimi-k2-thinking"},
     {"name": "glm", "tier": "voting", "transport": "openrouter", "model": "z-ai/glm-5.2", "fallback_model": "z-ai/glm-5.1"},

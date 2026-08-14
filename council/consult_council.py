@@ -200,15 +200,21 @@ GEMINI_API_URL = (
 GEMINI_THINKING_LEVEL = "high"
 
 # OpenRouter slug for the gemini voting member (same billing directive as
-# DEEPSEEK_OPENROUTER_MODEL). Listed in OpenRouter's public models API
-# (GET openrouter.ai/api/v1/models), re-checked 2026-07-25. On this route the
-# effort sent is openrouter_effort(), not GEMINI_THINKING_LEVEL, which applies
-# only to the direct gemini_rest transport.
-# 2026-07-25: 3.5-flash -> 3.6-flash, the highest-versioned gemini flash in that
-# catalog. That is a VERSION fact, not a capability measurement -- nothing here
-# compared the two. 3.5-flash is kept as the fallback.
-GEMINI_OPENROUTER_MODEL = "google/gemini-3.6-flash"
-GEMINI_OPENROUTER_FALLBACK = "google/gemini-3.5-flash"
+# DEEPSEEK_OPENROUTER_MODEL). On this route the effort sent is openrouter_effort(),
+# not GEMINI_THINKING_LEVEL, which applies only to the direct gemini_rest transport.
+# 2026-08-13: 3.6-flash -> 3.7-flash, 3.6-flash takes the fallback slot, and
+# 3.5-flash leaves the chain entirely. Both slugs were VERIFIED PRESENT that day in
+# OpenRouter's public models API (GET openrouter.ai/api/v1/models, rc=0, 411 models
+# returned). Listing EVERY slug containing "gemini" and "flash" -- 22 of them, with no
+# version filter, since filtering on "gemini-3" could not have revealed a higher major
+# version -- 3.7 was the highest NUMBERED gemini flash, its only siblings above 3.6
+# being its own ":batch" variant. One unnumbered alias, "~google/gemini-flash-latest",
+# also exists; what that resolves to was NOT determined here.
+# THAT IS A VERSION FACT, NOT A CAPABILITY MEASUREMENT -- nothing here compared
+# 3.7 against 3.6 on review quality, in either direction. The same caveat applied
+# to the 3.5 -> 3.6 bump before it.
+GEMINI_OPENROUTER_MODEL = "google/gemini-3.7-flash"
+GEMINI_OPENROUTER_FALLBACK = "google/gemini-3.6-flash"
 
 # --- FAST mode ---------------------------------------------------------------
 #
@@ -6594,6 +6600,114 @@ def lost_votes(results: list[dict]) -> list[dict]:
             if r.get("verdict") in ("UNPARSEABLE", "ERROR")]
 
 
+def quorum_state(results: list[dict]) -> dict:
+    """Whether BLOCK was arithmetically REACHABLE on this fire, and who was missing.
+
+    THE QUORUM COUNTS THE CONFIGURED BENCH, NOT THE SEATS THAT REPORTED.
+    block_quorum() derives its threshold from voting_members(), i.e. from REGISTRY.
+    Two paths run a smaller panel than REGISTRY holds and NEITHER shrinks REGISTRY:
+    main() drops a member whose transport key is absent from its own local
+    `members` list (see TRANSPORT_KEY_ENV), and --members can name any subset.
+    PROBED with GEMINI_API_KEY, DEEPSEEK_API_KEY and OPENROUTER_API_KEY all unset:
+    voting_members() still returns the whole configured bench (6 names on this
+    install's roster) and block_quorum() still returns 3.
+
+    So a degraded fire can reach a state where FEWER voters return a readable
+    verdict than the quorum requires, and then no combination of verdicts could
+    have reverted the file. RE-DERIVE THE TALLY, do not quote it -- the corpus grows,
+    so a fixed number here is stale on arrival. Two runs of the recipe below, minutes
+    apart on 2026-08-13, printed 2,239 then 2,242 reachable; an earlier count over the
+    same predicate gave 2,226. WHAT PRODUCED THE INTERVENING ENTRIES WAS NOT
+    ESTABLISHED -- the only observation is that the figure moved between runs:
+
+        python3 -c "
+        import json,glob
+        L={'ERROR','UNPARSEABLE'}; r=[]
+        for p in glob.glob('logs/*/*.json'):
+            d=json.load(open(p))
+            ms=d.get('members'); ro=(d.get('roster') or {}).get('members')
+            if not (d.get('final_verdict') and isinstance(ms,list) and ms and ro): continue
+            q=(len([x for x in ro if x.get('tier')=='voting'])+1)//2
+            alive=len(ms)-sum(m.get('verdict') in L for m in ms)
+            r.append((bool(d.get('tool_name')), alive<q))
+        print('reachable',sum(1 for h,u in r if not u),
+              'unreachable hook',sum(1 for h,u in r if u and h),
+              'unreachable cli',sum(1 for h,u in r if u and not h))"
+
+    THE UNREACHABLE COUNTS AGREED ACROSS EVERY SCAN CITED HERE: 19 PostToolUse fires
+    and 2 CLI runs. That is a count over the logs AS SCANNED on 2026-08-13, not a
+    standing property of the code -- a future degraded fire adds to the class, which
+    is why the recipe prints it rather than this docstring asserting it. Splitting
+    those 19 by the same predicate gave: ran a SINGLE voter 10, ran the full roster
+    and lost five to ERROR 9, neither 0. Tallying the class by final_verdict gave
+    hook {WARN: 19} and CLI {PASS: 1, WARN: 1}, and the sole PASS was
+    20260809T185451Z-f75d4e67 -- a non-hook run of 2 voters against a 6-name roster.
+    So no PASS was published by a HOOK under an unreachable quorum in those scans.
+
+    THE RECIPE ABOVE RUNS AS INDENTED -- do not "fix" the margin. Both forms were
+    measured on this exact block, extracted verbatim with its 8-space margin: piped
+    to sh as `python3 -c "..."` it exits rc=0, printing `reachable 2242 unreachable
+    hook 19 unreachable cli 2`; the same body fed to `python3 -` on STDIN exits rc=1
+    with `IndentationError: unexpected indent` on line 1. So for THIS block the two
+    invocations are not interchangeable. Whether `-c` accepts a uniform indent for
+    any such body is NOT established here -- treat the above as a property of this
+    recipe, measured, rather than as interpreter behaviour.
+
+    WHAT THAT DOES NOT ESTABLISH: that a revert was ever WANTED in those 19. No
+    seat in them cast BLOCK, so nothing here shows an unreachable quorum has ever
+    suppressed one. The hazard is that such a fire reads as an ordinary WARN while
+    the auto-revert could not have fired at all -- an exposure, not a measured loss.
+
+    THE THRESHOLD IS DELIBERATELY NOT MOVED, which is why this function only
+    DESCRIBES a state. Deriving the quorum from surviving voters would keep BLOCK
+    reachable at any degradation, at the cost of restoring lone-blocker auto-revert
+    exactly when the bench is malfunctioning -- the behaviour determine_final_verdict's
+    measurements moved away from. Auto-revert destroys work, so that trade is the
+    user's to make.
+
+    `reported` counts EXTERNAL verdicts too, because determine_final_verdict does:
+    it tallies BLOCKs over all_results, which is builtin_results + external. The
+    arithmetic here therefore matches the arithmetic that decides. It also PRESERVES
+    DUPLICATE role strings for the same reason -- an external verdict may reuse a
+    builtin's name, and both count in that tally -- so it is a vote count, not a
+    set of distinct members.
+
+    `seated` and `absent` PARTITION the configured roster by whether that seat produced
+    a BUILT-IN record, so they answer "who sat", which `ran` does not: an external
+    verdict may reuse a configured name, and counting it would report an absent seat as
+    having run. THE CONSEQUENCE OF DEFINING IT THAT WAY, stated because it is not
+    intuitive: an external record filed under a configured name leaves that seat in
+    `absent` while its verdict still flows through `ran`, `reported` and lost_votes().
+    The seat did not sit; a vote bearing its name was still counted. A seat with no
+    record of any kind appears in `absent` alone.
+    """
+    configured = [m.name for m in voting_members()]
+    ran = [str(r.get("role")) for r in results]
+    # THE EXTERNAL MARKER IS THE "source" KEY, set to "external:<path>" by
+    # load_external_verdicts and assigned on no other MEMBER record. That single
+    # assignment is the contract this relies on. To re-check it, search for ASSIGNMENTS
+    # of the key rather than mentions of it -- the useful pattern ends in a colon, since
+    # a bare search for the key name also matches reads and prose, this comment
+    # included, and none of those assign anything. Expect the one member-record write
+    # plus the roster dicts, which are a different structure entirely. A scan of the
+    # logged member records found none carrying the key, which is consistent with the
+    # contract but is not what makes it true.
+    seated = {str(r.get("role")) for r in results
+              if not str(r.get("source") or "").startswith("external:")}
+    lost = {str(r.get("role")) for r in lost_votes(results)}
+    reported = [n for n in ran if n not in lost]
+    quorum = block_quorum()
+    return {
+        "configured": configured,
+        "ran": ran,
+        "seated": [n for n in configured if n in seated],
+        "absent": [n for n in configured if n not in seated],
+        "reported": reported,
+        "quorum": quorum,
+        "block_reachable": len(reported) >= quorum,
+    }
+
+
 def determine_final_verdict(active_results: list[dict]) -> str:
     """The council's verdict. BLOCK requires a QUORUM, not a single voice.
 
@@ -6752,6 +6866,21 @@ def write_log(layer: str, tool_name: str | None, target_path: str | None,
         "members": [{**r, "stderr": _bound_stderr(r.get("stderr"))}
                     for r in (all_results or [])],
         "final_verdict": final_verdict,
+
+        # ENFORCEMENT PROVENANCE: could this fire have BLOCKed at all? Recorded rather
+        # than left to be re-derived, because deriving it needs three joins a consumer
+        # has to get right -- the roster's voting count, the readable-verdict count and
+        # ceil(n/2) -- and one wrong join silently reclassifies a degraded fire as a
+        # healthy one. Nothing in the entry distinguished a WARN meaning "the panel
+        # looked and found little" from one meaning "the panel could not sit".
+        # NAMED "quorum_state", NOT "quorum", DELIBERATELY: council_outcome already uses
+        # an `adjudication.quorum` BOOLEAN for a different thing entirely -- whether
+        # every label-adjudication judge returned a readable vote -- and it lives in the
+        # label entries, not here. Two different meanings under one key in one project is
+        # a trap even when the files never meet. This key names its producing function.
+        # The whole dict goes in rather than just the boolean, so "which seats were
+        # absent?" and "how far short was it?" stay answerable without a backfill.
+        "quorum_state": quorum_state(all_results or []),
 
         # DEPTH PROVENANCE. Before these two fields existed, the entry recorded
         # nothing about the EFFORT a run was made at. Entries still differed from
@@ -6945,6 +7074,30 @@ def emit_output(results: list[dict], final_verdict: str, log_path: Path,
         print("# Answer it on the merits or revert by hand; do not read the "
               "surviving file as vindication.")
 
+    # WHETHER THE FIRE COULD HAVE ENFORCED AT ALL, which is a different question from
+    # the one above. SUB-QUORUM BLOCK fires when blockers exist and fall short; this
+    # fires when too FEW readable verdicts came back for the threshold to be met at
+    # all, whatever they said, so a degraded fire reaches it with no BLOCK anywhere in
+    # it. Neither banner implies the other and a fire can legitimately print both.
+    # THE SHORTFALL ARISES TWO WAYS and the timing differs: seats that never ran (known
+    # before the fire) and seats that ran and returned ERROR (known only once their
+    # results land). Measured over the corpus, both occur -- see quorum_state(), which
+    # also carries the re-derivation recipe.
+    qs = quorum_state(results)
+    if not qs["block_reachable"]:
+        print("#" + "=" * 68)
+        print(f"# QUORUM UNREACHABLE: {len(qs['reported'])} readable verdict(s) came "
+              f"back, but {qs['quorum']} BLOCK(s) of {len(qs['configured'])} "
+              f"configured voting member(s) are required to auto-revert.")
+        print("# NO combination of verdicts on this fire could have reverted the file. "
+              "The auto-revert did not DECLINE to fire; it COULD NOT.")
+        if qs["absent"]:
+            print(f"# NEVER RAN: {', '.join(qs['absent'])}. An absent seat files no "
+                  f"record, so it is not among the lost votes named below.")
+        print("# Read this as A PANEL THAT COULD NOT SIT, not as a council that looked "
+              "and found little. Re-run once the bench is whole.")
+        print("#" + "=" * 68)
+
     # ANNOUNCE THE DEPTH, ALWAYS, AND NAME IT. A reduced-depth PASS is indistinguishable from
     # a full one on the page, and that is precisely the danger of a speed switch: it converts
     # "we looked less hard" into "we found nothing", silently. The verdict is still the verdict
@@ -6992,6 +7145,23 @@ def emit_output(results: list[dict], final_verdict: str, log_path: Path,
               f"(GLOBAL to the install; every session's fires use it)")
     for w in ROSTER_WARNINGS:
         print(f"# ROSTER WARNING: {w}")
+    # WHO ACTUALLY SAT, printed whenever it differs from who was configured. The ROSTER
+    # line above names the CONFIGURED bench, and that is also what the quorum counts:
+    # block_quorum() computes `n = len(voting_members()) if n_voting is None else
+    # n_voting`. The panel that RAN can be smaller -- main()'s key check drops a name
+    # with `members = [m for m in members if m != name]`, rebinding its own local list
+    # and leaving REGISTRY (hence voting_members()) untouched.
+    # UNCONDITIONAL ON REACHABILITY, deliberately: a panel can lose seats and still
+    # clear the quorum -- 4 of 6 configured leaves quorum 3 met -- in which case the
+    # QUORUM UNREACHABLE banner correctly stays silent and these seats would otherwise
+    # be named nowhere at all.
+    # COUNTED AS DISTINCT CONFIGURED SEATS, not as len(ran): `ran` is a record list
+    # that keeps duplicates and admits external roles, so it can exceed the configured
+    # count and print "7 of 6". configured-minus-absent cannot.
+    if qs["absent"]:
+        print(f"# PANEL: {len(qs['configured']) - len(qs['absent'])} of "
+              f"{len(qs['configured'])} configured voting member(s) ran on this fire. "
+              f"NO RECORD from: {', '.join(qs['absent'])}.")
     print(f"# log: {log_path}")
     for r in results:
         line = f"# member: {r['role']} verdict={r['verdict']}"

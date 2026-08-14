@@ -515,6 +515,147 @@ except Exception as e:  # noqa: BLE001
     FAILS.append(f"I effort-table invariant raised: {type(e).__name__}: {e}")
     CHECKS += 1
 
+# ---------------------------------------------------------------- J: quorum reachability
+# WHAT THIS SECTION PROTECTS: the disclosure that a fire could not have reached a BLOCK at all.
+# It is not a verdict change -- block_quorum() is untouched -- so nothing else in this suite
+# would notice if the disclosure silently stopped firing. A regression here is invisible in
+# exactly the way the defect it reports is.
+try:
+    import consult_council as cc  # noqa: E402
+    import council_watch as cw  # noqa: E402
+
+    def mk(role, verdict, **kw):
+        return dict(role=role, verdict=verdict, stderr="", text="x", duration_s=1.0, **kw)
+
+    names = [m.name for m in cc.voting_members()]
+    q = cc.block_quorum()
+
+    full = cc.quorum_state([mk(n, "PASS") for n in names])
+    check(full["block_reachable"] is True, "J1 a full readable panel can reach BLOCK")
+    check(full["absent"] == [], "J2 a full panel has no absent seats")
+    check(sorted(full["seated"] + full["absent"]) == sorted(full["configured"]),
+          "J3 seated and absent partition the configured roster")
+
+    # TWO DEGRADED SHAPES THAT FAIL DIFFERENTLY: a full panel whose seats ran and errored, and a
+    # truncated panel whose seats never ran at all. They must be judged the same way and
+    # reported differently -- only the second has absent seats.
+    thin = cc.quorum_state([mk(names[0], "WARN")]
+                           + [mk(n, "ERROR") for n in names[1:]])
+    check(thin["block_reachable"] is False, "J4 one readable verdict cannot reach a quorum > 1")
+    check(thin["absent"] == [], "J5 seats that RAN and errored are not 'absent'")
+
+    truncated = cc.quorum_state([mk(names[0], "PASS")])
+    check(truncated["block_reachable"] is (1 >= q),
+          "J6 a one-seat panel is judged against the CONFIGURED quorum, not its own size")
+    check(sorted(truncated["absent"]) == sorted(names[1:]),
+          "J7 seats that never ran are named absent")
+
+    # THE EXTERNAL-NAME COLLISION. An --external-verdict may reuse a configured seat's name;
+    # counting it as that seat having sat would report a bench member who never ran.
+    ext = cc.quorum_state([mk(names[1], "PASS", source="external:/tmp/v.txt")])
+    check(names[1] not in ext["seated"], "J8 an external record does not seat the name it borrows")
+    check(names[1] in ext["absent"], "J9 that configured seat is still absent")
+    check(ext["reported"] == [names[1]],
+          "J10 the external verdict still COUNTS as a vote, matching determine_final_verdict")
+
+    # THE BANNERS, from the real emit_output rather than a reconstruction of it.
+    def emit(results):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cc.emit_output(results, cc.determine_final_verdict(results), Path("/tmp/x.json"))
+        return buf.getvalue()
+
+    healthy = emit([mk(n, "PASS") for n in names])
+    check("QUORUM UNREACHABLE" not in healthy, "J11 a healthy fire prints no unreachable banner")
+    check("# PANEL:" not in healthy, "J12 a healthy fire prints no PANEL line")
+
+    degraded = emit([mk(names[0], "PASS")])
+    check("QUORUM UNREACHABLE" in degraded, "J13 a truncated panel prints the banner")
+    check("COULD NOT" in degraded, "J14 the banner says the revert could not fire, not that it declined")
+    check("# PANEL:" in degraded, "J15 the PANEL line names the shortfall")
+    check(f"1 of {len(names)}" in degraded,
+          "J16 PANEL counts distinct configured seats, so it can never print more than the roster")
+
+    # A PASS CAN COEXIST WITH AN UNREACHABLE QUORUM, which is the one shape measured in the
+    # corpus that published PASS. A PASS from a bench that could not have objected is the
+    # dangerous combination, so the banner must reach the page on that path too.
+    two = emit([mk(names[1], "PASS"), mk(names[2], "PASS")])
+    check("QUORUM UNREACHABLE" in two, "J17 the banner prints even when the fire PASSes")
+
+    # THE LOG FIELD. write_log must record it, or a consumer has to rebuild the derivation from
+    # the roster and the member records every time it wants the answer.
+    saved_logs = cc.LOGS_ROOT
+    try:
+        cc.LOGS_ROOT = Path(tempfile.mkdtemp())
+        written = cc.write_log("posttool", "Edit", "/tmp/t.py", "pitch",
+                               [mk(names[0], "PASS")], "PASS")
+        got = json.loads(written.read_text())
+        check("quorum_state" in got, "J18 write_log records quorum_state")
+        check(got["quorum_state"]["block_reachable"] is (1 >= q),
+              "J19 the recorded value matches the panel that ran")
+        check("quorum" not in got,
+              "J20 the field is NOT named 'quorum', which council_outcome uses for adjudication")
+    finally:
+        cc.LOGS_ROOT = saved_logs
+
+    # THE WATCHER ROW. Silence means two different things and only one of them is a claim.
+    class _R:
+        def _c(self, s, _c=""):
+            return s
+
+    r = _R()
+    unreachable = {"quorum_state": {"block_reachable": False, "reported": ["codex"],
+                                    "configured": names, "quorum": q, "absent": names[1:]}}
+    rows = cw._quorum_rows(r, unreachable)
+    check(any("QUORUM UNREACHABLE" in x for x in rows), "J21 the watcher renders an unreachable fire")
+    check(any("never ran" in x for x in rows), "J22 the watcher names the seats that never ran")
+    check(cw._quorum_rows(r, {"quorum_state": dict(unreachable["quorum_state"],
+                                                   block_reachable=True)}) == [],
+          "J23 a reachable fire renders nothing")
+    # THE GUARD THAT MATTERS: None is UNKNOWN, not False. `not qs.get(...)` would collapse them
+    # and report an unmeasured fire as unenforceable, which is a false alarm rather than a miss.
+    check(cw._quorum_rows(r, {"quorum_state": None}) == [],
+          "J24 a log predating the field renders nothing, not a false alarm")
+    check(cw._quorum_rows(r, {}) == [], "J25 a sidecar-shaped summary renders nothing")
+    check(cw._quorum_rows(r, {"quorum_state": "nonsense"}) == [],
+          "J26 a malformed field renders nothing rather than raising")
+
+    # THE TWO INTEGRATION POINTS, which nothing above reaches: the pass-through in
+    # _summary_from_log and the call inside follow(). Counted over the text of J1-J26, both
+    # appear ZERO times while _quorum_rows itself appears five, so the checks above exercise the
+    # two ends of the plumbing without ever crossing it. J27-J29 cross it.
+    saved_logs = cc.LOGS_ROOT
+    try:
+        cc.LOGS_ROOT = Path(tempfile.mkdtemp())
+        thin_log = cc.write_log("posttool", "Edit", "/tmp/t.py", "pitch",
+                                [mk(names[0], "PASS")], "PASS")
+        summ = cw._summary_from_log(thin_log)
+        check(summ is not None and summ.get("quorum_state") is not None,
+              "J27 _summary_from_log carries quorum_state out of the log")
+        # END TO END on a log the engine actually wrote: whether the row appears depends on the
+        # configured quorum, so the expectation is derived rather than pinned to this bench.
+        check(bool(cw._quorum_rows(r, summ)) is (1 < q),
+              "J28 a log-backed summary renders the row exactly when the quorum is unreachable")
+    finally:
+        cc.LOGS_ROOT = saved_logs
+
+    # THE CALL SITE IS PINNED BY SOURCE TEXT, AND THE ATTEMPT TO RUN IT CAME FIRST.
+    # MEASURED: follow(render, "no-such-session-xyz", 0.1) was invoked in a subprocess under an
+    # 8s deadline -- no markers to find and the fastest poll interval. It entered the function
+    # (its first print arrived) and never returned: TimeoutExpired at 8.0s. That is by design;
+    # follow() is a `while True:` poll whose only exit is `except KeyboardInterrupt: return 0`,
+    # so no input makes it terminate on its own and there is nothing to assert a return value
+    # against. Hence the same source-text technique I0b/I0c use for a cross-file flag spelling.
+    # WHAT THIS DOES NOT ESTABLISH: that the branch is reached at runtime, or that the call's
+    # arguments are correct -- a typo inside the expression would still match. It establishes
+    # that the call has not been deleted, which is precisely the regression J27 cannot see.
+    watch_src = (Path(__file__).resolve().parent.parent / "council_watch.py").read_text()
+    check("_quorum_rows(render, fresh)" in watch_src,
+          "J29 follow() still calls _quorum_rows on the finished-fire summary")
+except Exception as e:  # noqa: BLE001
+    FAILS.append(f"J quorum reachability raised: {type(e).__name__}: {e}")
+    CHECKS += 1
+
 # ---------------------------------------------------------------- report
 print(f"{CHECKS - len(FAILS)}/{CHECKS} checks passed")
 for f in FAILS:

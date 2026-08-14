@@ -52,12 +52,23 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # THE MARKER LAYOUT AND THE LIVENESS RULE BOTH BELONG TO council_advisor, which writes them.
-# --follow needs three of its names -- _pending_dir (656), _events_path (817) and
-# marker_is_live (833) -- and importing them is what keeps this file from growing a second,
-# drifting definition of "a fire is running".
-# TOLERANT IMPORT: the default mode spawns its own engine and needs none of this, so a
-# package without the advisor must still be able to run that mode rather than failing at
-# import time over a feature it is not using.
+# BOTH MODES USE THE ADVISOR WHEN IT IS PRESENT; only --follow REQUIRES it, per the tolerant
+# import below. The dependency map, by enclosing function, because a file-wide grep of `ca.`
+# lists the names a file mentions but cannot attribute any of them to a calling mode:
+#   main(), the default mode, which WRITES a fire's marker:
+#       write_pending_marker, _events_path, clear_pending_marker
+#   follow(), which READS fires: marker_is_live, read_events, summarise_partial, _events_path
+#   and the three helpers follow() itself calls -- _session_markers (_pending_dir),
+#       _host_markers (EVIDENCE_STATE_ROOT, PENDING_DIRNAME) and _fire_block (read_events,
+#       summarise_partial, _events_path)
+# Importing them is what keeps this file from growing a second, drifting definition of where a
+# marker lives and when a fire counts as running.
+# NAMED, NOT NUMBERED, deliberately: a line number cited across files is a pointer that goes
+# stale silently the next time the other file grows, and grep finds a def just as fast.
+# TOLERANT IMPORT, and here is what its absence now costs, which is no longer nothing: with no
+# council_advisor the default mode still runs the fire and still renders it in THIS terminal,
+# but writes no marker, so no other process can see it. --follow refuses outright, guarding on
+# `ca is None` at entry. A package shipping without the advisor loses visibility, not review.
 try:
     import council_advisor as ca
 except Exception:  # noqa: BLE001
@@ -403,6 +414,15 @@ def _summary_from_log(path: Path) -> dict | None:
     EXPECTED COMES FROM THE ROSTER, not from who answered. A seat that never reported must still
     occupy a cell -- deriving the roster from the results would silently shrink the grid to the
     seats that happened to answer, which is exactly the information a reader needs to not lose.
+
+    `quorum_state` IS PASSED THROUGH, NEVER RECOMPUTED HERE, and that is deliberate. It records
+    whether the fire could have reached a BLOCK at all, and the threshold behind it is the
+    auto-revert rule, which consult_council documents as the user's call rather than the agent's.
+    Deriving it here would put ceil(n/2) in a second place, and a copy that drifts would misreport
+    enforcement rather than merely look untidy. This module imports council_advisor, not
+    consult_council, so it has no access to block_quorum() and should not grow one. The field is
+    absent from any log written before it existed, so it passes through as None, and a reader must
+    treat None as UNKNOWN -- never as "reachable".
     """
     try:
         d = json.loads(path.read_text())
@@ -437,6 +457,7 @@ def _summary_from_log(path: Path) -> dict | None:
     return {"expected": {"voting": voting, "inspector": inspector},
             "started": {}, "finished": finished, "seats": seats,
             "seat_rounds": seat_rounds, "corrected": [],
+            "quorum_state": d.get("quorum_state"),
             "final_verdict": d.get("final_verdict"), "log_name": path.name}
 
 
@@ -451,6 +472,43 @@ def _doorman_block(render: Renderer, marker: Path) -> list[str]:
     return [f"{render._c(label, _BOLD)}  {rec.get('tool_name') or '?'} {target}"
             f"   {_elapsed_s(marker)}s",
             f"  {render._c('doorman reviewing (gate, before the council)', _DIM)}"]
+
+
+def _quorum_rows(render: Renderer, summary: dict) -> list[str]:
+    """The enforcement line for a finished fire: could it have reached a BLOCK at all?
+
+    THREE STATES, AND SILENCE MEANS TWO DIFFERENT THINGS, so neither may be rendered as an
+    assurance. `block_reachable` False is the only one that prints.
+      - FALSE: too few readable verdicts came back for the threshold, so no combination of
+        them could have reverted the file. This is the row worth interrupting a reader for.
+      - TRUE: prints nothing. The threshold was met, and a line reading "enforcement was
+        possible" on every ordinary fire trains the eye to skip the row that matters. TRUE
+        does NOT mean the panel was whole -- the threshold is ceil(n/2), half the configured
+        bench rounded up rather than all of it, so seats can be missing while the quorum is
+        still met. Measured on this install: 6 configured voting seats, block_quorum() 3, and
+        3 is exactly half rather than a majority -- do not read "majority" into it, since that
+        would put the bar at 4. Missing seats appear as empty cells in the grid above, never
+        on this line.
+      - NONE: the log predates the field, or the fire was salvaged from its sidecar and never
+        wrote one. That is UNKNOWN, not healthy. It currently prints nothing, which means
+        UNKNOWN and TRUE look IDENTICAL on this surface -- a known limitation of this row, not
+        a claim that the fire was fine. Anything that later renders UNKNOWN must distinguish
+        it from TRUE, never from FALSE.
+    The `is not False` test is deliberate: `not qs.get(...)` would collapse None into the same
+    branch as False and report an unmeasured fire as unenforceable.
+    """
+    qs = summary.get("quorum_state")
+    if not isinstance(qs, dict) or qs.get("block_reachable") is not False:
+        return []
+    reported = len(qs.get("reported") or [])
+    configured = len(qs.get("configured") or [])
+    rows = [f"  {render._c('QUORUM UNREACHABLE', _C.get('BLOCK', ''))}  "
+            f"{reported} readable verdict(s) of {configured} configured seat(s); "
+            f"{qs.get('quorum')} BLOCK(s) needed to auto-revert"]
+    absent = [str(a) for a in (qs.get("absent") or [])]
+    if absent:
+        rows.append(f"  {render._c('never ran', _DIM)}         {', '.join(absent)}")
+    return rows
 
 
 def follow(render: Renderer, session: str, interval: float) -> int:
@@ -553,6 +611,25 @@ def follow(render: Renderer, session: str, interval: float) -> int:
                         if verdict:
                             rows.append(f"  final: "
                                         f"{render._c(verdict, _C.get(verdict, ''))}")
+                        # AFTER the verdict, deliberately: the reachability line qualifies the
+                        # verdict above it, and a reader who stops at "final: WARN" has read the
+                        # less important half.
+                        # THE SIDECAR FALLBACK TAKEN JUST ABOVE CANNOT SUPPLY IT. Measured:
+                        # summarise_partial([]) returns exactly corrected, expected, finished,
+                        # seat_rounds, seats, started -- no quorum_state (and no final_verdict,
+                        # which is why the verdict line above is also skipped for a salvaged
+                        # fire). So a killed fire draws NO line here, which on this surface is
+                        # indistinguishable from a reachable one.
+                        # THAT GAP IS NARROWER THAN IT LOOKS, and the reason is in the CONTROL
+                        # PATH rather than in any report's wording: council_advisor's timeout
+                        # handler builds the partial and then `return emit_warning(salvaged)`,
+                        # returning down the WARNING route, while the revert lives further on in
+                        # the `rc == 2` branch that a killed wrapper never reaches. So a salvaged
+                        # fire cannot revert, and reachability is MOOT there rather than unknown.
+                        # format_partial says as much in its own text, but that text is a report,
+                        # not the mechanism -- the two agree here, and it is the branch that
+                        # settles it.
+                        rows += _quorum_rows(render, fresh)
                         block = [header] + rows
                         entry[1] = block
                     entry[4] = True
@@ -657,6 +734,31 @@ def main() -> int:
     colour = (not args.no_colour) and sys.stderr.isatty()
     render = Renderer(colour)
 
+    # A DIRECT PITCH IS A FIRE TOO, and --follow can only see it if it leaves the same two
+    # artifacts a hook-driven fire does: a pending-review MARKER to be enumerated, and an
+    # events SIDECAR to be rendered. Before this, only the PostToolUse hook wrote them, so a
+    # pitch streamed to its own terminal and was invisible everywhere else.
+    # THE MARKER NAME IS NOT tool_use_id-SHAPED HERE, and nothing should assume it is: a direct
+    # run has no originating tool call, so write_pending_marker falls back to a uuid. Any reader
+    # keying off the filename is reading an implementation detail of the hook path.
+    # THE LAYOUT RULES STAY IN council_advisor, which owns them: the marker path, the liveness
+    # test and the sidecar name are all its functions, called here rather than reimplemented,
+    # so there is no second definition free to drift from the writers.
+    marker = None
+    if ca is not None:
+        target = ""
+        for i, a in enumerate(forwarded):
+            if a == "--target-path" and i + 1 < len(forwarded):
+                target = forwarded[i + 1]
+            elif a.startswith("--target-path="):
+                target = a.split("=", 1)[1]
+        # tool_name "pitch" so the row is distinguishable from a hook-driven Edit/Write at a
+        # glance; an empty tool_use_id makes write_pending_marker name the file from a uuid,
+        # which is correct here -- a direct run has no originating tool call to key it from.
+        marker = ca.write_pending_marker(args.session, "pitch", target or "(direct pitch)",
+                                         "", os.getcwd())
+    events = ca._events_path(marker) if (ca is not None and marker is not None) else None
+
     r, w = os.pipe()
     try:
         proc = subprocess.Popen(
@@ -664,29 +766,77 @@ def main() -> int:
             pass_fds=(w,))
     except OSError as e:
         os.close(r); os.close(w)
+        if ca is not None:
+            ca.clear_pending_marker(marker)
         print(f"council_watch: could not start the engine: {e}", file=sys.stderr)
         return 2
     # The PARENT must close its copy of the write end, or the read below never sees EOF
     # when the engine exits and this wrapper hangs forever.
     os.close(w)
 
-    buf = ""
-    with os.fdopen(r, "r", buffering=1) as stream:
-        for chunk in stream:
-            buf += chunk
-            *complete, buf = buf.split("\n")
-            for raw in complete:
-                if not raw.strip():
-                    continue
-                try:
-                    rec = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue        # a malformed record must not kill the view
-                out = render.line(rec)
-                if out is not None:
-                    print(out, file=sys.stderr, flush=True)
+    # THE SIDECAR IS WHAT ANOTHER TERMINAL READS. This process owns the only pipe the engine
+    # writes to, so without teeing, --follow would find the marker and have nothing to render.
+    # Instrumentation must never cost the review: every failure here degrades to sink = None.
+    sink = None
+    if events is not None:
+        try:
+            sink = open(events, "a", buffering=1)
+        except OSError:
+            sink = None
 
-    return proc.wait()
+    buf = ""
+    try:
+        with os.fdopen(r, "r", buffering=1) as stream:
+            for chunk in stream:
+                buf += chunk
+                *complete, buf = buf.split("\n")
+                for raw in complete:
+                    if not raw.strip():
+                        continue
+                    # TEE BEFORE PARSING, so a record this renderer cannot read still reaches
+                    # the sidecar -- summarise_partial parses defensively and a dropped line
+                    # would be a seat missing from someone else's view, not a cosmetic loss.
+                    if sink is not None:
+                        try:
+                            sink.write(raw + "\n")
+                        except OSError:
+                            # CLOSE BEFORE DROPPING THE REFERENCE. Setting it to None first
+                            # makes the finally below skip its close() and leaks the handle --
+                            # the disabling of a broken sink must not also strand it.
+                            try:
+                                sink.close()
+                            except OSError:
+                                pass
+                            sink = None
+                    try:
+                        rec = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue        # a malformed record must not kill the view
+                    out = render.line(rec)
+                    if out is not None:
+                        print(out, file=sys.stderr, flush=True)
+        return proc.wait()
+    finally:
+        # THE CHILD GOES FIRST, and the ORDER is load-bearing: clearing the marker while the
+        # engine is still alive advertises a FINISHED fire that is still burning tokens, which
+        # inverts what a marker means to every reader of it.
+        # An interrupt can land anywhere above -- inside the stream loop as well as in
+        # proc.wait() -- so this reaps unconditionally on `poll() is None` rather than assuming
+        # where it struck. SIGTERM first, SIGKILL only after a bounded wait; whether the engine
+        # runs cleanup of its own on SIGTERM is NOT established here, only that it is given the
+        # chance to. The wait() after kill() is what actually reaps: without it the marker
+        # clears over a zombie, which is the same lie in a shorter-lived form.
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if sink is not None:
+            sink.close()
+        if ca is not None:
+            ca.clear_pending_marker(marker)
 
 
 if __name__ == "__main__":
