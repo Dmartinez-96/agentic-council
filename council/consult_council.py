@@ -684,6 +684,10 @@ async def reformat_unparseable(results: list[dict], cwd: Path) -> list[dict]:
             r["verdict"] = v
             r["reformatted"] = True
             r["verdict_stage"] = 1
+            # Keep the response that actually supplied the stored verdict. `text`
+            # remains the original member response, which may contain no verdict at
+            # all; without this field the log cannot justify the recovered value.
+            r["recovered_verdict_text"] = (out.get("text") or "")[:8000]
             return
         if kind == "UNPARSEABLE":
             r["reformat_failed"] = True
@@ -706,6 +710,7 @@ async def reformat_unparseable(results: list[dict], cwd: Path) -> list[dict]:
                 r["verdict"] = v2
                 r["reformatted"] = True
                 r["verdict_stage"] = 2
+                r["recovered_verdict_text"] = (out2.get("text") or "")[:8000]
                 return
             if kind2 == "NONE":
                 # An INFORMED ABSTENTION: asked directly, with the finality spelled
@@ -747,6 +752,7 @@ async def reformat_unparseable(results: list[dict], cwd: Path) -> list[dict]:
             r["verdict"] = v3
             r["reformatted"] = True
             r["verdict_stage"] = 3
+            r["recovered_verdict_text"] = (out3.get("text") or "")[:8000]
             # A DIFFERENT MODEL PRODUCED THIS. Stamped so no later reader mistakes a
             # fallback vote for the seat's primary judgement -- with commit_declined
             # alongside it when the primary explicitly abstained first.

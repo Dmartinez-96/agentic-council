@@ -656,6 +656,43 @@ except Exception as e:  # noqa: BLE001
     FAILS.append(f"J quorum reachability raised: {type(e).__name__}: {e}")
     CHECKS += 1
 
+# ------------------------------------------------------ K: inspector error diagnostics
+# `stderr_hint` is report vocabulary, not a second log field. The log retains the bounded
+# `stderr`; emit_output derives the hint from that value. Exercise the complete persisted
+# path so changing either side cannot make a failed inspector unauditable.
+try:
+    voter = cc.voting_members()[0].name
+    inspector = cc.inspector_members()[0].name
+    voting_result = {"role": voter, "text": "VERDICT: PASS", "stderr": "",
+                     "returncode": 0, "verdict": "PASS", "duration_s": 1.0}
+    shadow_error = {"role": inspector, "text": "",
+                    "stderr": "empty content in response:", "returncode": -1,
+                    "verdict": "ERROR", "duration_s": 1.0,
+                    "empty_response_retry": True,
+                    "first_attempt_error": "empty content in response:"}
+    saved_logs = cc.LOGS_ROOT
+    try:
+        cc.LOGS_ROOT = Path(tempfile.mkdtemp())
+        written = cc.write_log("posttool", "Edit", "/tmp/t.py", "pitch",
+                               [voting_result], "PASS", shadow_results=[shadow_error])
+        logged_shadow = json.loads(written.read_text())["shadow"][0]
+        check(logged_shadow.get("stderr") == "empty content in response:",
+              "K1 write_log retains the inspector failure reason in stderr")
+        check(logged_shadow.get("first_attempt_error") == "empty content in response:",
+              "K2 write_log retains the first-attempt retry diagnostic")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cc.emit_output([voting_result], "PASS", written,
+                           shadow_results=[logged_shadow])
+        check("stderr_hint='empty content in response:'" in buf.getvalue(),
+              "K3 emit_output derives stderr_hint from the persisted stderr")
+    finally:
+        cc.LOGS_ROOT = saved_logs
+except Exception as e:  # noqa: BLE001
+    FAILS.append(f"K inspector diagnostics raised: {type(e).__name__}: {e}")
+    CHECKS += 1
+
 # ---------------------------------------------------------------- report
 print(f"{CHECKS - len(FAILS)}/{CHECKS} checks passed")
 for f in FAILS:

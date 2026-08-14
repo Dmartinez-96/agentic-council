@@ -10,8 +10,10 @@ It ships as a **Claude Code integration** (a council on every `Write` / `Edit` /
 caveats unless a backing probe actually ran), but the engine has generalized past
 that: a review is invokable as a plain subprocess, not only a hook, and the actor
 it reviews -- the tool-using **leader** -- is now a selectable role, not only
-Claude. A model named in the roster's `leader` field takes the turns, and every
-file it writes is reviewed by the council *before* it touches disk.
+Claude. In council-native leader mode, a model named in the roster's `leader` field
+takes the turns, and each file write it proposes is reviewed by the council *before*
+it touches disk. The Claude Code integration instead reviews completed tool calls at
+PostToolUse, after the write lands.
 
 The review runs in **two tiers**: six voting critics plus a six-model non-voting
 inspector tier from further model families. It does not trust the actor's account of its own
@@ -258,8 +260,9 @@ restriction.)
 
 ## AUTO-REVERT: read this before you install
 
-**On a quorum `BLOCK` (two or more voting members), this software will undo
-the leader's write.** It is on by default (`AUTO_REVERT_ON_BLOCK` in
+**On a quorum `BLOCK` -- half the voting bench rounded up, so 3 of the 6 default
+voting members -- this software will undo the leader's write.** It is on by default
+(`AUTO_REVERT_ON_BLOCK` in
 `council_advisor.py`). You should know exactly what that means before you let it
 near your files.
 

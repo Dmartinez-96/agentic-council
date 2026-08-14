@@ -69,6 +69,51 @@ def unit_checks() -> None:
           "this is what makes the ladder discard rather than guess")
 
 
+def recovery_provenance_checks() -> None:
+    """Force the historical stage-2 shape and prove its source reaches the JSON log."""
+    print("\nUNIT: recovered-verdict provenance (deterministic, no API calls)")
+
+    async def exercise() -> dict:
+        replies = iter(({"text": "VERDICT: NONE"}, {"text": "VERDICT: BLOCK"}))
+
+        async def fake_runner(prompt, system_prompt, cwd):
+            return next(replies)
+
+        saved_runner = cc.MEMBER_RUNNERS.get("codex")
+        cc.MEMBER_RUNNERS["codex"] = fake_runner
+        record = {"role": "codex", "text": "<tool_call>read</tool_call>",
+                  "stderr": "", "verdict": "UNPARSEABLE"}
+        try:
+            await cc.reformat_unparseable([record], Path(tempfile.mkdtemp()))
+        finally:
+            if saved_runner is None:
+                cc.MEMBER_RUNNERS.pop("codex", None)
+            else:
+                cc.MEMBER_RUNNERS["codex"] = saved_runner
+        return record
+
+    record = asyncio.run(exercise())
+    check("stage 1 NONE advances to stage 2 BLOCK",
+          record.get("verdict") == "BLOCK" and record.get("verdict_stage") == 2)
+    check("original response remains the member text",
+          record.get("text") == "<tool_call>read</tool_call>")
+    check("stage-2 response is retained as verdict provenance",
+          record.get("recovered_verdict_text") == "VERDICT: BLOCK")
+
+    saved_logs = cc.LOGS_ROOT
+    try:
+        cc.LOGS_ROOT = Path(tempfile.mkdtemp())
+        written = cc.write_log("posttool", "Edit", "/tmp/provenance.py", "pitch",
+                               [record], "BLOCK")
+        logged = json.loads(written.read_text())["members"][0]
+        check("recovered verdict text reaches the JSON log",
+              logged.get("recovered_verdict_text") == "VERDICT: BLOCK")
+        check("logged original text still differs from its recovered verdict",
+              "BLOCK" not in logged.get("text", ""))
+    finally:
+        cc.LOGS_ROOT = saved_logs
+
+
 def find(pred, label):
     for fn in sorted(glob.glob("logs/2026-07-2*/*.json"), reverse=True):
         try:
@@ -155,6 +200,7 @@ async def live_checks() -> None:
 
 def main() -> int:
     unit_checks()
+    recovery_provenance_checks()
     if "--live" in sys.argv:
         asyncio.run(live_checks())
     else:
