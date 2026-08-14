@@ -17,6 +17,19 @@ The review runs in **two tiers**: six voting critics plus a six-model non-voting
 inspector tier from further model families. It does not trust the actor's account of its own
 work. Neither should you.
 
+![The phases of a council review](docs/council-phases-post.svg)
+
+The phases are sequential, and the boundary in the middle is the design. Voting round 1 is
+deliberately blind -- no member has seen another's verdict -- and it is the only *voting*
+round in which a member may file `REQUEST_FILE` / `REQUEST_URL` / `REQUEST_EXEC` (the
+inspector tier has the same channel in its own pass 1). Those requests are
+executed between the rounds, so round 2 is where a member first sees its peers *and* argues
+from evidence it actually checked. The quorum is counted there, on round-2 verdicts, and
+only voting members count toward it. The inspector tier then reads each member's verdict and
+reasoning and asks whether the bench over-flagged, missed something, or strong-armed itself
+into agreement. Panel size and composition are yours to choose -- the counts drawn here are
+this repo's defaults, not a requirement.
+
 ## Quickstart
 
 The full two-tier council needs an **OpenRouter API key** and the **codex CLI**. (You
@@ -289,6 +302,21 @@ preserve the file's mode, so restoring an executable does not silently strip its
 Whether you should enable this depends on how often YOUR council is wrong when it
 reaches a `BLOCK` quorum, which is exactly what `council_outcome.py` measures.
 Measure it before you trust it.
+
+### The whole pipeline, including the parts that fail
+
+The diagram in the introduction is the happy path. This one adds what the machinery does
+when something goes wrong or when you reconfigure it: the three review depths and which one
+wins when the markers disagree, the per-critic and per-fire timeouts and why the latter sits
+below the harness cap, the salvage path that reports a killed fire as an explicit PARTIAL
+rather than a `PASS`, the retry that refuses to guess at an unparseable verdict, the
+cross-file staleness that registers against the *other* file instead of wedging this edit,
+and the `NO_AUTO_REVERT` kill switch.
+
+![The full review pipeline, including timeouts, salvage, and the kill switch](docs/council-phases-full.svg)
+
+Both diagrams are generated from TikZ sources kept outside version control, so the
+committed artifact is the image itself.
 
 ## Tools beyond the hooks
 

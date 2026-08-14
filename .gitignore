@@ -58,3 +58,19 @@ council/roster.json
 # attestation ledger inside that directory.
 _brain/
 **/.attestations.json
+
+# docs/ -- only the rendered vector is version-controlled. The TikZ sources stay in the
+# working tree but UNTRACKED, and a regenerated .pdf/.log/.aux is a diff on every rebuild
+# for no reader's benefit. The one thing deliberately NOT ignored is what the README
+# embeds: docs/*.svg, produced by `pdftocairo -svg`, which emits text as glyph paths and so
+# carries no font dependency. The intermediate .png is not committed either.
+docs/*.tex
+docs/*.png
+docs/*.aux
+docs/*.log
+docs/*.pdf
+docs/*.out
+docs/*.fls
+docs/*.fdb_latexmk
+docs/*.synctex.gz
+docs/*.toc
