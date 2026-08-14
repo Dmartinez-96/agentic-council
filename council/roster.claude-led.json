@@ -4,10 +4,10 @@
   "members": [
     {"name": "codex", "tier": "voting", "transport": "codex_subprocess", "model": "gpt-5.6-sol", "fallback_model": "openai/gpt-5.6-sol"},
     {"name": "gemini", "tier": "voting", "transport": "openrouter", "model": "google/gemini-3.7-flash", "fallback_model": "google/gemini-3.6-flash"},
-    {"name": "deepseek", "tier": "voting", "transport": "openrouter", "model": "deepseek/deepseek-v4-pro", "fallback_model": "deepseek/deepseek-v4-flash"},
+    {"name": "deepseek", "tier": "voting", "transport": "openrouter", "model": "deepseek/deepseek-v4-pro-0813", "fallback_model": "deepseek/deepseek-v4-pro"},
     {"name": "kimi", "tier": "voting", "transport": "openrouter", "model": "moonshotai/kimi-k3", "fallback_model": "moonshotai/kimi-k2-thinking"},
     {"name": "glm", "tier": "voting", "transport": "openrouter", "model": "z-ai/glm-5.2", "fallback_model": "z-ai/glm-5.1"},
-    {"name": "grok", "tier": "voting", "transport": "openrouter", "model": "x-ai/grok-4.5", "fallback_model": "x-ai/grok-4.3"},
+    {"name": "grok", "tier": "voting", "transport": "openrouter", "model": "x-ai/grok-4.6", "fallback_model": "x-ai/grok-4.5"},
     {"name": "hunyuan", "tier": "inspector", "transport": "openrouter", "model": "tencent/hy3", "fallback_model": "tencent/hy3-preview"},
     {"name": "qwen", "tier": "inspector", "transport": "openrouter", "model": "qwen/qwen3.8-max", "fallback_model": "qwen/qwen3.7-max"},
     {"name": "minimax", "tier": "inspector", "transport": "openrouter", "model": "minimax/minimax-m3", "fallback_model": "minimax/minimax-m2.7"},

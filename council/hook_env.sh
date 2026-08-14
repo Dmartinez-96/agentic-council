@@ -46,19 +46,51 @@ set -u
 _council_harness=claude
 if [ "${1:-}" = "--harness" ]; then
     if [ "$#" -lt 3 ]; then
-        echo "hook_env.sh: --harness requires claude or codex plus a command" >&2
+        echo "hook_env.sh: --harness requires claude, codex or fugu plus a command" >&2
         exit 2
     fi
     _council_harness=$2
     shift 2
 fi
 case "$_council_harness" in
-    claude|codex) ;;
+    claude|codex|fugu) ;;
     *)
         echo "hook_env.sh: unknown harness $_council_harness" >&2
         exit 2
         ;;
 esac
+
+# FUGU CANNOT IDENTIFY ITSELF BY THE FLAG, which is why this REINTERPRETS rather than merely
+# defaulting. Read from the installed ~/.local/bin/claude-fugu: its final statement is
+# `exec env ... claude "$@"`, and it contains ZERO assignments to HOME or CLAUDE_CONFIG_DIR.
+# So a fugu session runs the same `claude` binary against the same ~/.claude and reads the same
+# settings.json. AND THAT FILE PASSES NO --harness AT ALL: measured on the live settings.json,
+# `--harness` occurs 0 times across its 7 hook commands, every one a bare `hook_env.sh <script>`.
+# Both a fugu session and a plain Claude session therefore arrive here on the DEFAULT, and the
+# flag cannot separate them because neither one sets it.
+# WHY THAT MAKES THIS DEFAULT LOAD-BEARING: changing it repoints every session on the machine at
+# once, not just new ones. Setting it to `fugu` was measured doing exactly that -- three log
+# entries from a plain claude session (20260814T041417Z, T041540Z, T041705Z) record
+# roster.source=roster.fugu-led.json with voters codex/gemini/deepseek/kimi/glm/CLAUDE, i.e.
+# claude reviewing claude's own edits. NOT established from those logs: what the overlap banner
+# printed, since the entry carries no leader field to check it against.
+# WHAT DOES SEPARATE THEM is line 29 of that wrapper: ANTHROPIC_BASE_URL="https://api.sakana.ai",
+# exported into the exec'd process. A resolved harness of `claude` is therefore UPGRADED to
+# `fugu` when that variable names sakana.ai. `codex` is untouched, and an explicit
+# `--harness fugu` is already fugu.
+# NOT YET OBSERVED END TO END. What was checked is that a plain `env VAR=... bash -c 'bash -c
+# echo'` propagates the variable two levels down -- a generic shell demonstration, NOT a hook
+# firing inside a real claude-fugu session. No fugu session has triggered a hook here yet. If
+# this ever mis-resolves, print ANTHROPIC_BASE_URL from inside a hook before suspecting the
+# pattern below.
+# THE MATCH IS ANCHORED ON THE LITERAL DOT and is case-insensitive, matched anywhere in the
+# URL. A stricter equality test would break the moment the wrapper points at a regional or
+# versioned host, and this value is not attacker-controlled: it comes from a wrapper the
+# operator installed.
+if [ "$_council_harness" = claude ] \
+   && printf '%s' "${ANTHROPIC_BASE_URL:-}" | grep -qiE 'sakana\.ai'; then
+    _council_harness=fugu
+fi
 
 _council_saved_openrouter=${OPENROUTER_API_KEY:-}
 if [ -r "$HOME/.config/council/env" ]; then

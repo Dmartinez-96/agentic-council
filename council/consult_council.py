@@ -138,7 +138,15 @@ DEEPSEEK_REASONING = "max"
 # checked 2026-07-18. On this route the effort sent is OpenRouter's unified
 # reasoning.effort (see openrouter_effort()); DEEPSEEK_REASONING above applies
 # only to the direct deepseek_https transport.
-DEEPSEEK_OPENROUTER_MODEL = "deepseek/deepseek-v4-pro"
+# 2026-08-14: v4-pro -> v4-pro-0813, with plain v4-pro taking the fallback slot and v4-flash
+# leaving the chain. Both slugs verified present that day via GET openrouter.ai/api/v1/models
+# (rc=0): v4-pro-0813 reports created 2026-08-12, canonical deepseek/deepseek-v4-pro-20260813;
+# plain v4-pro reports created 2026-04-24, canonical deepseek/deepseek-v4-pro-20260423. So the
+# dated slug is the NEWER of the two, which is why it leads.
+# A VERSION fact, NOT a capability measurement -- nothing here compared the two on review
+# quality, in either direction.
+DEEPSEEK_OPENROUTER_MODEL = "deepseek/deepseek-v4-pro-0813"
+DEEPSEEK_OPENROUTER_FALLBACK = "deepseek/deepseek-v4-pro"
 
 # Gemini member: the direct Gemini REST API (generateContent), used when
 # GEMINI_API_KEY is set; otherwise main() drops gemini from the roster.
@@ -277,15 +285,31 @@ MODES = ("fast", "default", "deep")
 # (thinkingConfig.thinkingLevel, reasoning_effort) were NOT probed for a value below `low`, and
 # shipping an unverified one would turn every FAST fire on such a roster into an HTTP 400.
 # `low` is the value already verified for them. Probe their ladders before lowering these.
+#
+# CLAUDE AND FUGU TAKE NO EFFORT PARAMETER AT ALL, and record "n/a" rather than a number they
+# were never sent. effort_for()'s value reaches a provider at exactly three call sites -- codex
+# (-c model_reasoning_effort), gemini (thinkingConfig.thinkingLevel) and deepseek
+# (reasoning_effort). claude_cmd/claude_leader_cmd and their fugu twins pass no such flag, so
+# any level written here would appear in the log as a depth that was never requested.
+# THEY ARE LISTED ANYWAY BECAUSE THE LOG PATH NEEDS THEM. write_log calls effort_for for every
+# seat that ran, so a roster seating claude on claude_subprocess made that call raise. Measured
+# with COUNCIL_ROSTER_PATH=roster.fugu-led.json: effort_for("claude") -> KeyError 'claude',
+# while effort_for("codex") -> low in the same interpreter. In a real fire that raises inside
+# write_log, i.e. AFTER every member has already run and been paid for, and the traceback
+# replaces the review.
 CORE_EFFORT = {
-    "fast":    {"codex": "none", "gemini": "low", "deepseek": "low"},
-    "default": {"codex": "low",  "gemini": "low", "deepseek": "low"},
+    "fast":    {"codex": "none", "gemini": "low", "deepseek": "low",
+                "claude": "n/a", "fugu": "n/a"},
+    "default": {"codex": "low",  "gemini": "low", "deepseek": "low",
+                "claude": "n/a", "fugu": "n/a"},
 }
 # DEEP resolves through these, so it tracks the constants rather than pinning a copy of them.
 _FULL_EFFORT = {
     "codex": lambda: CODEX_REASONING,
     "gemini": lambda: GEMINI_THINKING_LEVEL,
     "deepseek": lambda: DEEPSEEK_REASONING,
+    "claude": lambda: "n/a",
+    "fugu": lambda: "n/a",
 }
 
 # COMPAT: the old name for the FAST table. Its remaining job is as the membership guard
@@ -2300,6 +2324,30 @@ def _codex_lock_release(fh) -> None:
 # run was CHARGED, and no UI or doc may claim it does.
 CLAUDE_MODEL = "claude-opus-5"
 CLAUDE_OPENROUTER_FALLBACK = "anthropic/claude-opus-5"
+
+# --- FUGU (Sakana), served through the Claude Code CLI -----------------------
+#
+# `claude-fugu` is not a separate CLI. Read from the installed script: a bash wrapper whose
+# last statement is `exec env ... claude "$@"`, setting ANTHROPIC_BASE_URL=https://api.sakana.ai
+# and ANTHROPIC_AUTH_TOKEN=$SAKANA_API_KEY, plus an alias table rebinding the model names
+# (ANTHROPIC_DEFAULT_OPUS_MODEL=fugu-ultra[1m], SONNET and HAIKU=fugu[1m],
+# FABLE=fugu-cyber[1m]). It contains ZERO assignments to HOME or CLAUDE_CONFIG_DIR, so a fugu
+# session reads the SAME ~/.claude as a claude session: the same settings.json hooks, the same
+# CLAUDE.md, the same brain. That is why this profile needs no parallel copy of any of them,
+# and why the only thing that has to distinguish the two is which roster the hooks resolve.
+#
+# THE MODEL IS NAMED EXPLICITLY RATHER THAN VIA THE `opus` ALIAS. Both work -- measured
+# 2026-08-14 UTC (the log directories are UTC-dated; local was still 08-13 CDT),
+# `printf 'Reply with exactly: PONG' | claude-fugu -p --model X` returned rc=0 and PONG for X
+# in {opus, fugu-ultra[1m]}. The alias would record "opus" in the log where the truth is
+# fugu-ultra, and would silently follow the wrapper's table if that were ever retuned.
+# THE FLAG IS VALIDATED, which is what makes those two rc=0 results mean anything: the same
+# command with --model definitely-not-a-real-model-xyz returns rc=1, "There's an issue with the
+# selected model ... It may not exist or you may not have access to it." Without that negative
+# control, a passing probe and an ignored flag are the same observation.
+FUGU_CLI = "claude-fugu"
+FUGU_MODEL = "fugu-ultra[1m]"
+FUGU_OPENROUTER_FALLBACK = "sakana/fugu-ultra"
 # Dropped from the child env so the CLI's own login is what serves. ANTHROPIC_AUTH_TOKEN
 # is included because the warning above names "ANTHROPIC_API_KEY **or another auth
 # source**", so scrubbing only the first would leave a second override in place.
@@ -3342,14 +3390,22 @@ DEFAULT_REGISTRY: tuple[Member, ...] = (
     Member("gemini",   VOTING, "openrouter", GEMINI_OPENROUTER_MODEL,
            GEMINI_OPENROUTER_FALLBACK, capabilities=_DEFAULT_CAPS),
     Member("deepseek", VOTING, "openrouter", DEEPSEEK_OPENROUTER_MODEL,
-           "deepseek/deepseek-v4-flash", capabilities=_DEFAULT_CAPS),
+           DEEPSEEK_OPENROUTER_FALLBACK, capabilities=_DEFAULT_CAPS),
     Member("kimi",     VOTING, "openrouter",
            "moonshotai/kimi-k3", "moonshotai/kimi-k2-thinking",
            capabilities=_DEFAULT_CAPS),
     Member("glm",      VOTING, "openrouter",
            "z-ai/glm-5.2", "z-ai/glm-5.1", capabilities=_DEFAULT_CAPS),
+    # grok 4.5 -> 4.6 on 2026-08-13, 4.5 takes the fallback slot, 4.3 leaves the chain.
+    # Both slugs verified present that day via GET openrouter.ai/api/v1/models (rc=0, 411
+    # models returned). THE CATALOG ALSO CARRIES x-ai/grok-4.20, AND IT IS OLDER, not newer:
+    # its own `created` is 2026-03-31 and its canonical_slug is x-ai/grok-4.20-20260309,
+    # against 4.5 at 2026-07-08 and 4.6 at 2026-08-12 (canonical x-ai/grok-4.6-20260810).
+    # It is 4.2 in xAI's numbering. Sort these by `created`, never by reading the decimal.
+    # A VERSION fact, NOT a capability measurement -- nothing compared 4.6 against 4.5 on
+    # review quality, in either direction.
     Member("grok",     VOTING, "openrouter",
-           "x-ai/grok-4.5", "x-ai/grok-4.3", capabilities=_DEFAULT_CAPS),
+           "x-ai/grok-4.6", "x-ai/grok-4.5", capabilities=_DEFAULT_CAPS),
     # --- LAYER 2: non-voting inspectors (6) ---
     # hunyuan REPLACED muse on 2026-08-06. meta/muse-spark-1.1 AND -1.2 both return
     # HTTP 403 `user_blocked` ("access has been restricted due to repeated policy
@@ -3401,8 +3457,8 @@ else:
     ROSTER_PATH = COUNCIL_ROOT / "roster.json"
 
 VALID_TIERS = {VOTING, INSPECTOR}
-VALID_TRANSPORTS = {"codex_subprocess", "claude_subprocess", "gemini_rest",
-                    "deepseek_https", "openrouter"}
+VALID_TRANSPORTS = {"codex_subprocess", "claude_subprocess", "fugu_subprocess",
+                    "gemini_rest", "deepseek_https", "openrouter"}
 # The harness-mediated capabilities the engine honors. Each has a request channel
 # (REQUEST_FILE / REQUEST_URL / REQUEST_EXEC) parsed by a collect_* function and
 # delivered by main() to voting members (round 1 -> round 2) and, via the pass-1 ->
@@ -3416,12 +3472,14 @@ VALID_CAPABILITIES = {"file_retrieval", "web", "exec_sandbox"}
 CANONICAL_TRANSPORT_NAMES = {
     "codex_subprocess": "codex",
     "claude_subprocess": "claude",
+    "fugu_subprocess": "fugu",
     "gemini_rest": "gemini",
     "deepseek_https": "deepseek",
 }
 DIRECT_TRANSPORT_MODELS = {
     "codex_subprocess": CODEX_MODEL,
     "claude_subprocess": CLAUDE_MODEL,
+    "fugu_subprocess": FUGU_MODEL,
     "gemini_rest": GEMINI_API_MODEL,
     "deepseek_https": DEEPSEEK_MODEL,
 }
@@ -3461,6 +3519,13 @@ FALLBACK_CAPABLE_TRANSPORTS = ("codex_subprocess", "claude_subprocess")
 DIRECT_TRANSPORT_FAMILY_SLUG = {
     "codex_subprocess": CODEX_OPENROUTER_FALLBACK,      # openai/...
     "claude_subprocess": CLAUDE_OPENROUTER_FALLBACK,    # anthropic/...
+    # WITHOUT THIS ROW fugu resolved to None: measured before adding it,
+    # model_family("fugu_subprocess", FUGU_MODEL) -> None, i.e. UNDETERMINED, which the
+    # overlap banner is required to report as "no comparison was possible" rather than as a
+    # clean bench. The row is also why fugu has its own transport rather than riding
+    # claude_subprocess: this map is keyed by TRANSPORT and never reads the model string, so
+    # a Sakana model under the claude key would resolve to anthropic.
+    "fugu_subprocess": FUGU_OPENROUTER_FALLBACK,        # sakana/...
     "gemini_rest": GEMINI_OPENROUTER_MODEL,             # google/...
     "deepseek_https": DEEPSEEK_OPENROUTER_MODEL,        # deepseek/...
 }
@@ -6340,7 +6405,32 @@ def claude_leader_cmd() -> list[str]:
             *CLAUDE_RUNTIME_GUARD, *CLAUDE_LEADER_TOOL_GUARD]
 
 
-# The transports a LEADER may use: a STRICT SUBSET of VALID_TRANSPORTS, because the
+def fugu_leader_cmd() -> list[str]:
+    """Argv for one fugu LEADER turn. Identical in shape to claude_leader_cmd because the
+    binary IS Claude Code: `claude-fugu` execs `claude` under Sakana's endpoint, so the same
+    flags apply and the same guards are wanted.
+
+    THE TWO DIFFERENCES ARE THE BINARY AND THE MODEL, and both are load-bearing. Reusing
+    `claude` with FUGU_MODEL would send a Sakana model id to Anthropic's endpoint; reusing
+    FUGU_CLI with CLAUDE_MODEL would ask Sakana for claude-opus-5. Neither is a fallback --
+    both are simply the wrong call, which is why this is its own transport rather than a
+    parameter on claude_subprocess.
+
+    MEASURED against the live endpoint: `printf 'Reply with exactly: PONG' | claude-fugu -p
+    --model fugu-ultra[1m]` returns rc=0 and PONG; the same command with --model
+    no-such-model-zzz returns rc=1 and "It may not exist or you may not have access to it",
+    so the model argument is validated rather than ignored -- without that negative control a
+    passing probe and an ignored flag would be the same observation.
+    WHAT THAT DOES NOT ESTABLISH: that --safe-mode and --tools "" behave identically on this
+    endpoint. They are Claude Code CLI flags and the CLI is the same build, but no leader turn
+    has been run through this path yet."""
+    return [FUGU_CLI, "-p", "--model", FUGU_MODEL,
+            *CLAUDE_RUNTIME_GUARD, *CLAUDE_LEADER_TOOL_GUARD]
+
+
+# The transports a LEADER may use: a SUBSET of VALID_TRANSPORTS, currently measured EQUAL to
+# it (6 == 6, nothing in VALID_TRANSPORTS absent here). Equality is allowed; what this must
+# never become is a SUPERSET, because every entry needs a _call_leader branch below. Because the
 # openrouter branch aside, _call_leader's if/elif chain below must have a branch for each.
 # A REJECTED RATIONALE, recorded so it is not reinvented: an earlier version of this
 # comment said claude_subprocess cannot lead because it is guarded read-only while
@@ -6354,7 +6444,7 @@ def claude_leader_cmd() -> list[str]:
 # below without adding it here makes the transport unofferable; the reverse offers a
 # leader that fails closed at dispatch with ok=False.
 LEADER_TRANSPORTS = ("openrouter", "codex_subprocess", "claude_subprocess",
-                     "gemini_rest", "deepseek_https")
+                     "fugu_subprocess", "gemini_rest", "deepseek_https")
 
 
 async def _call_leader(leader: "Member", prompt: str, cwd: Path) -> dict:
@@ -6425,6 +6515,22 @@ async def _call_leader(leader: "Member", prompt: str, cwd: Path) -> dict:
         # recorded where that constant is defined -- read it there rather than trusting a
         # second-hand restatement here.
         res = await _run_subprocess(claude_leader_cmd(), cwd, role=leader.name,
+                                    stdin_data=prompt, drop_env=CLAUDE_DROP_ENV)
+    elif t == "fugu_subprocess":
+        # Same shape and the same absence of a lock as claude above, for the same reason: the
+        # codex auth lock exists for codex's OBSERVED refresh-token races and nothing like it
+        # has been seen here.
+        # CLAUDE_DROP_ENV IS STILL CORRECT ON THIS PATH, and why it does not break auth is
+        # readable in the wrapper: it drops ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN from the
+        # CHILD env, while claude-fugu's final statement is `exec env ...` which sets
+        # ANTHROPIC_AUTH_TOKEN="$SAKANA_API_KEY" in its own `env` invocation, which runs after
+        # it receives the environment we built. So the drop cannot cost Fugu its credential.
+        # WHAT IS NOT CLAIMED: that an inherited Anthropic key would otherwise have WON. No
+        # probe here tested a precedence conflict. The drop is kept because it is the claude
+        # path's existing hygiene, not because a failure was observed without it.
+        # SAKANA_API_KEY is NOT in the drop list, and the wrapper sources ~/.claude/.fugu-env
+        # when it is unset, so neither of its two auth routes is disturbed.
+        res = await _run_subprocess(fugu_leader_cmd(), cwd, role=leader.name,
                                     stdin_data=prompt, drop_env=CLAUDE_DROP_ENV)
     else:
         return {"ok": False, "text": "", "transport": t,

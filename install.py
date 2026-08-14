@@ -123,9 +123,9 @@ COUNCIL_FILES = [
     # council_events.py above -- omitting it raises ModuleNotFoundError on every invocation.
     "codex_hook.py",
     "brain_index.py",
-    # BOTH PROFILES, and the asymmetry is why neither is optional. hook_env.sh points
+    # ALL THREE PROFILES, and the asymmetry is why none is optional. hook_env.sh points
     # COUNCIL_ROSTER_PATH at `roster.<harness>-led.json`, so a missing file is a missing
-    # profile -- and the two harnesses answer that very differently.
+    # profile -- and the harnesses answer that very differently.
     # MEASURED 2026-08-10 against an absent path: consult_council's loader returns its built-in
     # DEFAULT_REGISTRY (its own comment names the case, "No roster file at all: a fresh
     # install"), so a CLAUDE-led council still fires. codex_hook does not: _profile_error()
@@ -133,9 +133,17 @@ COUNCIL_FILES = [
     # codex_hook.py:794-796 reads `profile_error = _profile_error()` / `if profile_error:` /
     # `return emit_pre_deny(...)` -- so every apply_patch is denied.
     # An install missing these therefore leaves Claude-led working and Codex-led unable to edit
-    # anything, which is the worse half of the pair to discover from a blocked session.
+    # anything, which is the worse half to discover from a blocked session.
+    # FUGU DEGRADES LIKE CLAUDE, SILENTLY, which is why its roster ships too. A fugu session
+    # runs the same hooks and the same engine loader -- there is no fugu-specific hook to raise.
+    # MEASURED 2026-08-14 with COUNCIL_ROSTER_PATH pointed at an absent roster.fugu-led.json:
+    # ROSTER_SOURCE "default", ROSTER_ERRORS none, leader "claude", voting codex/gemini/deepseek/
+    # kimi/glm/grok. So the fire still happens and still reports -- against a CLAUDE leader and
+    # the built-in bench, not the one chosen for fugu. That is a wrong council presented as a
+    # working one, which is worse than a denial precisely because nothing announces it.
     "roster.claude-led.json",
     "roster.codex-led.json",
+    "roster.fugu-led.json",
     # Every hook is invoked THROUGH this wrapper (see the hooks template), so an install
     # that omits it leaves every configured hook pointing at a file that is not there.
     # It loads OPENROUTER_API_KEY when the launching environment did not carry it, which
